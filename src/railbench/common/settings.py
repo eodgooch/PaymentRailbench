@@ -9,6 +9,9 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+psycopg://railbench:railbench@localhost:5432/railbench"
     ledger_readonly_database_url: str = ""
+    # The Ledger API runs every connection as this role (SET ROLE): SELECT and INSERT only on
+    # the Ledger (migration 0002). The DATABASE_URL user must be a member of it. Empty: no SET.
+    ledger_database_role: str = "railbench_app"
     simulator_url: str = "http://localhost:8100"
     webhook_signing_secret: SecretStr = SecretStr("change-me")
     anthropic_api_key: SecretStr | None = None
