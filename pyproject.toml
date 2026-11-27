@@ -46,6 +46,10 @@ select = ["E", "W", "F", "I", "B", "UP", "SIM", "DTZ", "TID", "RUF"]
 "datetime.datetime.today".msg = "Read time from a railbench.common.clock.Clock, never the system."
 "datetime.date.today".msg = "Read time from a railbench.common.clock.Clock, never the system."
 "time.time".msg = "Read time from a railbench.common.clock.Clock, never the system."
+"time.time_ns".msg = "Read time from a railbench.common.clock.Clock, never the system."
+"time.localtime".msg = "Read time from a railbench.common.clock.Clock, never the system."
+"time.gmtime".msg = "Read time from a railbench.common.clock.Clock, never the system."
+"time.ctime".msg = "Read time from a railbench.common.clock.Clock, never the system."
 
 [tool.ruff.lint.per-file-ignores]
 # The one place allowed to read the system time.
