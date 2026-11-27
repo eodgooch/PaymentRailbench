@@ -230,10 +230,11 @@ Each milestone ends with all checks green, the README updated, and a stop for re
 - Two-way Reconciliation, Break Types and the Exception Queue.
 - **Thin MCP server** with `trace_payment`, `explain_balance` and `explain_break`.
 - `make night` with the headline Scenario (Late Return after an Instant Payout), and the HTML report.
+- The nightly GitHub Pages workflow (§9), since its report is the outreach link. The agent step joins in M2.
 - ✅ Invariant property tests pass; the headline Scenario ends with the right Recovery Receivable and an exception; the MCP server answers "where did this discrepancy come from?" for that Break.
 
 **M2: Triage agent and evaluation**
-- The full MCP tool set, the triage agent with cost caps, Proposals with CLI approval, `make eval`, and the nightly GitHub Pages workflow.
+- The full MCP tool set, the triage agent with cost caps, Proposals with CLI approval, `make eval`, and the agent step added to the nightly workflow.
 - ✅ The eval table is published; the agent never writes (a test proves its role can't).
 
 **M3: Lending and Cash Advances**
