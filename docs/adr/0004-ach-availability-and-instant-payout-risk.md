@@ -1,0 +1,3 @@
+# ACH funds become Available after 2 Banking Days, and Instant Payouts accept Late Return risk
+
+ACH money is pending at origination, posted at settlement and Available 2 Banking Days later, after the window for most return codes (R01, R02, R03). Some codes (e.g. R10, unauthorized) can arrive up to 60 days later; holding every payment that long would wreck the time from Auction Close to seller funds. So the late-return risk is accepted and handled explicitly: a Late Return posts as a Reversal, any resulting negative Customer Balance moves to Recovery Receivable, and an exception is raised. Instant Payouts over RTP go out before the buyer's funds are Available, at Mintwharf's risk, capped by a per-Customer risk limit.

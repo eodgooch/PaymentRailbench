@@ -1,0 +1,3 @@
+# No hash chain on the Journal
+
+Append-only is enforced with database grants (the app role has `SELECT` and `INSERT` only on Ledger tables, and a trigger rejects `UPDATE` and `DELETE`), not with a hash chain linking each Transaction to the previous one. A hash chain would add tamper evidence against someone with owner access, but it forces a single writer to keep the chain linear, which hurts exactly when an Auction Close posts hundreds of Payouts at once. For an internal system of record the threat it covers is better handled by access control and audit logs. This was considered deliberately, given a blockchain background, and rejected as overengineering.

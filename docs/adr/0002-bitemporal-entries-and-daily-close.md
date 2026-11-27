@@ -1,0 +1,3 @@
+# Entries are bitemporal, and Daily Close locks reconciled days
+
+Every Entry carries an Effective Time (when it happened economically) and a Recorded Time (when the Ledger learned of it), and balance queries take both: "Tuesday's balance as known on Tuesday" and "Tuesday's balance as known now" are different, honest answers. A Daily Close locks a reconciled Banking Day: nothing new can take effect inside it, so later corrections take effect on the next open day and name the closed day they relate to. The alternative, a single timestamp, can't tell Support what a Customer actually saw on a past date after a Provider Adjustment, and none of the off-the-shelf ledgers we looked at fully supports both axes (ADR 0007).
