@@ -1,42 +1,20 @@
 """The baseline migration against a real Postgres 16, and /health on top of it."""
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 import pytest
 from alembic import command
-from alembic.config import Config
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, create_engine, text
-from testcontainers.community.postgres import PostgresContainer
+from sqlalchemy import Engine, text
 
 from railbench.common.clock import Clock, ManualClock
 from railbench.ledger.app import create_app as create_ledger_app
 from railbench.simulator.app import create_app as create_simulator_app
+from tests.integration.helpers import alembic_config
 
 pytestmark = pytest.mark.integration
-
-
-@pytest.fixture(scope="module")
-def database_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        url: str = postgres.get_connection_url()
-        command.upgrade(_alembic_config(url), "head")
-        yield url
-
-
-@pytest.fixture
-def engine(database_url: str) -> Iterator[Engine]:
-    engine = create_engine(database_url)
-    yield engine
-    engine.dispose()
-
-
-def _alembic_config(url: str) -> Config:
-    config = Config("alembic.ini")
-    config.set_main_option("sqlalchemy.url", url)
-    return config
 
 
 def test_migrations_create_a_schema_for_each_part_of_railbench(engine: Engine) -> None:
@@ -49,8 +27,8 @@ def test_migrations_create_a_schema_for_each_part_of_railbench(engine: Engine) -
 
 
 def test_baseline_downgrades_and_upgrades_cleanly(database_url: str, engine: Engine) -> None:
-    command.downgrade(_alembic_config(database_url), "base")
-    command.upgrade(_alembic_config(database_url), "head")
+    command.downgrade(alembic_config(database_url), "base")
+    command.upgrade(alembic_config(database_url), "head")
 
     with engine.connect() as connection:
         count = connection.scalar(

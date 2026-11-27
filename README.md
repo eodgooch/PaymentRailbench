@@ -21,13 +21,55 @@ setting. If a port is already taken, override it: `make dev LEDGER_HOST_PORT=800
 Both services answer `GET /health` with their database connectivity, and return 503 when the
 database is unreachable. Logs are JSON, one object per line.
 
+## The Ledger model
+
+The Ledger is double-entry and append-only, in the `ledger` schema (migration `0002`).
+
+- **Accounts** have a code, a type (asset, liability, revenue, expense) and one currency.
+- A **Transaction** is a set of **Entries**. Each Entry is a signed, non-zero integer amount
+  in Minor Units (positive is a debit, negative a credit) posted to one Account in that
+  Account's currency, with an **Effective Time**, a **Recorded Time** (from the Clock) and an
+  **Actor**: a system job (name and version), a Provider Event (Inbox ID), or a person
+  (operator ID and approved Proposal ID). The database checks each Actor kind has exactly its
+  own fields.
+- Entries **sum to zero per currency**: checked in code before posting, and again at commit
+  by deferred constraint triggers, which also refuse a Transaction with no Entries.
+- **Posted Balance** is the signed sum of an Account's Entries, derived on every read and
+  never stored. Pending and Available Balances, Holds, bitemporal balance queries and Daily
+  Close come later.
+- **Idempotency:** every Transaction has a unique Idempotency Key and a SHA-256 fingerprint of
+  its payload (times compared as instants). The row goes in with `ON CONFLICT DO NOTHING`,
+  so concurrent posts of one key post once. The fingerprint covers the Entries, Actor,
+  Effective Time and description, so a retry that changes only its description is a
+  conflict (ADR 0008). Over HTTP the first post answers `201 Created`;
+  a retry with the same payload answers `200 OK` with the original and
+  `Idempotent-Replayed: true`; the same key with another payload answers `409 Conflict`.
+- **Reversal** (`POST /transactions/{id}/reversal`, with its own Idempotency Key and Actor)
+  posts a Transaction that negates every Entry of the original and references it. A unique
+  `reverses_id` means a Transaction is reversed at most once (a second attempt is a `409`).
+  A Reversal can't itself be reversed: post a new Transaction instead (ADR 0008).
+- **Append-only (ADR 0006):** the Ledger API runs as `railbench_app` (`SET ROLE` on every
+  connection, `LEDGER_DATABASE_ROLE`), which has `SELECT` and `INSERT` only on Ledger tables.
+  A statement trigger rejects `UPDATE`, `DELETE` and `TRUNCATE` from every role, the owner
+  included, unless the session set `railbench.migrating = on`, which only `migrations/env.py`
+  does (`SET LOCAL`, inside the migration transaction). That setting guards against
+  accidents, not against the owner, who can always disable a trigger; the app role has no
+  `UPDATE` or `DELETE` grant whatever it sets. Transaction and Entry IDs are unique but not
+  gapless: a refused or replayed post can use up an ID.
+
+The API: `POST /accounts`, `GET /accounts/{code}` (with its Posted Balance),
+`POST /transactions`, `GET /transactions/{id}` and `POST /transactions/{id}/reversal`. Money
+is a JSON integer: `12.5`, `12.0`, `"1250"` and `true` are all refused with `422`.
+
 ### Layout
 
 - `src/railbench/common`: settings, the Clock, JSON logging, the database Engine, `/health`
-- `src/railbench/ledger`: the Ledger API
+- `src/railbench/ledger`: the Ledger. `journal.py` posts and reads (the one way in),
+  `model.py` holds the validated values, `app.py` is the thin HTTP layer
 - `src/railbench/simulator`: the Simulator, a separate service (ADR 0005)
 - `migrations/`: Alembic. The baseline creates the `ledger`, `payments` (Payments and the
-  Inbox), `reconciliation` and `simulator` schemas.
+  Inbox), `reconciliation` and `simulator` schemas; `0002` adds the Ledger tables, triggers
+  and the `railbench_app` role.
 
 Nothing reads the system time directly: code takes a `Clock` (`WallClock` by default,
 `ManualClock` in tests and Scenarios), and a ruff rule bans `datetime.now()` and friends
