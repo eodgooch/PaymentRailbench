@@ -1,0 +1,62 @@
+# Local stack: Postgres, then migrations, then the Ledger API and the Simulator.
+x-railbench: &railbench
+  build: .
+  image: railbench:dev
+  environment:
+    DATABASE_URL: postgresql+psycopg://railbench:railbench@postgres:5432/railbench
+    SIMULATOR_URL: http://simulator:8100
+    WEBHOOK_SIGNING_SECRET: ${WEBHOOK_SIGNING_SECRET:-change-me}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: railbench
+      POSTGRES_PASSWORD: railbench
+      POSTGRES_DB: railbench
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U railbench -d railbench"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  migrate:
+    <<: *railbench
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  ledger:
+    <<: *railbench
+    command: ["python", "-m", "railbench.ledger"]
+    ports:
+      - "${LEDGER_HOST_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck: &http-health
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(urllib.request.urlopen('http://localhost:8000/health', timeout=2).status != 200)"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  simulator:
+    <<: *railbench
+    command: ["python", "-m", "railbench.simulator"]
+    ports:
+      - "${SIMULATOR_HOST_PORT:-8100}:8100"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(urllib.request.urlopen('http://localhost:8100/health', timeout=2).status != 200)"]
+
+volumes:
+  pgdata:
