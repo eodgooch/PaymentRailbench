@@ -142,7 +142,7 @@ class Journal:
             reverses=None,
             actor=new.actor,
             effective_at=new.effective_at,
-            lines=new.entries,
+            new_entries=new.entries,
         )
 
     def reverse(self, transaction_id: int, request: ReversalRequest) -> Posted:
@@ -162,7 +162,7 @@ class Journal:
                 reverses=transaction_id,
                 actor=request.actor,
                 effective_at=request.effective_at,
-                lines=[
+                new_entries=[
                     NewEntry(account=entry.account, currency=entry.currency, amount=-entry.amount)
                     for entry in original.entries
                 ],
@@ -187,7 +187,7 @@ class Journal:
         reverses: int | None,
         actor: Actor,
         effective_at: datetime,
-        lines: Sequence[NewEntry],
+        new_entries: Sequence[NewEntry],
     ) -> Posted:
         recorded_at = self._clock.now()
         with self._engine.begin() as connection:
@@ -204,20 +204,20 @@ class Journal:
                 .returning(transactions.c.id)
             )
             if transaction_id is not None:
-                account_ids = _resolve_accounts(connection, lines)
+                account_ids = _resolve_accounts(connection, new_entries)
                 connection.execute(
                     insert(entries),
                     [
                         {
                             "transaction_id": transaction_id,
-                            "account_id": account_ids[line.account],
-                            "currency": line.currency,
-                            "amount": line.amount,
+                            "account_id": account_ids[new_entry.account],
+                            "currency": new_entry.currency,
+                            "amount": new_entry.amount,
                             "effective_at": effective_at,
                             "recorded_at": recorded_at,
                             **_actor_columns(actor),
                         }
-                        for line in lines
+                        for new_entry in new_entries
                     ],
                 )
         # Read after commit, once the deferred balance check has passed.
@@ -238,8 +238,8 @@ class Journal:
             return Posted(transaction=_read_transaction(connection, original.id), replayed=True)
 
 
-def _resolve_accounts(connection: Connection, lines: Sequence[NewEntry]) -> dict[str, int]:
-    codes = {line.account for line in lines}
+def _resolve_accounts(connection: Connection, new_entries: Sequence[NewEntry]) -> dict[str, int]:
+    codes = {new_entry.account for new_entry in new_entries}
     found = {
         row.code: row
         for row in connection.execute(
@@ -251,10 +251,12 @@ def _resolve_accounts(connection: Connection, lines: Sequence[NewEntry]) -> dict
     missing = sorted(codes - found.keys())
     if missing:
         raise UnknownAccount(f"no such Account: {', '.join(missing)}")
-    for line in lines:
-        currency = found[line.account].currency
-        if currency != line.currency:
-            raise CurrencyMismatch(f"Account {line.account} is in {currency}, not {line.currency}")
+    for new_entry in new_entries:
+        currency = found[new_entry.account].currency
+        if currency != new_entry.currency:
+            raise CurrencyMismatch(
+                f"Account {new_entry.account} is in {currency}, not {new_entry.currency}"
+            )
     return {code: row.id for code, row in found.items()}
 
 

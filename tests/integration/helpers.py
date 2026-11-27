@@ -4,8 +4,6 @@ from uuid import uuid4
 
 from alembic.config import Config
 
-APP_ROLE = "railbench_app"
-
 
 def alembic_config(url: str) -> Config:
     config = Config("alembic.ini")

@@ -12,6 +12,8 @@
 - Append-only (ADR 0006): the app role `railbench_app` gets SELECT and INSERT only, and a
   trigger rejects UPDATE, DELETE and TRUNCATE from every role, the owner included, unless the
   session is running migrations (`railbench.migrating`, set by `migrations/env.py`).
+  There are no default privileges: a later migration that adds a Ledger table grants it to
+  the app role explicitly, next to its append-only trigger.
 
 Revision ID: 0002
 Revises: 0001
@@ -161,7 +163,6 @@ $$;
 
 GRANT USAGE ON SCHEMA ledger TO {APP_ROLE};
 GRANT SELECT, INSERT ON {", ".join(f"ledger.{t}" for t in TABLES)} TO {APP_ROLE};
-ALTER DEFAULT PRIVILEGES IN SCHEMA ledger GRANT SELECT, INSERT ON TABLES TO {APP_ROLE};
 """
 
 

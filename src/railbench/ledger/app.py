@@ -31,6 +31,15 @@ ERROR_STATUS = {
 }
 
 
+def error_status(error: LedgerError) -> int:
+    """The HTTP status for a refusal. A LedgerError with no mapping of its own is still a
+    refusal of this request, never a server fault, so it answers 422 rather than 500."""
+    return next(
+        (code for kind, code in ERROR_STATUS.items() if isinstance(error, kind)),
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+    )
+
+
 class AccountWithBalance(Account):
     posted_balance: int
 
@@ -49,8 +58,7 @@ def create_app(engine: Engine, clock: Clock) -> FastAPI:
 
     @app.exception_handler(LedgerError)
     def ledger_error(_request: Request, error: LedgerError) -> JSONResponse:
-        code = next(code for kind, code in ERROR_STATUS.items() if isinstance(error, kind))
-        return JSONResponse(status_code=code, content={"detail": str(error)})
+        return JSONResponse(status_code=error_status(error), content={"detail": str(error)})
 
     @app.post("/accounts", status_code=status.HTTP_201_CREATED)
     def open_account(new: NewAccount, journal: JournalDep) -> Account:

@@ -39,13 +39,15 @@ The Ledger is double-entry and append-only, in the `ledger` schema (migration `0
   Close come later.
 - **Idempotency:** every Transaction has a unique Idempotency Key and a SHA-256 fingerprint of
   its payload (times compared as instants). The row goes in with `ON CONFLICT DO NOTHING`,
-  so concurrent posts of one key post once. Over HTTP the first post answers `201 Created`;
+  so concurrent posts of one key post once. The fingerprint covers the Entries, Actor,
+  Effective Time and description, so a retry that changes only its description is a
+  conflict (ADR 0008). Over HTTP the first post answers `201 Created`;
   a retry with the same payload answers `200 OK` with the original and
   `Idempotent-Replayed: true`; the same key with another payload answers `409 Conflict`.
 - **Reversal** (`POST /transactions/{id}/reversal`, with its own Idempotency Key and Actor)
   posts a Transaction that negates every Entry of the original and references it. A unique
   `reverses_id` means a Transaction is reversed at most once (a second attempt is a `409`).
-  A Reversal can't itself be reversed: post a new Transaction instead.
+  A Reversal can't itself be reversed: post a new Transaction instead (ADR 0008).
 - **Append-only (ADR 0006):** the Ledger API runs as `railbench_app` (`SET ROLE` on every
   connection, `LEDGER_DATABASE_ROLE`), which has `SELECT` and `INSERT` only on Ledger tables.
   A statement trigger rejects `UPDATE`, `DELETE` and `TRUNCATE` from every role, the owner

@@ -7,8 +7,8 @@ from alembic import command
 from sqlalchemy import Engine, create_engine
 from testcontainers.community.postgres import PostgresContainer
 
-from railbench.common.db import make_engine
-from tests.integration.helpers import APP_ROLE, alembic_config
+from railbench.common.db import LEDGER_APP_ROLE, make_engine
+from tests.integration.helpers import alembic_config
 
 
 @pytest.fixture(scope="session")
@@ -30,6 +30,6 @@ def engine(database_url: str) -> Iterator[Engine]:
 @pytest.fixture
 def app_engine(database_url: str) -> Iterator[Engine]:
     """Connects the way the Ledger API does: as the append-only app role."""
-    engine = make_engine(database_url, role=APP_ROLE)
+    engine = make_engine(database_url, role=LEDGER_APP_ROLE)
     yield engine
     engine.dispose()
