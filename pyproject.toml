@@ -1,0 +1,67 @@
+[project]
+name = "railbench"
+version = "0.1.0"
+description = "A double-entry Ledger for Mintwharf, tested against a payment-rail Simulator."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "alembic>=1.13",
+    "fastapi>=0.115",
+    "psycopg[binary]>=3.2",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "sqlalchemy>=2.0",
+    "uvicorn>=0.32",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27",
+    "mypy>=1.13",
+    "pre-commit>=4.0",
+    "pytest>=8.3",
+    "ruff>=0.8",
+    "testcontainers[postgres]>=4.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/railbench"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "DTZ", "TID", "RUF"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"datetime.datetime.now".msg = "Read time from a railbench.common.clock.Clock, never the system."
+"datetime.datetime.utcnow".msg = "Read time from a railbench.common.clock.Clock, never the system."
+"datetime.datetime.today".msg = "Read time from a railbench.common.clock.Clock, never the system."
+"datetime.date.today".msg = "Read time from a railbench.common.clock.Clock, never the system."
+"time.time".msg = "Read time from a railbench.common.clock.Clock, never the system."
+
+[tool.ruff.lint.per-file-ignores]
+# The one place allowed to read the system time.
+"src/railbench/common/clock.py" = ["TID251"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src", "tests", "migrations"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["testcontainers.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = ["integration: needs Docker (testcontainers Postgres)"]
