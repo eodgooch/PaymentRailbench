@@ -174,7 +174,7 @@ A Return that arrives after the funds were already Available, so Mintwharf may h
 How long after settlement a Return can still arrive. It depends on the return code: most codes by the opening of the second Banking Day after the Settlement Date, unauthorized consumer debits (such as R10) by the opening of the Banking Day after the 60th calendar day.
 
 **Return exception**:
-The record raised when a Return leaves a Customer Balance short: the deficit moved to Recovery Receivable, as the dollar exposure, with the return code and whether it was a Late Return. It is for a person to work; it is not a Break.
+The record raised when a Return leaves a Customer Balance short: the deficit moved to Recovery Receivable, as the exposure in Minor Units, with the return code and whether it was a Late Return. It is for a person to work; it is not a Break.
 _Avoid_: Break (Breaks come from Reconciliation)
 
 **Provider Adjustment**:

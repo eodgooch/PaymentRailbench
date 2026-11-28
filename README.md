@@ -223,10 +223,11 @@ one, in one database transaction with the Provider Event as Actor:
 - the availability Hold, if still in place, is released, so the money is never Available;
 - if the Customer Balance is left short (the money was spent, say at an Auction Close), the
   deficit moves to that Customer's **Recovery Receivable** (`recovery-receivable:<Customer
-  Balance>`), the Customer Balance goes back to zero, and a **return exception** records the
-  exposure in Minor Units, the return code and whether it was a **Late Return** (after the
-  funds were Available). `GET /return-exceptions[?customer_account=…]` lists them, and
-  `GET /payments/{id}` shows a Payment's.
+  Balance>`) at the moment it occurs, from the Return's Effective Time on (so a delayed
+  Return still leaves no negative balance at any time from then), and a **return exception**
+  records the exposure in Minor Units, the return code and whether it was a **Late Return**
+  (after the funds became Available, by time). `GET /return-exceptions[?customer_account=…]`
+  lists them, and `GET /payments/{id}` shows a Payment's.
 
 What a Customer owes in Recovery Receivable counts against them for Payouts: a Standard
 Payout behind a returned buyer goes on waiting, and an Instant Payout whose buyer was
