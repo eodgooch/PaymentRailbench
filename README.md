@@ -289,6 +289,46 @@ for a Payment that ended without settling is stored `unmatched`, never booked.
 `GET /payments/{id}` shows a Payment's adjustments. `scenarios/settlement-report-faults.yaml`
 has every report Fault; replaying it reproduces the Ledger, adjustments included (tested).
 
+## Reconciliation and the Exception Queue
+
+Reconciliation (SPEC §7.1, ADR 0015) matches each Provider's Banking Day D two-way: the
+Payments the Ledger recorded settled for D's report (by the published Cutoff rule, from
+their Settlement's Effective Time), and D's Provider Adjustments, against the lines of D's
+Settlement Report. It waits for the next Banking Day's report too, so a line one day late is
+a timing mismatch rather than missing, and matches what the Ledger knew when the later of
+the two arrived, so re-running a day finds the same Breaks and adds nothing. The
+`reconciliation` job runs on the Ledger's Clock after report ingest. Every disagreement is a
+**Break**, one rule per **Break Type**:
+
+| Break Type | When |
+|---|---|
+| missing at Provider | settled for D's report, on no report up to the next Banking Day's |
+| timing mismatch | its line is on another day's report than the one it counts toward |
+| amount mismatch | its line's amount isn't what settled |
+| duplicate | a second settlement line for one Payment, or a re-issued report stating other lines |
+| status mismatch | a line for a Payment the Ledger hasn't recorded settled, or a Provider Adjustment still pending |
+| missing in Ledger | a line for no Payment the Ledger has (or contradicting it), or an unmatched Provider Adjustment |
+
+Duplicate, delayed and out-of-order webhooks and Returns are absorbed by the Inbox and the
+state machines and raise no Break (a settlement webhook still unheard when the day is
+reconciled is a status mismatch); the report Faults each raise theirs, and a booked Provider
+Adjustment none (ADR 0015 has the table; tested against the Fault Manifest). Each Break
+stores its exposure in Minor Units, its facts and its evidence, as foreign keys to the
+Payments, state changes, Inbox events, Ledger Transactions, reports, lines and Provider
+Adjustment decisions it rests on; its id is a hash of Provider, day, Break Type and match
+key, the same in every run of a Scenario. Its age runs from detection.
+
+`GET /breaks` is the **Exception Queue**: open Breaks, largest exposure first, then oldest
+(`status=resolved|all`, `provider`, `banking_day`, `break_type` filter it). `GET /breaks/{id}`
+reads one with its evidence. `POST /breaks/{id}/resolution` resolves it once, by a person
+(`{"actor": {"operator_id": …, "proposal_id": …}}`, the Proposal optional) with exactly one
+of a `correcting_transaction_id` already in the Ledger or a `reason`; a retry answers 200,
+another resolution 409. Nothing resolves a Break on its own. `GET /reconciliations/{provider}/{date}`
+says whether the day is reconciled and how many Breaks are open with what exposure (for
+Daily Close); `POST` to it, or `make reconcile DAY=2026-09-04`, reconciles the day. A
+Scenario run reconciles every Banking Day it covers and prints the Breaks; replaying the
+Ledger reproduces them.
+
 ## Scenarios and delivery Faults
 
 A **Scenario** is a named, seeded YAML file of Customers, ACH pulls, Auction Closes and
@@ -330,7 +370,8 @@ one ManualClock, prints each Payment's states and Inbox outcomes, and writes the
 Manifest** (every run does) to `reports/manifests/<scenario>-<seed>.json`: each Fault's id, kind, Payment,
 event, parameters, when it was injected, a cause code and its true root cause. The Ledger
 never reads it: it lives in the `simulator` schema, which the Ledger's role can't read, and
-the `ledger` and `payments` packages can't import `railbench.scenarios` (both tested).
+the `ledger`, `payments` and `reconciliation` packages can't import `railbench.scenarios`
+(both tested).
 
 Under these Faults the Ledger stays correct: a stateful property test
 (`tests/integration/test_ach_payment_properties.py`) delivers a Payment's events, Returns
@@ -353,6 +394,8 @@ recorded), reproduces the Ledger exactly, Recorded Times included.
   interface and its Simulator adapter; served by the Ledger API
 - `src/railbench/marketplace`: Auction Closes, Payouts and the Payout release job; served by
   the Ledger API
+- `src/railbench/reconciliation`: the matching rules (pure), the job, the Exception Queue
+  and resolutions; served by the Ledger API
 - `src/railbench/simulator`: the Simulator, a separate service (ADR 0005), with ACH and RTP,
   scripted endings, delivery Faults, and Settlement Reports with their Faults
 - `src/railbench/scenarios`: Scenario files, the runner and CLI, the Fault Manifest, the
@@ -364,7 +407,8 @@ recorded), reproduces the Ledger exactly, Recorded Times included.
   `0004` adds Payments, the Inbox and state changes; `0005` the Simulator's state; `0006`
   its plans, delivery Faults and the Fault Manifest; `0007` pushes and RTP, and the
   `marketplace` schema; `0008` Returns and return exceptions; `0009` Settlement Reports,
-  their lines and Provider Adjustments.
+  their lines and Provider Adjustments; `0010` Reconciliation runs, Breaks, their evidence
+  and resolutions.
 
 Nothing reads the system time directly: code takes a `Clock` (`WallClock` by default,
 `ManualClock` in tests and Scenarios), and a ruff rule bans `datetime.now()` and friends
