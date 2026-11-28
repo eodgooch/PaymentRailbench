@@ -14,12 +14,12 @@ from railbench.common.settings import Settings
 
 def serve(
     service: str,
-    create_app: Callable[[Engine, Clock], FastAPI],
+    create_app: Callable[[Engine, Clock, Settings], FastAPI],
     port: Callable[[Settings], int],
     database_role: Callable[[Settings], str | None] = lambda _settings: None,
 ) -> None:
     settings = Settings()
     configure_logging(service, settings.log_level)
     engine = make_engine(settings.database_url, role=database_role(settings))
-    app = create_app(engine, WallClock())
+    app = create_app(engine, WallClock(), settings)
     uvicorn.run(app, host="0.0.0.0", port=port(settings), log_config=None)

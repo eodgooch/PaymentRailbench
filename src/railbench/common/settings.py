@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     # unset to None: connect as the DATABASE_URL user itself.
     ledger_database_role: str | None = LEDGER_APP_ROLE
     simulator_url: str = "http://localhost:8100"
+    # Where the Simulator delivers Provider Events: the Ledger's webhook receiver.
+    ledger_webhook_url: str = "http://localhost:8000/providers/simulator/events"
     webhook_signing_secret: SecretStr = SecretStr("change-me")
     anthropic_api_key: SecretStr | None = None
     triage_model: str = ""
@@ -28,3 +30,8 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     ledger_port: int = 8000
     simulator_port: int = 8100
+    # How often a running service does its Clock-driven work: the Simulator advances
+    # Payments and delivers due webhooks; the Ledger makes settled ACH funds Available.
+    # 0 turns the background loop off (tests drive both by hand on a ManualClock).
+    simulator_tick_seconds: float = 0
+    ledger_tick_seconds: float = 0

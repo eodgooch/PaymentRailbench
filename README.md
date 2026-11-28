@@ -87,15 +87,78 @@ The API: `POST /accounts`, `GET /accounts/{code}`, `GET /accounts/{code}/balance
 Key and replays or conflicts the same way. Money is a JSON integer: `12.5`, `12.0`,
 `"1250"` and `true` are all refused with `422`.
 
+## Payments, the Inbox and the Simulator
+
+An ACH pull funds a Customer Balance end to end (SPEC §4.1–4.3, §6, ADR 0004, ADR 0005,
+ADR 0010):
+
+1. `POST /payments` on the Ledger (`rail: ach`, `direction: pull`, a Customer Balance, an
+   integer amount, an Idempotency Key) asks the Provider for the Payment through the
+   **Provider interface** (`railbench.payments.provider`): create Payment, get Payment,
+   verify and read a webhook. `SimulatorProvider` is its HTTP adapter for the Simulator; no
+   Ledger or Payments module imports the Simulator (a test checks the imports). The Payment
+   is recorded as `created`. Retries replay with `200`; another payload under the same key
+   is a `409`.
+2. The Simulator submits the pull, settles it at 08:30 New York time on the Banking Day
+   after submission (the 16:00 Cutoff pushes a late one a day), and delivers signed
+   Provider Events (`payment.submitted`, `payment.settled`) to
+   `POST /providers/simulator/events`, retrying non-2xx answers and timeouts after 30 s,
+   60 s, … up to an hour apart, 10 attempts at most. It claims due events in a short commit
+   and POSTs outside any transaction, so a slow Ledger holds no locks.
+3. The Ledger verifies the HMAC signature (401 if it fails; nothing is stored), stores the
+   event raw in the **Inbox**, deduplicates it by event ID, and applies it at most once.
+   The ACH state machine (`created → submitted → settled → available`, or `canceled` /
+   `declined` before settlement) moves forward only: an event for a state already passed
+   is recorded `stale`, an impossible one (a decline after settlement) is recorded as an
+   `exception` with no Ledger write, and both show on `GET /payments/{id}`.
+4. Booking, through the Journal, with the Provider Event's Inbox ID as Actor:
+   **submitted**: a pending Transaction, Clearing Account → Customer Balance (Pending);
+   **settled**: its Settlement (now Posted), a Transaction from the Clearing Account to Bank
+   Cash (Clearing nets to zero), and a Hold on the Customer Balance;
+   **declined/canceled**: a pending Reversal.
+5. **Available** is the Ledger's decision, not the Provider's: a job on the Ledger's Clock
+   releases the Hold at midnight New York time at the start of the second Banking Day after
+   the settlement's Banking Day. A pull settled on Friday 4 September 2026 is Available on
+   Wednesday 9 September, after a weekend and Labor Day.
+
+The **Banking Day calendar** (`railbench.common.calendar`) knows weekends and the Federal
+Reserve's holidays as it publishes them (a Sunday holiday closes the Monday; a Saturday
+holiday doesn't close the Friday). Payments, the Inbox, outcomes and state changes live in
+the `payments` schema and are append-only like the Ledger (migration `0004`); replaying the
+Inbox into an empty Ledger reproduces it (tested). The Simulator keeps its own mutable state
+in the `simulator` schema (migration `0005`), which the Ledger's role can't read.
+
+**The Clock in tests and running services.** Tests run both apps in-process on one
+`ManualClock`, each on a real localhost port, so webhooks cross real HTTP; they call
+`Simulator.tick()` and `Payments.make_available()` by hand. Running services use the wall
+clock and do the same work on timers (`SIMULATOR_TICK_SECONDS`, `LEDGER_TICK_SECONDS`, on in
+Compose), so under `make dev` a pull reaches `submitted` within a second but settles on the
+real next Banking Day. A clock shared by running services, for demos, comes with
+`make night`.
+
+Three settings extend SPEC §13: `LEDGER_WEBHOOK_URL` (where the Simulator delivers Provider
+Events), `SIMULATOR_TICK_SECONDS` and `LEDGER_TICK_SECONDS` (the timers above; `0` turns
+them off). Applying one Provider Event is one database transaction: the Journal runs as a
+unit of work on the Inbox's connection, so a step the Ledger refuses leaves no Ledger rows
+behind, only the exception.
+
+The Ledger API adds `POST /payments`, `GET /payments/{id}` and
+`POST /providers/{provider}/events`; the Simulator serves `POST /payments` and
+`GET /payments/{id}`.
+
 ### Layout
 
-- `src/railbench/common`: settings, the Clock, JSON logging, the database Engine, `/health`
+- `src/railbench/common`: settings, the Clock, the Banking Day calendar, webhook signing,
+  JSON logging, the database Engine, `/health`
 - `src/railbench/ledger`: the Ledger. `journal.py` posts and reads (the one way in),
   `model.py` holds the validated values, `app.py` is the thin HTTP layer
+- `src/railbench/payments`: Payments, the Inbox and the ACH state machine, the Provider
+  interface and its Simulator adapter; served by the Ledger API
 - `src/railbench/simulator`: the Simulator, a separate service (ADR 0005)
 - `migrations/`: Alembic. The baseline creates the `ledger`, `payments` (Payments and the
   Inbox), `reconciliation` and `simulator` schemas; `0002` adds the Ledger tables, triggers
-  and the `railbench_app` role; `0003` adds Transaction status, Settlements and Holds.
+  and the `railbench_app` role; `0003` adds Transaction status, Settlements and Holds;
+  `0004` adds Payments, the Inbox and state changes; `0005` the Simulator's state.
 
 Nothing reads the system time directly: code takes a `Clock` (`WallClock` by default,
 `ManualClock` in tests and Scenarios), and a ruff rule bans `datetime.now()` and friends

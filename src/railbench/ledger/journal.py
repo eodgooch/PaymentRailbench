@@ -12,12 +12,15 @@ with one key, Postgres lets exactly one insert and the other sees the committed 
 `settlements.transaction_id` for Settlements, `hold_ends.hold_id` for releases and captures.
 
 Balances are derived on every read, never stored or cached (ADR 0009).
+
+`Journal.within(connection)` runs the same operations as one unit of work on a caller's
+open transaction (each write in a savepoint), so a caller such as the Inbox can commit its
+own rows and the Ledger writes they cause together, or neither.
 """
 
-import hashlib
-import json
-from collections.abc import Callable, Iterable, Sequence
-from datetime import UTC, datetime
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -40,6 +43,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
 from railbench.common.clock import Clock
+from railbench.common.fingerprint import fingerprint as payload_fingerprint
 from railbench.ledger.model import (
     Account,
     AccountType,
@@ -146,14 +150,41 @@ class CurrencyMismatch(Rejected):
 
 
 class Journal:
-    def __init__(self, engine: Engine, clock: Clock) -> None:
+    def __init__(self, engine: Engine, clock: Clock, connection: Connection | None = None) -> None:
         self._engine = engine
         self._clock = clock
+        self._connection = connection
+
+    def within(self, connection: Connection) -> "Journal":
+        """This Journal as a unit of work on the caller's `connection`, inside a transaction
+        the caller began. Every write runs in a savepoint and every read sees what the caller
+        has written so far; nothing commits until the caller commits, so the caller's own
+        rows and the Ledger writes commit or roll back together. A refused write rolls back
+        its own savepoint and leaves the caller's transaction usable. The deferred balance
+        check runs at the caller's commit."""
+        return Journal(self._engine, self._clock, connection)
+
+    @contextmanager
+    def _reading(self) -> Iterator[Connection]:
+        if self._connection is None:
+            with self._engine.connect() as connection:
+                yield connection
+        else:
+            yield self._connection
+
+    @contextmanager
+    def _writing(self) -> Iterator[Connection]:
+        if self._connection is None:
+            with self._engine.begin() as connection:
+                yield connection
+        else:
+            with self._connection.begin_nested():
+                yield self._connection
 
     def open_account(self, new: NewAccount) -> Account:
         values = {**new.model_dump(), "recorded_at": self._clock.now()}
         try:
-            with self._engine.begin() as connection:
+            with self._writing() as connection:
                 connection.execute(insert(accounts).values(values))
         except IntegrityError as error:
             if _constraint(error) == "accounts_code_key":
@@ -162,7 +193,7 @@ class Journal:
         return Account.model_validate(values)
 
     def account(self, code: str) -> Account:
-        with self._engine.connect() as connection:
+        with self._reading() as connection:
             row = connection.execute(
                 select(
                     accounts.c.code, accounts.c.type, accounts.c.currency, accounts.c.recorded_at
@@ -195,7 +226,7 @@ class Journal:
                 raise ValueError("balance times must be timezone-aware")
         if known_at > now:
             raise NotYetKnown(f"the Ledger can't know {known_at.isoformat()} yet")
-        with self._engine.connect() as connection:
+        with self._reading() as connection:
             account = connection.execute(
                 select(accounts.c.id, accounts.c.type, accounts.c.currency).where(
                     accounts.c.code == code
@@ -225,7 +256,7 @@ class Journal:
         """Post a Transaction exactly once per Idempotency Key."""
         return self._write(
             key=new.idempotency_key,
-            fingerprint=_fingerprint({"post": new.model_dump(exclude={"idempotency_key"})}),
+            fingerprint=payload_fingerprint({"post": new.model_dump(exclude={"idempotency_key"})}),
             description=new.description,
             reverses=None,
             status=lambda _connection: new.status,
@@ -273,7 +304,7 @@ class Journal:
         try:
             return self._write(
                 key=request.idempotency_key,
-                fingerprint=_fingerprint(payload),
+                fingerprint=payload_fingerprint(payload),
                 description=request.description,
                 reverses=transaction_id,
                 status=status,
@@ -292,14 +323,14 @@ class Journal:
             raise
 
     def transaction(self, transaction_id: int) -> Transaction:
-        with self._engine.connect() as connection:
+        with self._reading() as connection:
             return _read_transaction(connection, transaction_id)
 
     def settle(self, transaction_id: int, request: SettlementRequest) -> Posted:
         """Settle a pending Transaction: from the Settlement's Effective Time, as known from
         its Recorded Time, its Entries count as Posted rather than Pending. No Entry is
         changed. A Transaction settles at most once, and not once it has been reversed."""
-        fingerprint = _fingerprint(
+        fingerprint = payload_fingerprint(
             {"settle": transaction_id, **request.model_dump(exclude={"idempotency_key"})}
         )
 
@@ -344,8 +375,8 @@ class Journal:
         """Place a Hold exactly once per Idempotency Key. It reduces the Account's Available
         Balance from its Effective Time and moves no money. It isn't refused for exceeding
         the Available Balance: deciding that is the caller's job."""
-        fingerprint = _fingerprint({"hold": new.model_dump(exclude={"idempotency_key"})})
-        with self._engine.begin() as connection:
+        fingerprint = payload_fingerprint({"hold": new.model_dump(exclude={"idempotency_key"})})
+        with self._writing() as connection:
             account_ids = _resolve_accounts(connection, [(new.account, new.currency)])
             hold_id: int | None = connection.scalar(
                 pg_insert(holds)
@@ -363,7 +394,7 @@ class Journal:
                 .on_conflict_do_nothing(index_elements=[holds.c.idempotency_key])
                 .returning(holds.c.id)
             )
-        with self._engine.connect() as connection:
+        with self._reading() as connection:
             if hold_id is not None:
                 return HoldRecorded(hold=_read_hold(connection, hold_id), replayed=False)
             original = _replayed(connection, holds, new.idempotency_key, fingerprint)
@@ -371,13 +402,13 @@ class Journal:
             return HoldRecorded(hold=_read_hold(connection, original), replayed=True)
 
     def hold(self, hold_id: int) -> Hold:
-        with self._engine.connect() as connection:
+        with self._reading() as connection:
             return _read_hold(connection, hold_id)
 
     def release_hold(self, hold_id: int, request: ReleaseRequest) -> HoldRecorded:
         """Release a Hold: the reservation ends at the release's Effective Time and no money
         moves. A Hold ends once, by release or by capture."""
-        fingerprint = _fingerprint(
+        fingerprint = payload_fingerprint(
             {"release": hold_id, **request.model_dump(exclude={"idempotency_key"})}
         )
 
@@ -439,7 +470,7 @@ class Journal:
         try:
             return self._write(
                 key=new.idempotency_key,
-                fingerprint=_fingerprint(
+                fingerprint=payload_fingerprint(
                     {"capture": hold_id, "post": new.model_dump(exclude={"idempotency_key"})}
                 ),
                 description=new.description,
@@ -472,7 +503,7 @@ class Journal:
         first, inside the commit, so it can take a lock and read before deciding; `on_posted`
         runs after the Entries, in the same commit, only when the Transaction is new."""
         recorded_at = self._clock.now()
-        with self._engine.begin() as connection:
+        with self._writing() as connection:
             decided = status(connection)
             transaction_id: int | None = connection.scalar(
                 pg_insert(transactions)
@@ -508,8 +539,9 @@ class Journal:
                 )
                 if on_posted is not None:
                     on_posted(connection, transaction_id, recorded_at)
-        # Read after commit, once the deferred balance check has passed.
-        with self._engine.connect() as connection:
+        # Read after commit, once the deferred balance check has passed (within a unit of
+        # work, after the savepoint: the check runs at the caller's commit).
+        with self._reading() as connection:
             if transaction_id is not None:
                 return Posted(
                     transaction=_read_transaction(connection, transaction_id), replayed=False
@@ -537,14 +569,14 @@ class Journal:
         a retry of the same payload, which writes nothing. A unique violation named in
         `conflicts` (an "at most once" rule) raises that Conflict, unless it came from a
         concurrent retry of this same request."""
-        with self._engine.connect() as connection:
+        with self._reading() as connection:
             if _replayed(connection, table, key, fingerprint):
                 return False
         try:
-            with self._engine.begin() as connection:
+            with self._writing() as connection:
                 write(connection)
         except IntegrityError as error:
-            with self._engine.connect() as connection:
+            with self._reading() as connection:
                 if _replayed(connection, table, key, fingerprint):
                     return False
             conflict = conflicts.get(_constraint(error) or "")
@@ -771,20 +803,6 @@ def _actor_from(row: Row[Any]) -> Actor:
         case "person":
             return Person(operator_id=row.actor_operator_id, proposal_id=row.actor_proposal_id)
     raise ValueError(f"unknown Actor kind {row.actor_kind!r}")
-
-
-def _fingerprint(payload: dict[str, Any]) -> str:
-    """A SHA-256 of the request's canonical JSON, to tell a retry from a different request
-    reusing its Idempotency Key."""
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=_instant)
-    return hashlib.sha256(canonical.encode()).hexdigest()
-
-
-def _instant(value: object) -> str:
-    # Times compare as instants: 16:00-05:00 and 21:00Z are the same payload.
-    if isinstance(value, datetime):
-        return value.astimezone(UTC).isoformat()
-    raise TypeError(f"can't fingerprint {type(value).__name__}")
 
 
 def _constraint(error: IntegrityError) -> str | None:

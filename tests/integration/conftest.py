@@ -4,7 +4,7 @@ from collections.abc import Iterator
 
 import pytest
 from alembic import command
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, text
 from testcontainers.community.postgres import PostgresContainer
 
 from railbench.common.db import LEDGER_APP_ROLE, make_engine
@@ -33,3 +33,12 @@ def app_engine(database_url: str) -> Iterator[Engine]:
     engine = make_engine(database_url, role=LEDGER_APP_ROLE)
     yield engine
     engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def quiet_simulator(engine: Engine) -> None:
+    """Every test starts with no Provider Events waiting for delivery, so one test's
+    undelivered webhooks never reach another test's receiver. The Simulator's state is its
+    own bookkeeping, not the Ledger, so it can be deleted."""
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM simulator.events"))
