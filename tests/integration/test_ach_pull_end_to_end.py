@@ -33,10 +33,10 @@ from railbench.payments.provider import Provider, ProviderPayment, SimulatorProv
 from railbench.payments.service import Payments
 from railbench.payments.state_machine import AchState
 from railbench.payments.tables import inbox
+from railbench.scenarios.servers import free_port, serving
 from railbench.simulator.app import create_app as create_simulator_app
 from railbench.simulator.provider import Simulator
 from tests.integration.helpers import alembic_config, unique
-from tests.integration.servers import free_port, serving
 
 pytestmark = pytest.mark.integration
 

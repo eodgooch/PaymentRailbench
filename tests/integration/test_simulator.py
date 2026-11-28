@@ -16,11 +16,11 @@ from sqlalchemy import Engine
 from railbench.common.clock import ManualClock
 from railbench.common.settings import Settings
 from railbench.common.signing import SIGNATURE_HEADER, verify
+from railbench.scenarios.servers import serving
 from railbench.simulator.app import create_app
 from railbench.simulator.model import EventType, PaymentPlan
 from railbench.simulator.provider import PlanConflict, Simulator, event_id_for
 from tests.integration.helpers import unique
-from tests.integration.servers import serving
 
 pytestmark = pytest.mark.integration
 

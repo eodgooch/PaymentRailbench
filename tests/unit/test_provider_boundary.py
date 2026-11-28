@@ -1,5 +1,7 @@
 """The Ledger talks to the Simulator only through the Provider interface (ADR 0005): no
-Ledger or Payments module imports the Simulator, and the Simulator imports neither."""
+Ledger or Payments module imports the Simulator, and the Simulator imports neither. And the
+Ledger never reads the fault manifest (SPEC §6, ADR 0011): only Scenario tooling may import
+`railbench.scenarios`, which writes it."""
 
 import ast
 from pathlib import Path
@@ -9,10 +11,15 @@ import pytest
 SRC = Path(__file__).parents[2] / "src" / "railbench"
 
 FORBIDDEN = {
-    "ledger": ("railbench.simulator",),
-    "payments": ("railbench.simulator",),
-    "common": ("railbench.simulator", "railbench.ledger", "railbench.payments"),
-    "simulator": ("railbench.ledger", "railbench.payments"),
+    "ledger": ("railbench.simulator", "railbench.scenarios"),
+    "payments": ("railbench.simulator", "railbench.scenarios"),
+    "common": (
+        "railbench.simulator",
+        "railbench.ledger",
+        "railbench.payments",
+        "railbench.scenarios",
+    ),
+    "simulator": ("railbench.ledger", "railbench.payments", "railbench.scenarios"),
 }
 
 

@@ -1,0 +1,38 @@
+# A batch of buyer ACH pulls with delivery Faults drawn at random from the seed: run it with
+# another seed for another mix. One pull is canceled. Expected: whatever the mix, every
+# event applies at most once, nothing moves backward, and replaying the Inbox reproduces
+# the Ledger.
+name: ach-pull-random-faults
+description: Duplicate, delayed and out-of-order webhooks drawn from the seed.
+seed: 5
+start: 2026-09-03T15:00:00-04:00
+customers:
+  - id: c-esme
+    name: Esme Varga
+  - id: c-fitz
+    name: Fitz Adebayo
+payments:
+  - id: esme-1
+    customer: c-esme
+    amount: 12000
+  - id: fitz-1
+    customer: c-fitz
+    amount: 8800
+    at: PT5M
+  - id: esme-2
+    customer: c-esme
+    amount: 650
+    at: PT10M
+    outcome: cancel
+  - id: fitz-2
+    customer: c-fitz
+    amount: 40100
+    at: PT15M
+  - id: esme-3
+    customer: c-esme
+    amount: 2300
+    at: PT2H # after Cutoff: counts toward Friday, settles after Labor Day
+random_faults:
+  rate: 0.5
+  kinds: [duplicate, delay, out_of_order]
+  max_delay: PT12H
