@@ -8,7 +8,9 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from railbench.common.returns import RETURN_CODES
 
 BIGINT_MAX = 2**63 - 1
 
@@ -21,6 +23,7 @@ class PaymentStatus(StrEnum):
     SETTLED = "settled"
     DECLINED = "declined"
     CANCELED = "canceled"
+    RETURNED = "returned"
 
 
 class EventType(StrEnum):
@@ -30,6 +33,7 @@ class EventType(StrEnum):
     SETTLED = "payment.settled"
     DECLINED = "payment.declined"
     CANCELED = "payment.canceled"
+    RETURNED = "payment.returned"
 
 
 class PaymentRequest(BaseModel):
@@ -67,6 +71,17 @@ class SimulatedPayment(BaseModel):
     settled_at: datetime | None
     # When it was declined or canceled, if it was.
     ended_at: datetime | None = None
+    # When it was returned, if it was, and with which NACHA return code.
+    returned_at: datetime | None = None
+    return_code: str | None = None
+
+
+class ReturnRequest(BaseModel):
+    """Return a settled ACH pull now, with a NACHA return code (a Return injected by hand)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    code: str
 
 
 # Scripting the Simulator (SPEC §6): how a Payment ends and which delivery Faults to inject.
@@ -74,7 +89,7 @@ class SimulatedPayment(BaseModel):
 # Simulator itself makes no random choices.
 
 Outcome = Literal["settle", "decline", "cancel"]
-EventName = Literal["submitted", "settled", "declined", "canceled"]
+EventName = Literal["submitted", "settled", "declined", "canceled", "returned"]
 FaultId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,79}$")]
 
 FINAL_EVENT: dict[str, EventName] = {
@@ -89,12 +104,14 @@ STATUS_FOR_OUTCOME = {
 }
 
 
-def events_for(outcome: Outcome, rail: Rail) -> tuple[EventName, ...]:
+def events_for(outcome: Outcome, rail: Rail, returned: bool = False) -> tuple[EventName, ...]:
     """The Provider Events a Payment on `rail` with this outcome emits, in the order it
-    emits them. An RTP Payment emits only its ending: it settles or is declined at once."""
+    emits them, ending with its Return if it's `returned`. An RTP Payment emits only its
+    ending: it settles or is declined at once."""
     if rail == "rtp":
         return (FINAL_EVENT[outcome],)
-    return ("submitted", FINAL_EVENT[outcome])
+    ending: tuple[EventName, ...] = ("returned",) if returned else ()
+    return ("submitted", FINAL_EVENT[outcome], *ending)
 
 
 class _Fault(BaseModel):
@@ -105,10 +122,13 @@ class _Fault(BaseModel):
 
 
 class DuplicateDelivery(_Fault):
-    """Deliver the event `times` more times after the first: same event ID, same body."""
+    """Deliver the event `times` more times after the first: same event ID, same body. With
+    `after`, the extra copies are held until that later event has been delivered (a
+    redelivery long after the original, say a settlement redelivered after its Return)."""
 
     kind: Literal["duplicate"] = "duplicate"
     times: Annotated[int, Field(strict=True, ge=1, le=10)] = 1
+    after: EventName | None = None
 
 
 class DelayedDelivery(_Fault):
@@ -131,9 +151,35 @@ class OutOfOrderDelivery(_Fault):
     after: EventName
 
 
-# A discriminated union: Returns, Cutoff and Settlement Report Faults join as new kinds.
+class PlannedReturn(_Fault):
+    """Return the settled ACH pull with NACHA return `code`, `at` after it settled. It must
+    land inside the code's Return Window (`railbench.common.returns`): the Simulator refuses
+    the Payment otherwise, once it knows when it settles. A Late Return is one after the
+    funds became Available (SPEC §6: "Late Return, any code, any time inside its window")."""
+
+    kind: Literal["return"] = "return"
+    event: Literal["returned"] = "returned"
+    code: str
+    at: timedelta
+
+    @field_validator("code")
+    @classmethod
+    def _known_code(cls, code: str) -> str:
+        if code not in RETURN_CODES:
+            raise ValueError(f"the Simulator knows no NACHA return code {code!r}")
+        return code
+
+    @model_validator(mode="after")
+    def _after_settlement(self) -> Self:
+        if self.at < timedelta(0):
+            raise ValueError("a Return can't come before its Payment settled")
+        return self
+
+
+# A discriminated union: Cutoff and Settlement Report Faults join as new kinds.
 FaultPlan = Annotated[
-    DuplicateDelivery | DelayedDelivery | OutOfOrderDelivery, Field(discriminator="kind")
+    DuplicateDelivery | DelayedDelivery | OutOfOrderDelivery | PlannedReturn,
+    Field(discriminator="kind"),
 ]
 
 
@@ -147,23 +193,34 @@ class PaymentPlan(BaseModel):
     outcome: Outcome = "settle"
     faults: tuple[FaultPlan, ...] = ()
 
+    @property
+    def planned_return(self) -> "PlannedReturn | None":
+        return next((f for f in self.faults if isinstance(f, PlannedReturn)), None)
+
     @model_validator(mode="after")
     def _faults_fit_the_outcome(self) -> Self:
         if self.rail == "rtp" and self.outcome == "cancel":
             raise ValueError("an RTP Payment can't be canceled: it settles or is declined")
-        emitted = events_for(self.outcome, self.rail)
+        returns = [fault for fault in self.faults if isinstance(fault, PlannedReturn)]
+        if returns and (self.rail != "ach" or self.outcome != "settle"):
+            raise ValueError("only an ACH Payment that settles can be returned (RTP has none)")
+        if len(returns) > 1:
+            raise ValueError("a Payment is returned at most once")
+        emitted = events_for(self.outcome, self.rail, returned=bool(returns))
         for fault in self.faults:
+            later = (
+                fault.after if isinstance(fault, OutOfOrderDelivery | DuplicateDelivery) else None
+            )
             if fault.event not in emitted:
                 raise ValueError(
                     f"fault {fault.id}: a Payment that ends {self.outcome!r} never emits "
                     f"{fault.event!r}"
                 )
-            if isinstance(fault, OutOfOrderDelivery) and (
-                fault.after not in emitted
-                or emitted.index(fault.after) <= emitted.index(fault.event)
+            if later is not None and (
+                later not in emitted or emitted.index(later) <= emitted.index(fault.event)
             ):
                 raise ValueError(
-                    f"fault {fault.id}: {fault.after!r} is not emitted after {fault.event!r}"
+                    f"fault {fault.id}: {later!r} is not emitted after {fault.event!r}"
                 )
         return self
 

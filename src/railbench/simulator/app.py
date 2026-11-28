@@ -2,7 +2,11 @@
 
 `POST /payments` creates a Payment once per Idempotency Key: 201 for a new one, 200 with
 `Idempotent-Replayed: true` for a retry of the same request, 409 for the same key with a
-different payload. `GET /payments/{id}` reads one. Provider Events go out as signed
+different payload (or a plan the Payment can't follow), 422 for a planned Return that would
+fall outside its Return Window. `GET /payments/{id}` reads one. `POST /payments/{id}/returns`
+returns a settled ACH pull now with a NACHA return code (201; 409 if it can't be returned,
+422 outside the code's Return Window or for an unknown code): a control endpoint for tests
+and demos, as a Provider's sandbox would have. Provider Events go out as signed
 webhooks to LEDGER_WEBHOOK_URL whenever `Simulator.tick()` runs: every
 SIMULATOR_TICK_SECONDS in a running service, by hand in tests.
 """
@@ -17,11 +21,13 @@ from railbench.common.clock import Clock
 from railbench.common.service import create_service_app
 from railbench.common.settings import Settings
 from railbench.common.ticker import ticking
-from railbench.simulator.model import PaymentRequest, SimulatedPayment
+from railbench.simulator.model import PaymentRequest, ReturnRequest, SimulatedPayment
 from railbench.simulator.provider import (
     IdempotencyConflict,
     PaymentNotFound,
     PlanMismatch,
+    ReturnOutsideWindow,
+    ReturnRefused,
     Simulator,
 )
 
@@ -64,6 +70,8 @@ def create_app(
             created, replayed = simulator.create_payment(payment)
         except (IdempotencyConflict, PlanMismatch) as error:
             raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
+        except ReturnOutsideWindow as error:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(error)) from error
         if replayed:
             response.status_code = status.HTTP_200_OK
             response.headers["Idempotent-Replayed"] = "true"
@@ -77,5 +85,20 @@ def create_app(
             return simulator.payment(payment_id)
         except PaymentNotFound as error:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"no Payment {payment_id}") from error
+
+    @app.post(
+        "/payments/{payment_id}/returns",
+        status_code=status.HTTP_201_CREATED,
+        responses={404: {}, 409: {}, 422: {}},
+    )
+    def return_payment(payment_id: str, request: ReturnRequest) -> SimulatedPayment:
+        try:
+            return simulator.return_payment(payment_id, request.code)
+        except PaymentNotFound as error:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"no Payment {payment_id}") from error
+        except ReturnRefused as error:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
+        except ReturnOutsideWindow as error:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(error)) from error
 
     return app

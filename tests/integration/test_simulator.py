@@ -528,3 +528,165 @@ def test_a_payment_must_be_on_the_rail_it_was_planned_for(client: TestClient) ->
     simulator(client).plan(PaymentPlan(idempotency_key=key, outcome="decline"))
 
     assert client.post("/payments", json=rtp_push(key)).status_code == 409
+
+
+# Returns (SPEC §4.3, §6, ADR 0013): a settled ACH pull can be returned with a NACHA return
+# code at any time inside that code's Return Window, and never outside it.
+WEDNESDAY_OPENING = datetime(2026, 9, 9, 4, 0, tzinfo=UTC)  # R01-R03 deadline for Friday
+NOVEMBER_4_OPENING = datetime(2026, 11, 4, 5, 0, tzinfo=UTC)  # R10 deadline for Friday
+
+
+def a_return(code: str, at: timedelta, **more: Any) -> dict[str, Any]:
+    return {"id": f"return-{code.lower()}", "kind": "return", "code": code, "at": at, **more}
+
+
+def test_a_planned_return_arrives_with_its_code_after_the_settlement(
+    client: TestClient, clock: ManualClock, receiver: Receiver
+) -> None:
+    payment_id = planned(client, "settle", a_return("R10", timedelta(days=30)))
+    clock.set(FRIDAY_SETTLEMENT)
+    simulator(client).tick()
+    assert simulator(client).next_due() == FRIDAY_SETTLEMENT + timedelta(days=30)
+
+    clock.set(FRIDAY_SETTLEMENT + timedelta(days=30))
+    simulator(client).tick()
+
+    found = client.get(f"/payments/{payment_id}").json()
+    assert (found["status"], found["return_code"]) == ("returned", "R10")
+    assert found["returned_at"] == "2026-10-04T12:30:00Z"
+    events = events_for(receiver, payment_id)
+    assert [e["type"] for e in events] == [
+        "payment.submitted",
+        "payment.settled",
+        "payment.returned",
+    ]
+    returned = events[-1]
+    assert returned["occurred_at"] == "2026-10-04T12:30:00Z"
+    assert returned["return"]["code"] == "R10"
+    assert "not authorized" in returned["return"]["reason"]
+    [fault] = [f for f in simulator(client).faults() if f.payment_id == payment_id]
+    assert (fault.kind, fault.event_type, fault.cause_code) == (
+        "return",
+        "payment.returned",
+        "late_return",
+    )
+    assert fault.params == {"code": "R10", "at": "P30D"}
+    assert "R10" in fault.root_cause and fault.event_id in fault.root_cause
+
+
+def test_a_return_inside_the_administrative_window_is_not_a_late_return(
+    client: TestClient, clock: ManualClock
+) -> None:
+    payment_id = planned(client, "settle", a_return("R01", WEDNESDAY_OPENING - FRIDAY_SETTLEMENT))
+    clock.set(WEDNESDAY_OPENING)
+    simulator(client).tick()
+
+    assert client.get(f"/payments/{payment_id}").json()["status"] == "returned"
+    [fault] = [f for f in simulator(client).faults() if f.payment_id == payment_id]
+    assert fault.cause_code == "ach_return"
+
+
+@pytest.mark.parametrize(
+    ("code", "deadline"), [("R01", WEDNESDAY_OPENING), ("R10", NOVEMBER_4_OPENING)]
+)
+def test_a_planned_return_outside_its_window_is_refused(
+    client: TestClient, code: str, deadline: datetime
+) -> None:
+    key = unique("too-late")
+    late = deadline - FRIDAY_SETTLEMENT + timedelta(seconds=1)
+    simulator(client).plan(
+        PaymentPlan.model_validate({"idempotency_key": key, "faults": [a_return(code, late)]})
+    )
+
+    response = client.post("/payments", json=ach_pull(key))
+
+    assert response.status_code == 422
+    assert "Return Window" in response.json()["detail"]
+
+
+def test_a_return_can_only_be_planned_for_an_ach_pull_that_settles(client: TestClient) -> None:
+    for plan in (
+        {"rail": "rtp", "faults": [a_return("R10", timedelta(days=1))]},
+        {"outcome": "decline", "faults": [a_return("R10", timedelta(days=1))]},
+        {"faults": [a_return("R99", timedelta(days=1))]},
+        {"faults": [a_return("R10", timedelta(days=-1))]},
+        {"faults": [a_return("R10", timedelta(days=1)), a_return("R01", timedelta(0), id="x")]},
+    ):
+        with pytest.raises(ValueError):
+            PaymentPlan.model_validate({"idempotency_key": "k", **plan})
+
+    key = unique("push-returned")
+    simulator(client).plan(
+        PaymentPlan.model_validate(
+            {"idempotency_key": key, "faults": [a_return("R03", timedelta(hours=1))]}
+        )
+    )
+    response = client.post(
+        "/payments", json=ach_pull(key, direction="push", reference="Mintwharf payout")
+    )
+    assert response.status_code == 409
+    assert "pull" in response.json()["detail"]
+
+
+def test_delivery_faults_act_on_the_return_too(
+    client: TestClient, clock: ManualClock, receiver: Receiver
+) -> None:
+    payment_id = planned(
+        client,
+        "settle",
+        a_return("R02", timedelta(hours=2)),
+        {"id": "twice", "kind": "duplicate", "event": "returned"},
+        # The settlement's redelivery comes only after the Return has gone out.
+        {"id": "again", "kind": "duplicate", "event": "settled", "after": "returned"},
+    )
+    clock.set(FRIDAY_SETTLEMENT)
+    simulator(client).tick()
+    clock.set(FRIDAY_SETTLEMENT + timedelta(hours=2))
+    simulator(client).tick()
+    simulator(client).tick()
+
+    assert [type_ for type_, _ in received(receiver, payment_id)] == [
+        "payment.submitted",
+        "payment.settled",
+        "payment.returned",
+        "payment.returned",
+        "payment.settled",
+    ]
+
+
+def test_a_return_can_be_injected_now_inside_its_window(
+    client: TestClient, clock: ManualClock, receiver: Receiver
+) -> None:
+    payment_id = create(client, ach_pull())["id"]
+    early = client.post(f"/payments/{payment_id}/returns", json={"code": "R01"})
+    assert early.status_code == 409  # not settled yet
+    assert "settled" in early.json()["detail"]
+
+    clock.set(NOVEMBER_4_OPENING)
+    simulator(client).tick()  # settles at Friday 08:30, which is long past
+    too_late = client.post(f"/payments/{payment_id}/returns", json={"code": "R01"})
+    assert too_late.status_code == 422
+    assert "Return Window" in too_late.json()["detail"]
+    assert client.post(f"/payments/{payment_id}/returns", json={"code": "R42"}).status_code == 422
+
+    returned = client.post(f"/payments/{payment_id}/returns", json={"code": "R10"})
+    assert returned.status_code == 201, returned.text
+    assert (returned.json()["status"], returned.json()["returned_at"]) == (
+        "returned",
+        "2026-11-04T05:00:00Z",
+    )
+    simulator(client).tick()
+    assert received(receiver, payment_id)[-1][0] == "payment.returned"
+    again = client.post(f"/payments/{payment_id}/returns", json={"code": "R10"})
+    assert again.status_code == 409  # a Payment is returned once
+    [fault] = [f for f in simulator(client).faults() if f.payment_id == payment_id]
+    assert (fault.kind, fault.cause_code) == ("return", "late_return")
+
+
+def test_an_rtp_push_cannot_be_returned(client: TestClient) -> None:
+    payment_id = create(client, rtp_push())["id"]
+
+    response = client.post(f"/payments/{payment_id}/returns", json={"code": "R01"})
+
+    assert response.status_code == 409
+    assert "RTP" in response.json()["detail"]
