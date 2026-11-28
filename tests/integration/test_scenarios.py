@@ -11,6 +11,7 @@ import pytest
 from sqlalchemy import Engine, create_engine, select
 
 from railbench.common.db import LEDGER_APP_ROLE, make_engine
+from railbench.common.settlement_reports import report_published_at
 from railbench.payments.tables import inbox
 from railbench.scenarios.model import Scenario, load
 from railbench.scenarios.replay import availability_job_runs, replay_inbox
@@ -184,17 +185,29 @@ def test_the_same_scenario_and_seed_replay_exactly(database_url: str, manifests:
 
     assert first.manifest.faults  # the seed drew some Faults
     assert first.manifest == second.manifest == crowded.manifest
-    assert first.ticks == second.ticks == crowded.ticks
-    assert first.summary == second.summary == only(scenario.name, crowded.summary)
+    assert first.ticks == second.ticks
+    # A Settlement Report covers every Payment the Provider settled that day, so when reports
+    # are published depends on the whole database; every other moment doesn't.
+    published = {
+        report_published_at(day) for found in (first, crowded) for day in found.settlement_reports
+    }
+    assert [t for t in first.ticks if t not in published] == [
+        t for t in crowded.ticks if t not in published
+    ]
+    assert first.settlement_reports == second.settlement_reports
+    assert first.summary == second.summary
+    assert only(scenario.name, first.summary) == only(scenario.name, crowded.summary)
     assert other_seed.manifest.faults != first.manifest.faults
 
 
 def only(name: str, summary: dict[str, Any]) -> dict[str, Any]:
-    """The part of a Ledger summary belonging to one Scenario's Payments."""
+    """The part of a Ledger summary belonging to one Scenario's Payments. Settlement Reports
+    are left out: one report lists every Scenario's settlements that day."""
     prefix = f"scenario:{name}:"
     return {
         section: {key: value for key, value in rows.items() if key.startswith(prefix)}
         for section, rows in summary.items()
+        if section != "settlement_reports"
     }
 
 
@@ -444,6 +457,109 @@ def test_replaying_the_inbox_reproduces_a_ledger_with_returns(
             owner.dispose()
             target.dispose()
 
+    replayed = create_engine(fresh)
+    try:
+        assert ledger_summary(replayed) == original.summary
+    finally:
+        replayed.dispose()
+
+
+# Settlement Reports (ADR 0014)
+
+
+def report_lines(found: Run, day: str) -> list[tuple[str, str, int, str]]:
+    [report] = found.summary["settlement_reports"][f"simulator:{day}"]
+    assert report["outcome"] == "ingested"
+    return [
+        (line["type"], line["idempotency_key"].split(":")[-1], line["amount"], line["settled_at"])
+        for line in report["lines"]
+    ]
+
+
+def test_every_settlement_report_fault_shows_on_its_report_and_in_the_manifest(
+    database_url: str, manifests: Path
+) -> None:
+    found = run_in_fresh_database(
+        database_url, manifests, load(SCENARIOS / "settlement-report-faults.yaml")
+    )
+
+    reports = found.summary["settlement_reports"]
+    assert list(reports) == [
+        "simulator:2026-09-03",
+        "simulator:2026-09-04",
+        "simulator:2026-09-08",
+        "simulator:2026-09-09",
+    ]
+    assert report_lines(found, "2026-09-03") == [
+        ("settlement", "rtp", -27_000, "2026-09-03T21:00:00+00:00")
+    ]
+    assert report_lines(found, "2026-09-04") == [
+        ("settlement", "wren-funding", 59_500, "2026-09-04T12:30:00+00:00"),
+        ("adjustment", "rtp", 2_000, "2026-09-04T16:00:00+00:00"),
+    ]
+    assert report_lines(found, "2026-09-08") == [
+        ("settlement", "jules-funding", 8_000, "2026-09-04T20:00:00+00:00")
+    ]
+    assert report_lines(found, "2026-09-09") == [
+        ("adjustment", "wren-funding", -150, "2026-09-09T16:00:00+00:00")
+    ]
+    assert {(f.fault_id, f.payment, f.cause_code) for f in found.manifest.faults} == {
+        ("wren-reported-short", "wren-funding", "wrong_report_amount"),
+        ("pax-line-missing", "pax-funding", "missing_report_line"),
+        ("jules-after-cutoff", "jules-funding", "settlement_after_cutoff"),
+        ("ottoline-payout-recalled", "ottoline-payout:rtp", "provider_adjustment"),
+        ("wren-fee-corrected", "wren-funding", "provider_adjustment"),
+    }
+
+    totals = account_totals(found.summary)
+    assert totals["bank-cash:usd"] == 54_850
+    assert totals["provider-fees:usd"] == 150
+    assert totals["customer:c-ottoline:usd"] == -2_000  # owed again: a liability in credit
+    assert totals["customer:c-pax:usd"] == -12_000  # funded in full, line or no line
+    assert totals["customer:c-jules:usd"] == -8_000
+    assert totals["clearing:simulator:ach:usd"] == totals["clearing:simulator:rtp:usd"] == 0
+    [booked] = [
+        line["adjustment"]
+        for line in reports["simulator:2026-09-09"][0]["lines"]
+        if line["adjustment"]
+    ]
+    assert booked["outcome"] == "booked"
+    assert booked["payment"] == "scenario:settlement-report-faults:8:wren-funding"
+    assert no_exceptions(found)
+
+
+def test_the_same_scenario_and_seed_publish_byte_identical_reports(
+    database_url: str, manifests: Path
+) -> None:
+    scenario = load(SCENARIOS / "settlement-report-faults.yaml")
+
+    first = run_in_fresh_database(database_url, manifests, scenario)
+    second = run_in_fresh_database(database_url, manifests, scenario)
+
+    assert first.settlement_reports
+    assert first.settlement_reports == second.settlement_reports
+    assert first.manifest == second.manifest
+    assert first.summary == second.summary
+
+
+def test_replaying_reproduces_a_ledger_with_settlement_reports_and_adjustments(
+    database_url: str, fresh: str, manifests: Path
+) -> None:
+    with fresh_database(database_url) as source:
+        original = run(
+            load(SCENARIOS / "settlement-report-faults.yaml"),
+            source,
+            manifest_path=manifests / "reports.json",
+        )
+        owner: Engine = create_engine(source)
+        target = make_engine(fresh, role=LEDGER_APP_ROLE)
+        try:
+            replay_inbox(owner, target)
+        finally:
+            owner.dispose()
+            target.dispose()
+
+    assert original.summary["settlement_reports"]
     replayed = create_engine(fresh)
     try:
         assert ledger_summary(replayed) == original.summary

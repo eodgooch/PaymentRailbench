@@ -451,6 +451,16 @@ class Simulator:
             raise ReportNotFound(f"no {provider} Settlement Report for {day.isoformat()}")
         return bytes(body)
 
+    def published_reports(self, provider: str) -> dict[date, bytes]:
+        """Every Settlement Report published for the Provider, by Banking Day."""
+        with self._engine.connect() as connection:
+            rows = connection.execute(
+                select(settlement_reports.c.report_date, settlement_reports.c.body)
+                .where(settlement_reports.c.provider == provider)
+                .order_by(settlement_reports.c.report_date)
+            ).all()
+        return {row.report_date: bytes(row.body) for row in rows}
+
     def sign(self, body: bytes) -> str:
         """The signature header value for a response body, signed now (ADR 0010)."""
         return sign(self._secret, body, self._clock.now())

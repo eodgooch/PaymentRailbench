@@ -8,8 +8,11 @@ and Payments as recorded (a stand-in Provider answers each origination with the 
 ID it gave the first time), each Auction Close from its lots and Payout requests with the fee
 and Instant Payout limit it was booked under, every Inbox body applied through
 `Payments.replay` at the time it was first received, and the availability and Payout
-release jobs run at each moment they recorded doing something. At one moment they go in this
-order: Accounts, Auction Closes, originations, Provider Events, then the two jobs. Every
+release jobs run at each moment they recorded doing something, and every Settlement Report
+the Ledger received, raw, at the time it received it (ADR 0014), so its lines, and its
+Provider Adjustments' bookings, come out the same. At one moment they go in this order:
+Accounts, Auction Closes, originations, Provider Events, the two jobs, then Settlement
+Reports, in the order received. Every
 Payment is originated from its row, a Payout's too, naming the Hold that reserves it (found
 in the target by the Hold's Idempotency Key), so a Payout's Payment exists before Provider
 Events about it arrive, even when the run made it and heard of it at one Clock moment.
@@ -45,9 +48,10 @@ from railbench.payments.provider import (
     SettlementReport,
     SimulatorProvider,
 )
+from railbench.payments.reports import SettlementReports
 from railbench.payments.service import AVAILABILITY_JOB, PaymentNotYetKnown, Payments
 from railbench.payments.state_machine import PaymentState
-from railbench.payments.tables import inbox, payments, transitions
+from railbench.payments.tables import inbox, payments, settlement_reports, transitions
 
 
 class RecordedProvider:
@@ -117,6 +121,7 @@ class StepKind(IntEnum):
     RECEIVE_EVENT = 3
     RUN_AVAILABILITY_JOB = 4
     RUN_PAYOUT_JOB = 5
+    RECEIVE_REPORT = 6
 
 
 @dataclass(frozen=True)
@@ -151,9 +156,13 @@ def replay_inbox(
         )
         closes: list[tuple[Any, NewAuctionClose]] = []
         payout_runs: list[datetime] = []
+        report_rows: list[Any] = []
         if accounts_in_scope is None:
             closes = _auction_closes(connection)
             payout_runs = payout_job_runs(connection)
+            report_rows = list(
+                connection.execute(select(settlement_reports).order_by(settlement_reports.c.id))
+            )
     providers = {p.provider for p in payment_rows}
     if len(providers) > 1:
         raise NotImplementedError(f"replaying more than one Provider: {sorted(providers)}")
@@ -177,6 +186,7 @@ def replay_inbox(
             *(Step(at, StepKind.RUN_AVAILABILITY_JOB, n) for n, at in enumerate(job_runs)),
             *(Step(c.recorded_at, StepKind.CLOSE_AUCTION, c.id, (c, new)) for c, new in closes),
             *(Step(at, StepKind.RUN_PAYOUT_JOB, n) for n, at in enumerate(payout_runs)),
+            *(Step(r.received_at, StepKind.RECEIVE_REPORT, r.id, r) for r in report_rows),
         ],
         key=lambda step: step.sort_key,
     )
@@ -187,6 +197,7 @@ def replay_inbox(
     service = Payments(target, clock, journal, provider)
     # Each Auction Close is booked under the terms it recorded; the release job needs none.
     marketplace = Marketplace(target, clock, journal, service)
+    reports = SettlementReports(target, clock, journal, provider)
 
     for step in steps:
         clock.set(step.at)
@@ -223,6 +234,8 @@ def replay_inbox(
                 )
             case StepKind.RUN_PAYOUT_JOB:
                 marketplace.release_payouts()
+            case StepKind.RECEIVE_REPORT:
+                reports.replay(row.provider, row.report_date, bytes(row.body), row.headers)
 
 
 def _auction_closes(connection: Connection) -> list[tuple[Any, NewAuctionClose]]:

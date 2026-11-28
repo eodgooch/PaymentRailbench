@@ -178,11 +178,11 @@ The record raised when a Return leaves a Customer Balance short: the deficit mov
 _Avoid_: Break (Breaks come from Reconciliation)
 
 **Provider Adjustment**:
-A Provider clawing back part of an already settled amount after the fact (for example a fee correction or a partial recall of a Payout batch).
+A Provider clawing back part of an already settled amount after the fact (for example a fee correction or a partial recall of a Payout batch), reported on a later Settlement Report and booked against the original Payment.
 _Avoid_: Partial return (ACH Returns are all-or-nothing)
 
 **Cutoff**:
-The time of day after which a Provider counts a Payment toward the next banking day.
+The time of day, per Provider and Rail, after which a Provider counts a Payment toward the next Banking Day.
 
 **Banking Day**:
 A day the Federal Reserve is open. Weekends and Fed holidays aren't Banking Days.
@@ -190,8 +190,12 @@ A day the Federal Reserve is open. Weekends and Fed holidays aren't Banking Days
 ## Reconciliation
 
 **Settlement Report**:
-A Provider's daily statement of what it settled, which the Ledger is reconciled against.
+A Provider's statement, one per Banking Day, of what it settled and its Provider Adjustments, which the Ledger is reconciled against.
 _Avoid_: Bank statement (that's a different, v2 source)
+
+**Report line**:
+One settlement or Provider Adjustment on a Settlement Report, as the Provider stated it. Evidence for Reconciliation; storing it changes no balance.
+_Avoid_: Statement line, row (fine for the CSV itself)
 
 **Reconciliation**:
 Matching the Ledger against a Settlement Report and recording every disagreement as a Break.

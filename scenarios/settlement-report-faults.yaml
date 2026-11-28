@@ -1,0 +1,77 @@
+# Every Settlement Report Fault (SPEC §4.5, §6, ADR 0014). Three buyers fund by ACH pull on
+# Thursday afternoon; their pulls settle Friday 08:30 New York. Wren buys Ottoline's card at
+# the 17:00 Auction Close for 300.00, and Ottoline's Instant Payout of 270.00 (less
+# Mintwharf's fictional 10% fee) goes out over RTP at once, before the 18:00 RTP Cutoff.
+# Expected Settlement Reports (one per Banking Day; Monday 7 September is Labor Day):
+# - Thursday 3: Ottoline's Payout, -27000;
+# - Friday 4: Wren's pull reported as 59500, 500 short of what settled (wrong amount); Pax's
+#   pull left off (missing line); a Provider Adjustment at noon recalling 20.00 of
+#   Ottoline's Payout, +2000;
+# - Tuesday 8: Jules's pull, booked at Friday's 16:00 ACH Cutoff, so on the next Banking
+#   Day's report after a Fed holiday (settlement after Cutoff);
+# - Wednesday 9: a fee correction of 1.50 against Wren's pull, -150.
+# Expected Ledger:
+# - the missing, wrong and late lines change no balance: every pull is booked as its
+#   Provider Events said;
+# - the recall is booked against Ottoline's Payout: Bank Cash +2000, her Customer Balance
+#   +2000 (Mintwharf owes her that part again);
+# - the fee correction is booked against Wren's pull: Bank Cash -150, Provider Fees +150;
+# - Bank Cash ends at 54850; every Clearing Account nets to zero;
+# - the Fault Manifest names all five report Faults; replaying reproduces the Ledger.
+name: settlement-report-faults
+description: A missing line, a wrong amount, a settlement after Cutoff and two Provider Adjustments.
+seed: 8
+start: 2026-09-03T15:00:00-04:00 # Thursday, before the 16:00 New York ACH Cutoff
+instant_payout_limit: 50000
+seller_fee_bps: 1000
+customers:
+  - id: c-wren
+    name: Wren Halvorsen
+  - id: c-pax
+    name: Pax Oduya
+  - id: c-jules
+    name: Jules Marrow
+  - id: c-ottoline
+    name: Ottoline Vance
+payments:
+  - id: wren-funding
+    customer: c-wren
+    amount: 60000
+    description: Buyer funds their Customer Balance
+  - id: pax-funding
+    customer: c-pax
+    amount: 12000
+    description: Buyer funds their Customer Balance
+  - id: jules-funding
+    customer: c-jules
+    amount: 8000
+    description: Buyer funds their Customer Balance
+auction_closes:
+  - id: thursday-evening
+    at: PT2H
+    lots:
+      - {id: lot-1, buyer: c-wren, seller: c-ottoline, hammer_price: 30000}
+    payouts:
+      - {id: ottoline-payout, seller: c-ottoline, speed: instant}
+faults:
+  - id: wren-reported-short
+    kind: wrong_report_amount
+    payment: wren-funding
+    by: -500
+  - id: pax-line-missing
+    kind: missing_report_line
+    payment: pax-funding
+  - id: jules-after-cutoff
+    kind: settlement_after_cutoff
+    payment: jules-funding
+  - id: ottoline-payout-recalled
+    kind: provider_adjustment
+    payment: ottoline-payout
+    amount: 2000
+    reason: payout_recall
+  - id: wren-fee-corrected
+    kind: provider_adjustment
+    payment: wren-funding
+    amount: 150
+    reason: fee_correction
+    after: 2

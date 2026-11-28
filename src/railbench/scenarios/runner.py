@@ -11,9 +11,11 @@ of Mintwharf's buyers and of time:
 3. originate each Payment, then close each auction, through the Ledger API at its time;
 4. move the Clock straight to the next moment anything is due (a Payment to originate, an
    auction to close, a Payment to settle or end, a webhook to deliver, ACH funds due to
-   become Available), tick the Simulator and then the Ledger's jobs (ACH availability, then
-   Payout release), and repeat until nothing is left to do;
-5. write the Fault Manifest.
+   become Available, a Settlement Report with anything on it to publish), tick the
+   Simulator (then have it publish due Settlement Reports) and then the Ledger's jobs (ACH
+   availability, Payout release, then Settlement Report ingest), and repeat until nothing
+   is left to do;
+5. write the Fault Manifest, report Faults included.
 
 No randomness is drawn here and no wall clock is read, so a Scenario and seed give the same
 Ledger, Payment and event IDs, delivery order and Fault Manifest every run. The one
@@ -27,7 +29,7 @@ import secrets
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -44,13 +46,14 @@ from railbench.ledger.app import create_app as create_ledger_app
 from railbench.ledger.journal import Journal
 from railbench.ledger.model import AccountType, NewAccount
 from railbench.marketplace.service import Marketplace
+from railbench.payments.reports import SettlementReports
 from railbench.payments.service import Payments
 from railbench.scenarios.manifest import Manifest, manifest_for
 from railbench.scenarios.model import Scenario, ScenarioAuctionClose
 from railbench.scenarios.servers import free_port, serving
 from railbench.scenarios.summary import Summary, ledger_summary
 from railbench.simulator.app import create_app as create_simulator_app
-from railbench.simulator.provider import Simulator
+from railbench.simulator.provider import PROVIDER, Simulator
 
 ALEMBIC_INI = Path(__file__).parents[3] / "alembic.ini"
 # A run that hasn't gone quiet after this many ticks is stuck (a bug, not a long Scenario).
@@ -73,6 +76,8 @@ class Run:
     # Scenario Payment id → the Ledger's Payment id.
     payments: dict[str, int]
     summary: Summary = field(repr=False)
+    # Every Settlement Report the Simulator published, by Banking Day, as published.
+    settlement_reports: dict[date, bytes] = field(default_factory=dict, repr=False)
 
 
 def run(
@@ -117,6 +122,7 @@ def run(
     journal: Journal = ledger_app.state.journal
     payments: Payments = ledger_app.state.payments
     marketplace: Marketplace = ledger_app.state.marketplace
+    reports: SettlementReports = ledger_app.state.reports
     simulator: Simulator = simulator_app.state.simulator
     try:
         with (
@@ -167,8 +173,10 @@ def run(
                     )
                     response.raise_for_status()
                 simulator.tick()
+                simulator.publish_reports()
                 payments.make_available()
                 marketplace.release_payouts()
+                reports.ingest_due()
                 ticks.append(now)
                 if len(ticks) > MAX_TICKS:
                     raise RunDidNotSettle(f"{scenario.name} still busy after {MAX_TICKS} ticks")
@@ -176,6 +184,7 @@ def run(
                     moment
                     for moment in (
                         simulator.next_due(),
+                        simulator.next_report_due(),
                         waiting[0].at + scenario.start if waiting else None,
                         closing[0].at + scenario.start if closing else None,
                         _next_available(payments, originated.values()),
@@ -194,6 +203,7 @@ def run(
             ticks=ticks,
             payments=originated,
             summary=ledger_summary(owner),
+            settlement_reports=simulator.published_reports(PROVIDER),
         )
     finally:
         delivery_http.close()
