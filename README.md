@@ -145,7 +145,7 @@ behind, only the exception.
 
 The Ledger API adds `POST /payments`, `GET /payments/{id}` and
 `POST /providers/{provider}/events`; the Simulator serves `POST /payments` and
-`GET /payments/{id}`.
+`GET /payments/{id}` (and, for Returns, `POST /payments/{id}/returns`).
 
 ## Auction Closes and Payouts
 
@@ -203,6 +203,43 @@ The Ledger's ticker (`LEDGER_TICK_SECONDS`) runs ACH availability and then Payou
 `SELLER_FEE_BPS` extends SPEC §13. Auction Closes, lots, Payouts and Payout steps are
 append-only in the `marketplace` schema (migration `0007`).
 
+## Returns and Recovery Receivable
+
+A settled ACH pull can be sent back with a NACHA return code (SPEC §4.3, ADR 0004,
+ADR 0013). The Simulator knows each code's Return Window, measured from the Settlement Date
+on the Banking Day calendar (`railbench.common.returns`, checked against nacha.org on
+2026-11-27): R01, R02, R03, R04 and R29 by the opening of the second Banking Day after it;
+unauthorized consumer debits, R05, R07, R10 and R11, by the opening of the Banking Day after
+the 60th calendar day. It returns a pull as planned by a `return` Fault, or now through
+`POST /payments/{id}/returns` (`{"code": "R10"}`), emitting `payment.returned` with the code,
+and refuses a Return outside its window (`422`), on RTP or a push, or before settlement
+(`409`). The Ledger's ACH state machine adds `returned`, from `settled` or `available`,
+final; a Return for a Payment never settled is an exception with no Ledger write. Applying
+one, in one database transaction with the Provider Event as Actor:
+
+- a posted **Reversal** of the funding (Customer Balance → Clearing Account) and of its sweep
+  to Bank Cash, so the money leaves Bank Cash and the Clearing Account still nets to zero;
+  nothing is edited;
+- the availability Hold, if still in place, is released, so the money is never Available;
+- if the Customer Balance is left short (the money was spent, say at an Auction Close), the
+  deficit moves to that Customer's **Recovery Receivable** (`recovery-receivable:<Customer
+  Balance>`), the Customer Balance goes back to zero, and a **return exception** records the
+  exposure in Minor Units, the return code and whether it was a **Late Return** (after the
+  funds were Available). `GET /return-exceptions[?customer_account=…]` lists them, and
+  `GET /payments/{id}` shows a Payment's.
+
+What a Customer owes in Recovery Receivable counts against them for Payouts: a Standard
+Payout behind a returned buyer goes on waiting, and an Instant Payout whose buyer was
+returned is back on its seller's limit, until the buyer funds what they owe.
+
+The headline Scenario, `scenarios/late-r10-after-instant-payout.yaml`, is a Late R10 thirty
+two days after the buyer's funds settled, when the seller's Instant Payout has long cleared
+over RTP; it ends with the buyer's Customer Balance at 0, 300.00 in Recovery Receivable, one
+return exception for 30000, Bank Cash down by the 270.00 paid out, the seller untouched,
+every Clearing Account at zero, and an Inbox replay that reproduces the Ledger (tested).
+`scenarios/duplicate-settlement-after-return.yaml` redelivers a settlement after its Return:
+the Inbox recognises it and nothing changes.
+
 ## Scenarios and delivery Faults
 
 A **Scenario** is a named, seeded YAML file of Customers, ACH pulls, Auction Closes and
@@ -215,6 +252,8 @@ faults:
   - {id: dup, kind: duplicate, payment: avery-funding, event: submitted, times: 2}
   - {id: late, kind: delay, payment: cleo-top-up, event: settled, by: PT6H}
   - {id: swap, kind: out_of_order, payment: cleo-funding, event: submitted, after: settled}
+  - {id: r10, kind: return, payment: cleo-funding, code: R10, at: P30D}
+  - {id: again, kind: duplicate, payment: cleo-funding, event: settled, after: returned}
 random_faults: {rate: 0.5, kinds: [duplicate, delay, out_of_order], max_delay: PT12H}
 ```
 
@@ -243,11 +282,13 @@ never reads it: it lives in the `simulator` schema, which the Ledger's role can'
 the `ledger` and `payments` packages can't import `railbench.scenarios` (both tested).
 
 Under these Faults the Ledger stays correct: a stateful property test
-(`tests/integration/test_ach_payment_properties.py`) delivers a Payment's events in random
-orders, again, late and contradicting each other, and checks after every step that
+(`tests/integration/test_ach_payment_properties.py`) delivers a Payment's events, Returns
+included, in random orders, again, late and contradicting each other, and checks after every step that
 Transactions balance, states only move forward, each event applies once, the Clearing
 Account nets to zero, stale and impossible events write nothing, and balances match the
-Payment's furthest state; and replaying the Inbox of a run with every Fault kind into an
+Payment's furthest state; another (`test_return_properties.py`) checks that a Return after
+random spending leaves no negative Customer Balance, only the matching Recovery Receivable;
+and replaying the Inbox of a run with every Fault kind into an
 empty database, from that database alone (the availability job's runs are read from what it
 recorded), reproduces the Ledger exactly, Recorded Times included.
 
@@ -271,7 +312,7 @@ recorded), reproduces the Ledger exactly, Recorded Times included.
   and the `railbench_app` role; `0003` adds Transaction status, Settlements and Holds;
   `0004` adds Payments, the Inbox and state changes; `0005` the Simulator's state; `0006`
   its plans, delivery Faults and the Fault Manifest; `0007` pushes and RTP, and the
-  `marketplace` schema.
+  `marketplace` schema; `0008` Returns and return exceptions.
 
 Nothing reads the system time directly: code takes a `Clock` (`WallClock` by default,
 `ManualClock` in tests and Scenarios), and a ruff rule bans `datetime.now()` and friends
