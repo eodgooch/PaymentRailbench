@@ -13,8 +13,10 @@ of Mintwharf's buyers and of time:
    auction to close, a Payment to settle or end, a webhook to deliver, ACH funds due to
    become Available, a Settlement Report with anything on it to publish), tick the
    Simulator (then have it publish due Settlement Reports) and then the Ledger's jobs (ACH
-   availability, Payout release, then Settlement Report ingest), and repeat until nothing
-   is left to do;
+   availability, Payout release, Settlement Report ingest, then Reconciliation), and repeat
+   until nothing is left to do. Reconciling a Banking Day waits for the next Banking Day's
+   report (ADR 0015), so a run goes on to the report after the last day with anything on
+   it, and every Banking Day it covers is reconciled;
 5. write the Fault Manifest, report Faults included.
 
 No randomness is drawn here and no wall clock is read, so a Scenario and seed give the same
@@ -51,6 +53,7 @@ from railbench.ledger.model import AccountType, NewAccount
 from railbench.marketplace.service import Marketplace
 from railbench.payments.reports import SettlementReports
 from railbench.payments.service import Payments
+from railbench.reconciliation.service import Reconciliation
 from railbench.scenarios.manifest import Manifest, manifest_for
 from railbench.scenarios.model import Scenario, ScenarioAuctionClose
 from railbench.scenarios.servers import free_port, serving
@@ -159,6 +162,7 @@ def run(
     payments: Payments = ledger_app.state.payments
     marketplace: Marketplace = ledger_app.state.marketplace
     reports: SettlementReports = ledger_app.state.reports
+    reconciliation: Reconciliation = ledger_app.state.reconciliation
     simulator: Simulator = simulator_app.state.simulator
     try:
         with (
@@ -213,6 +217,7 @@ def run(
                 payments.make_available()
                 marketplace.release_payouts()
                 reports.ingest_due()
+                reconciliation.reconcile_due()
                 ticks.append(now)
                 if len(ticks) > MAX_TICKS:
                     raise RunDidNotSettle(f"{scenario.name} still busy after {MAX_TICKS} ticks")
@@ -224,6 +229,7 @@ def run(
                         waiting[0].at + scenario.start if waiting else None,
                         closing[0].at + scenario.start if closing else None,
                         _next_available(payments, originated.values()),
+                        reconciliation.next_due(),
                     )
                     if moment is not None
                 ]

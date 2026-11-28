@@ -16,13 +16,19 @@ row by something stable instead:
   Transaction and each Payout step's Hold by Idempotency Key;
 - Settlement Reports by `<provider>:<report date>`, every version received in order, with
   its lines as stated and every decision about each Provider Adjustment (pending, booked,
-  unmatched) with its Payment (by Idempotency Key) and Transaction (by its key).
+  unmatched) with its Payment (by Idempotency Key) and Transaction (by its key);
+- Reconciliation runs by `<provider>:<banking day>`, and Breaks by their own ids (a hash of
+  provider, day, Break Type and match key, the same in every database), each with its
+  evidence named the stable way: a Payment by Idempotency Key, a state change as
+  `<Payment key>/<state>`, an Inbox event by event ID, a Transaction by its key, a report
+  as `<provider>:<date>:<SHA-256>`, a line as `<report>/<line ID>`, and a Provider
+  Adjustment decision as `<line>/<outcome>@<recorded at>`; and each Break's resolution.
 
 `accounts` narrows the summary to the Payments funding those Customer Balances and the
 Ledger rows that touch them or belong to those Payments, for databases shared with other
 work (the property tests), and to the Auction Closes whose lots touch them, and leaves
-Settlement Reports out (a report covers every Payment). Without it, the whole Ledger is
-summarised.
+Settlement Reports and Reconciliation out (a report covers every Payment). Without it, the
+whole Ledger is summarised.
 """
 
 from collections.abc import Collection
@@ -44,6 +50,13 @@ from railbench.payments.tables import (
     settlement_report_lines,
     settlement_reports,
     transitions,
+)
+from railbench.reconciliation.tables import (
+    EVIDENCE_COLUMNS,
+    break_evidence,
+    break_resolutions,
+    breaks,
+    runs,
 )
 
 Summary = dict[str, Any]
@@ -112,6 +125,88 @@ class _Summariser:
             "holds": self._holds(),
             "auction_closes": self._auction_closes(),
             "settlement_reports": self._settlement_reports(),
+            "reconciliation": self._reconciliation(),
+        }
+
+    def _reconciliation(self) -> dict[str, Any]:
+        if self._scope is not None:
+            return {}
+        reports = {
+            row.id: f"{row.provider}:{row.report_date.isoformat()}:{row.body_sha256}"
+            for row in self._c.execute(select(settlement_reports))
+        }
+        lines = {
+            row.id: f"{reports[row.report_id]}/{row.line_id}"
+            for row in self._c.execute(select(settlement_report_lines))
+        }
+        keys = {row.id: row.idempotency_key for row in self._c.execute(select(payments))}
+        names: dict[str, dict[int, str]] = {
+            "payments": keys,
+            "transitions": {
+                row.id: f"{keys[row.payment_id]}/{row.state}"
+                for row in self._c.execute(select(transitions))
+            },
+            "inbox": {int(k): v for k, v in self._events.items()},
+            "reports": reports,
+            "report_lines": lines,
+            "provider_adjustments": {
+                row.id: f"{lines[row.line_id]}/{row.outcome}@{_time(row.recorded_at)}"
+                for row in self._c.execute(select(provider_adjustments))
+            },
+        }
+        evidence: dict[str, dict[str, list[str]]] = {}
+        for item in self._c.execute(select(break_evidence)):
+            for kind, column in EVIDENCE_COLUMNS.items():
+                ref = getattr(item, column)
+                if ref is None:
+                    continue
+                name = (
+                    self._key(self._transaction_key(ref))
+                    if kind == "transactions"
+                    else names[kind][ref]
+                )
+                evidence.setdefault(item.break_id, {}).setdefault(kind, []).append(name)
+        resolutions = {row.break_id: row for row in self._c.execute(select(break_resolutions))}
+        run_names = {}
+        found_runs = {}
+        for run in self._c.execute(select(runs)):
+            run_names[run.id] = f"{run.provider}:{run.banking_day.isoformat()}"
+            found_runs[run_names[run.id]] = {
+                "report": reports[run.report_id],
+                "next_report": reports[run.next_report_id],
+                "known_at": _time(run.known_at),
+                "job": f"{run.job_name}@{run.job_version}",
+                "recorded_at": _time(run.recorded_at),
+            }
+        found_breaks = {}
+        for row in self._c.execute(select(breaks)):
+            resolution = resolutions.get(row.id)
+            found_breaks[row.id] = {
+                "run": run_names[row.run_id],
+                "break_type": row.break_type,
+                "match_key": row.match_key,
+                "exposure": row.exposure,
+                "currency": row.currency,
+                "facts": row.facts,
+                "detected_at": _time(row.detected_at),
+                "evidence": {
+                    kind: sorted(refs) for kind, refs in sorted(evidence.get(row.id, {}).items())
+                },
+                "resolution": None
+                if resolution is None
+                else {
+                    "operator_id": resolution.actor_operator_id,
+                    "proposal_id": resolution.actor_proposal_id,
+                    "correcting_transaction": None
+                    if resolution.correcting_transaction_id is None
+                    else self._key(self._transaction_key(resolution.correcting_transaction_id)),
+                    "reason": resolution.reason,
+                    "recorded_at": _time(resolution.recorded_at),
+                },
+            }
+        return {
+            "runs": dict(sorted(found_runs.items())),
+            "breaks": dict(sorted(found_breaks.items())),
         }
 
     def _settlement_reports(self) -> dict[str, Any]:

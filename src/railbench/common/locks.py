@@ -21,6 +21,8 @@ class LockSpace(IntEnum):
     SELLER = 7  # one Customer's Instant Payout exposure (marketplace)
     CUSTOMER = 8  # booking a Return's deficit on one Customer Balance (Payments)
     REPORT = 9  # ingesting one Provider's Settlement Report for one Banking Day (Payments)
+    RECONCILIATION = 10  # reconciling one Provider's Banking Day (Reconciliation)
+    BREAK = 11  # resolving one Break (Reconciliation)
 
 
 def lock(connection: Connection, space: LockSpace, key: int) -> None:

@@ -1,7 +1,7 @@
 """The Ledger talks to the Simulator only through the Provider interface (ADR 0005): no
 Ledger, Payments or marketplace module imports the Simulator, and the Simulator imports none
-of them. Payments doesn't depend on the marketplace built on it. And the Ledger never reads
-the Fault Manifest (SPEC §6, ADR 0011): only Scenario tooling may import
+of them. Payments and Reconciliation don't depend on the marketplace. And neither the Ledger
+nor Reconciliation reads the Fault Manifest (SPEC §6, ADR 0011): only Scenario tooling may import
 `railbench.scenarios`, which writes it."""
 
 import ast
@@ -15,6 +15,8 @@ FORBIDDEN = {
     "ledger": ("railbench.simulator", "railbench.scenarios"),
     "payments": ("railbench.simulator", "railbench.scenarios", "railbench.marketplace"),
     "marketplace": ("railbench.simulator", "railbench.scenarios"),
+    # Reconciliation never reads the Fault Manifest, nor the Simulator's side (ADR 0015).
+    "reconciliation": ("railbench.simulator", "railbench.scenarios", "railbench.marketplace"),
     "common": (
         "railbench.simulator",
         "railbench.ledger",
