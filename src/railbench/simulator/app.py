@@ -18,6 +18,7 @@ from fastapi import FastAPI, HTTPException, Request, Response, status
 from sqlalchemy import Engine
 
 from railbench.common.clock import Clock
+from railbench.common.returns import UnknownReturnCode
 from railbench.common.service import create_service_app
 from railbench.common.settings import Settings
 from railbench.common.ticker import ticking
@@ -98,7 +99,7 @@ def create_app(
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"no Payment {payment_id}") from error
         except ReturnRefused as error:
             raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
-        except ReturnOutsideWindow as error:
+        except (ReturnOutsideWindow, UnknownReturnCode) as error:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(error)) from error
 
     return app

@@ -55,7 +55,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from railbench.common.calendar import at_new_york, is_banking_day, new_york_date, next_banking_day
 from railbench.common.clock import Clock
 from railbench.common.fingerprint import fingerprint as payload_fingerprint
-from railbench.common.returns import RETURN_CODES, WindowKind, is_late, return_deadline
+from railbench.common.returns import ReturnCode, is_late, return_code
 from railbench.common.signing import SIGNATURE_HEADER, sign
 from railbench.simulator.model import (
     FINAL_EVENT,
@@ -112,7 +112,27 @@ class ReturnRefused(Exception):
 
 
 class ReturnOutsideWindow(ValueError):
-    """A Return outside its code's Return Window, or with a code the Simulator doesn't know."""
+    """A Return outside its code's Return Window."""
+
+
+# The manifest's id for a Return injected by hand through `return_payment()`.
+BY_HAND = "injected-return"
+
+
+@dataclass(frozen=True)
+class _Injected:
+    """One Fault Manifest row about to be written."""
+
+    fault_id: str
+    kind: str
+    params: dict[str, Any]
+    cause_code: str
+    root_cause: str
+
+    @classmethod
+    def of(cls, fault: FaultPlan, cause_code: str, root_cause: str) -> "_Injected":
+        params = fault.model_dump(mode="json", exclude={"id", "kind", "event"}, exclude_none=True)
+        return cls(fault.id, fault.kind, params, cause_code, root_cause)
 
 
 @dataclass(frozen=True)
@@ -334,12 +354,10 @@ class Simulator:
             for row in rows
         ]
 
-    def return_payment(self, public_id: str, code: str) -> SimulatedPayment:
+    def return_payment(self, public_id: str, code: ReturnCode) -> SimulatedPayment:
         """Return a settled ACH pull now, with NACHA return `code`: a Return injected by hand
         rather than planned. Raises ReturnRefused for anything but a settled ACH pull, and
         ReturnOutsideWindow outside the code's Return Window."""
-        if code not in RETURN_CODES:
-            raise ReturnOutsideWindow(f"the Simulator knows no NACHA return code {code!r}")
         now = self._clock.now()
         with self._engine.begin() as connection:
             row = connection.execute(
@@ -354,7 +372,7 @@ class Simulator:
             if row.status != PaymentStatus.SETTLED:
                 raise ReturnRefused(f"{public_id} is {row.status}: only a settled pull returns")
             _check_window(code, row.settled_at, now)
-            self._return(connection, row.id, code, now, injected=True)
+            self._return(connection, row.id, code, now, by_hand=True)
         return self.payment(public_id)
 
     def tick(self) -> None:
@@ -374,31 +392,30 @@ class Simulator:
                 .with_for_update(skip_locked=True)
             ).all()
             for payment_id, code, returns_at in due:
-                self._return(connection, payment_id, code, returns_at, injected=False)
+                self._return(connection, payment_id, return_code(code), returns_at, by_hand=False)
 
     def _return(
         self,
         connection: Connection,
         payment_id: int,
-        code: str,
+        code: ReturnCode,
         returned_at: datetime,
         *,
-        injected: bool,
+        by_hand: bool,
     ) -> None:
+        """Return the Payment and emit its `payment.returned`. A Return `by_hand` is its own
+        Fault in the manifest; a planned one is the plan's `return` Fault."""
         connection.execute(
             update(payments)
             .where(payments.c.id == payment_id)
             .values(
                 status=PaymentStatus.RETURNED,
-                return_code=code,
+                return_code=code.code,
                 returns_at=returned_at,
                 returned_at=returned_at,
             )
         )
-        injection = (
-            PlannedReturn(id="injected-return", code=code, at=timedelta(0)) if injected else None
-        )
-        self._emit(connection, payment_id, EventType.RETURNED, returned_at, injection)
+        self._emit(connection, payment_id, EventType.RETURNED, returned_at, by_hand=by_hand)
 
     def _settle_due(self) -> None:
         """Settle, or decline or cancel as planned, every submitted Payment that's due: the
@@ -429,10 +446,11 @@ class Simulator:
         payment_id: int,
         type_: EventType,
         occurred_at: datetime,
-        injected_return: PlannedReturn | None = None,
+        *,
+        by_hand: bool = False,
     ) -> None:
-        """Freeze a Provider Event into the outbox, with any Faults planned for it (and the
-        Return injected by hand, if this is one)."""
+        """Freeze a Provider Event into the outbox, with any Faults planned for it. A Return
+        made `by_hand` is recorded as a Fault of its own, in place of any planned one."""
         row = connection.execute(select(payments).where(payments.c.id == payment_id)).one()
         now = self._clock.now()
         event_id = event_id_for(row.idempotency_key, type_)
@@ -442,16 +460,11 @@ class Simulator:
             "occurred_at": occurred_at,
             "payment": _payment(row).model_dump(mode="json"),
         }
+        returned = None if row.return_code is None else return_code(row.return_code)
         if type_ is EventType.RETURNED:
-            event["return"] = {
-                "code": row.return_code,
-                "reason": RETURN_CODES[row.return_code].reason,
-            }
-        body = json.dumps(
-            event,
-            default=_iso,
-            separators=(",", ":"),
-        )
+            assert returned is not None
+            event["return"] = {"code": returned.code, "reason": returned.reason}
+        body = json.dumps(event, default=_iso, separators=(",", ":"))
         delivery: dict[str, Any] = {
             "payment_id": payment_id,
             "event_id": event_id,
@@ -461,48 +474,39 @@ class Simulator:
             "next_attempt_at": now,
         }
         copies: list[DuplicateDelivery] = []
-        injected: list[tuple[FaultPlan, str, str]] = []
+        injected: list[_Injected] = []
+        held_by: str | None = None
         planned = self._faults_for(connection, row.idempotency_key, type_)
-        if injected_return is not None:  # injected by hand instead of as planned
+        if by_hand:
+            assert returned is not None
             planned = [f for f in planned if not isinstance(f, PlannedReturn)]
-        for fault in [*planned, *([injected_return] if injected_return else [])]:
+            cause_code, cause = _return_cause(row, returned, event_id, occurred_at)
+            injected.append(
+                _Injected(BY_HAND, "return", {"code": returned.code}, cause_code, cause)
+            )
+        for fault in planned:
             match fault:
                 case PlannedReturn(code=code):
-                    returned = RETURN_CODES[code]
-                    late = is_late(row.settled_at, occurred_at)
-                    window = (
-                        "60 calendar days"
-                        if returned.window is WindowKind.EXTENDED
-                        else "2 Banking Days"
-                    )
-                    cause = (
-                        f"The Simulator returned ACH pull {row.public_id} with {code} "
-                        f"({returned.reason}) in Provider Event {event_id} at "
-                        f"{_iso(occurred_at)}, inside its {window} Return Window (until "
-                        f"{_iso(return_deadline(code, row.settled_at))}), "
-                        + (
-                            "after the funds had become Available (a Late Return)."
-                            if late
-                            else "before the funds became Available."
-                        )
-                    )
-                    injected.append((fault, "late_return" if late else "ach_return", cause))
+                    cause_code, cause = _return_cause(row, code, event_id, occurred_at)
+                    injected.append(_Injected.of(fault, cause_code, cause))
                 case DelayedDelivery(by=by):
                     delivery["next_attempt_at"] += by
+                    held_by = held_by or fault.id
                     cause = (
                         f"The Simulator held Provider Event {event_id} ({type_}) back for {by} "
                         "past when it was due (a delayed webhook)."
                     )
-                    injected.append((fault, "delayed_delivery", cause))
+                    injected.append(_Injected.of(fault, "delayed_delivery", cause))
                 case OutOfOrderDelivery(after=after):
                     later = _event_type(after)
                     delivery["after_event_id"] = event_id_for(row.idempotency_key, later)
+                    held_by = held_by or fault.id
                     cause = (
                         f"The Simulator held Provider Event {event_id} ({type_}) until "
                         f"{delivery['after_event_id']} ({later}) had been delivered, so the "
                         "Ledger heard of the later state first (out-of-order webhooks)."
                     )
-                    injected.append((fault, "out_of_order_delivery", cause))
+                    injected.append(_Injected.of(fault, "out_of_order_delivery", cause))
                 case DuplicateDelivery(times=times):
                     copies.append(fault)
                     cause = (
@@ -510,31 +514,25 @@ class Simulator:
                         f"{times + 1} times with the same event ID and body (a duplicate "
                         "webhook)."
                     )
-                    injected.append((fault, "duplicate_delivery", cause))
-        held_by = next(
-            (f.id for f, _, _ in injected if isinstance(f, DelayedDelivery | OutOfOrderDelivery)),
-            None,
-        )
+                    injected.append(_Injected.of(fault, "duplicate_delivery", cause))
         connection.execute(insert(events).values(**delivery, fault_id=held_by))
         for copy in copies:
             extra = {**delivery, "fault_id": copy.id}
             if copy.after is not None:
                 extra["after_event_id"] = event_id_for(row.idempotency_key, _event_type(copy.after))
             connection.execute(insert(events), [extra] * copy.times)
-        for fault, cause_code, root_cause in injected:
+        for found in injected:
             connection.execute(
                 insert(faults).values(
-                    fault_id=fault.id,
-                    kind=fault.kind,
+                    fault_id=found.fault_id,
+                    kind=found.kind,
                     payment_id=payment_id,
                     event_id=event_id,
                     event_type=type_,
-                    params=fault.model_dump(
-                        mode="json", exclude={"id", "kind", "event"}, exclude_none=True
-                    ),
+                    params=found.params,
                     injected_at=now,
-                    cause_code=cause_code,
-                    root_cause=root_cause,
+                    cause_code=found.cause_code,
+                    root_cause=found.root_cause,
                 )
             )
 
@@ -625,16 +623,33 @@ def _planned_return(planned: PlannedReturn, settles_at: datetime) -> dict[str, A
     """The columns scheduling a planned Return, once the settlement time is known."""
     returns_at = settles_at + planned.at
     _check_window(planned.code, settles_at, returns_at)
-    return {"return_code": planned.code, "returns_at": returns_at}
+    return {"return_code": planned.code.code, "returns_at": returns_at}
 
 
-def _check_window(code: str, settled_at: datetime, returned_at: datetime) -> None:
-    deadline = return_deadline(code, settled_at)
-    if not settled_at <= returned_at <= deadline:
+def _check_window(code: ReturnCode, settled_at: datetime, returned_at: datetime) -> None:
+    if not code.within_window(settled_at, returned_at):
         raise ReturnOutsideWindow(
-            f"a {code} Return at {_iso(returned_at)} is outside its Return Window: from "
-            f"{_iso(settled_at)} to {_iso(deadline)}"
+            f"a {code.code} Return at {_iso(returned_at)} is outside its Return Window: from "
+            f"{_iso(settled_at)} {code.window.label} ({_iso(code.deadline(settled_at))})"
         )
+
+
+def _return_cause(
+    row: Row[Any], code: ReturnCode, event_id: str, returned_at: datetime
+) -> tuple[str, str]:
+    """The cause code and true root cause of a Return, for the Fault Manifest."""
+    late = is_late(row.settled_at, returned_at)
+    cause = (
+        f"The Simulator returned ACH pull {row.public_id} with {code.code} ({code.reason}) "
+        f"in Provider Event {event_id} at {_iso(returned_at)}, inside its Return Window "
+        f"(from settlement {code.window.label}: until {_iso(code.deadline(row.settled_at))}), "
+        + (
+            "after the funds had become Available (a Late Return)."
+            if late
+            else "before the funds became Available."
+        )
+    )
+    return ("late_return" if late else "ach_return"), cause
 
 
 def _deliverable() -> Any:
@@ -668,7 +683,7 @@ def _payment(row: Row[Any]) -> SimulatedPayment:
         settled_at=row.settled_at,
         ended_at=row.ended_at,
         returned_at=row.returned_at,
-        return_code=row.return_code if row.returned_at is not None else None,
+        return_code=None if row.returned_at is None else return_code(row.return_code),
     )
 
 

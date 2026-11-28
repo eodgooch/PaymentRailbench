@@ -2,12 +2,13 @@
 
 - `payments.transitions.state` may now be `returned`: an ACH pull sent back with a NACHA
   return code, after it settled.
-- `payments.return_exceptions`: one row per Return that left a Customer Balance short, at
-  most one per Payment, append-only like the rest of the schema. It names the Payment, the
-  Inbox event behind it, the Customer Balance and its Recovery Receivable, the return code,
-  the dollar exposure in Minor Units (the deficit moved to Recovery Receivable), whether it
-  was a Late Return (the funds had been Available), and the Transaction that moved the
-  deficit. It is an exception record for people to work, not a Reconciliation Break.
+- `payments.return_exceptions`: one row per deficit a Return moved to Recovery Receivable
+  (usually one per Return; more when the Customer Balance dips again later, ADR 0013),
+  append-only like the rest of the schema. It names the Payment, the Inbox event behind it,
+  the Customer Balance and its Recovery Receivable, the return code, the exposure in Minor
+  Units, whether it was a Late Return (by time: after the funds became Available), the
+  Transaction that moved the deficit and when it took effect. It is an exception record
+  for people to work, not a Reconciliation Break.
 - `simulator.payments`: the Return the Simulator will make or has made (`return_code`,
   `returns_at`, `returned_at`).
 
@@ -38,7 +39,7 @@ ALTER TABLE payments.transitions
 
 CREATE TABLE payments.return_exceptions (
     id                      BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    payment_id              BIGINT NOT NULL UNIQUE REFERENCES payments.payments (id),
+    payment_id              BIGINT NOT NULL REFERENCES payments.payments (id),
     inbox_id                BIGINT NOT NULL REFERENCES payments.inbox (id),
     customer_account        TEXT NOT NULL REFERENCES ledger.accounts (code),
     recovery_account        TEXT NOT NULL REFERENCES ledger.accounts (code),
@@ -46,7 +47,7 @@ CREATE TABLE payments.return_exceptions (
     return_code             TEXT NOT NULL CHECK (return_code ~ '^R[0-9]{{2}}$'),
     exposure                BIGINT NOT NULL CHECK (exposure > 0),
     late                    BOOLEAN NOT NULL,
-    recovery_transaction_id BIGINT NOT NULL REFERENCES ledger.transactions (id),
+    recovery_transaction_id BIGINT NOT NULL UNIQUE REFERENCES ledger.transactions (id),
     detail                  TEXT NOT NULL CHECK (detail <> ''),
     effective_at            TIMESTAMPTZ NOT NULL,
     recorded_at             TIMESTAMPTZ NOT NULL

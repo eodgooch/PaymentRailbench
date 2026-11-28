@@ -24,7 +24,8 @@ A Return is final, and can only follow a settlement the Ledger has recorded: a R
 Payment still created or submitted is impossible (SPEC §4.2's own example), even if only the
 settlement is late, and so is one after a decline or cancellation. After a Return, every
 state on the main path counts as passed (a late settlement or a second Return is stale),
-and a decline or cancellation is impossible.
+and a decline or cancellation is impossible. Only a pull is returned: a Return of a push (a
+Payout) is impossible.
 
 Nothing follows an RTP ending: a settled RTP Payment can't be declined or returned, and RTP
 has no submission or cancellation step, so any other RTP event is impossible.
@@ -36,6 +37,7 @@ from enum import StrEnum
 from typing import Literal
 
 Rail = Literal["ach", "rtp"]
+Direction = Literal["pull", "push"]
 
 
 class PaymentState(StrEnum):
@@ -85,9 +87,11 @@ def decide(
     reached: Collection[PaymentState] = (),
     *,
     rail: Rail,
+    direction: Direction,
 ) -> Decision:
-    """What an event reporting `reported` does to a Payment on `rail` now at `current`,
-    having been recorded in the states `reached` (its history, `current` included or not)."""
+    """What an event reporting `reported` does to a `direction` Payment on `rail` now at
+    `current`, having been recorded in the states `reached` (its history, `current` included
+    or not)."""
     if rail == "rtp":
         return _decide_rtp(current, reported)
 
@@ -100,6 +104,8 @@ def decide(
     if current is PaymentState.RETURNED:
         return Stale() if reported in (*MAIN_PATH, PaymentState.RETURNED) else impossible()
     if reported is PaymentState.RETURNED:
+        if direction == "push":
+            return Impossible("an ACH push (a Payout) can't be returned here: only pulls are")
         if current in RETURNABLE:
             return Advance(path=(PaymentState.RETURNED,))
         return Impossible(f"an ACH Payment can't go from {current} to returned: it never settled")

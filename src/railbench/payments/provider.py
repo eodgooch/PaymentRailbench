@@ -10,7 +10,6 @@ adapter, not a Ledger change.
 """
 
 import json
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -18,9 +17,9 @@ from typing import Any, Protocol
 
 import httpx
 
+from railbench.common.returns import ReturnCode, return_code
 from railbench.common.signing import SIGNATURE_HEADER, BadSignature, verify
-from railbench.payments.model import Direction
-from railbench.payments.state_machine import PaymentState, Rail
+from railbench.payments.state_machine import Direction, PaymentState, Rail
 
 
 @dataclass(frozen=True)
@@ -48,7 +47,7 @@ class ProviderEvent:
     reported: PaymentState
     occurred_at: datetime
     # A Return's NACHA return code (`returned` events only).
-    return_code: str | None = None
+    return_code: ReturnCode | None = None
 
 
 class ProviderError(Exception):
@@ -74,8 +73,6 @@ class Provider(Protocol):
         """The Provider Event in a verified body. Raises MalformedEvent."""
         ...
 
-
-_RETURN_CODE = re.compile(r"^R[0-9]{2}$")
 
 EVENT_STATES = {
     "payment.submitted": PaymentState.SUBMITTED,
@@ -132,17 +129,15 @@ class SimulatorProvider:
             if occurred_at.utcoffset() is None:
                 raise ValueError("occurred_at has no UTC offset")
             reported = EVENT_STATES[event["type"]]
-            return_code = None
-            if reported is PaymentState.RETURNED:
-                return_code = str(event["return"]["code"])
-                if not _RETURN_CODE.match(return_code):
-                    raise ValueError(f"not a NACHA return code: {return_code!r}")
+            code = None
+            if reported is PaymentState.RETURNED:  # an unknown code is a ValueError too
+                code = return_code(str(event["return"]["code"]))
             return ProviderEvent(
                 event_id=str(event["event_id"]),
                 provider_payment_id=str(event["payment"]["id"]),
                 reported=reported,
                 occurred_at=occurred_at,
-                return_code=return_code,
+                return_code=code,
             )
         except (ValueError, KeyError, TypeError, AttributeError) as error:
             raise MalformedEvent(f"not a Simulator Provider Event: {error!r}") from error

@@ -143,7 +143,8 @@ def test_a_return_moves_exactly_the_deficit_to_recovery_receivable(
         )
 
     returned_at = settled_at + timedelta(seconds=returned_after)
-    available_at = pulls["returned"].available_at or END_OF_TIME
+    available_at = payments.payment(pulls["returned"].id).available_at
+    assert available_at is not None  # settled, so the Ledger knows when it's Available
     if availability_first:
         clock.set(max(returned_at, available_at))
         payments.make_available()
@@ -160,7 +161,6 @@ def test_a_return_moves_exactly_the_deficit_to_recovery_receivable(
     assert owed == deficit
     raised = payments.payment(pulls["returned"].id).return_exceptions
     assert [e.exposure for e in raised] == ([deficit] if deficit else [])
-    if raised:  # a Late Return when the Ledger had made the funds Available first
-        reached = [t.state for t in payments.payment(pulls["returned"].id).transitions]
-        assert raised[0].late == ("available" in reached)
+    if raised:  # a Late Return by time, whichever the Ledger did first
+        assert raised[0].late == (returned_at > available_at)
     assert payments.payment(pulls["other"].id).return_exceptions == []

@@ -6,7 +6,7 @@ Ledger write. Webhooks here are signed by hand, the way the Simulator signs them
 import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from threading import Barrier
 from typing import Any, NoReturn
 from uuid import uuid4
@@ -786,7 +786,11 @@ def test_a_return_before_availability_of_money_already_spent_also_moves_the_defi
     assert customer_balances(client, payment) == (0, 0, 0)
     assert recovery_receivable(client, payment) == AMOUNT
     [exception] = payments(client).payment(payment["id"]).return_exceptions
-    assert (exception.exposure, exception.late, exception.return_code) == (AMOUNT, False, "R01")
+    assert (exception.exposure, exception.late, exception.return_code.code) == (
+        AMOUNT,
+        False,
+        "R01",
+    )
 
 
 def test_a_return_is_applied_once(
@@ -849,3 +853,138 @@ def test_a_payout_return_is_an_exception(client: TestClient, clock: ManualClock)
     assert response.json()["outcome"] == "exception"
     assert "push" in response.json()["detail"]
     assert customer_balances(client, payout) == (10_000 - AMOUNT, 0, 10_000 - AMOUNT)
+
+
+def another_pull(client: TestClient, payment: dict[str, Any]) -> dict[str, Any]:
+    """A second ACH pull into the same Customer Balance."""
+    response = client.post(
+        "/payments",
+        json={
+            "idempotency_key": unique("pull"),
+            "rail": "ach",
+            "direction": "pull",
+            "customer_account": payment["customer_account"],
+            "amount": AMOUNT,
+            "currency": "USD",
+        },
+    )
+    assert response.status_code == 201, response.text
+    body: dict[str, Any] = response.json()
+    return body
+
+
+def short_by(client: TestClient, customer: str, at: datetime) -> int:
+    """How far the Customer Balance's Posted less unsettled outflows is below zero at `at`,
+    as known now."""
+    found = journal(client).balances(customer, at)
+    return max(0, found.unsettled_outflows - found.posted)
+
+
+def test_a_delayed_return_covers_the_deficit_at_every_time_from_its_effective_time(
+    client: TestClient, clock: ManualClock, payment: dict[str, Any]
+) -> None:
+    """The Return takes effect on 5 October but the Ledger hears of it on the 20th. Meanwhile
+    the Customer spent 20.00 on the 7th and a second pull settled on the 9th. From the
+    Return's Effective Time on, as known now, the Customer Balance is never short: the
+    deficit is moved where it occurs (75.00 on the 5th, 20.00 more on the 7th), and the
+    later inflow doesn't quietly collect it."""
+    customer = payment["customer_account"]
+    made_available(client, clock, payment)
+    spend(client, customer, AMOUNT, AVAILABLE_AT)
+    spent_after = datetime(2026, 10, 7, 14, 0, tzinfo=UTC)
+    inflow_settles = datetime(2026, 10, 9, 12, 30, tzinfo=UTC)
+    second = another_pull(client, payment)
+    clock.set(datetime(2026, 10, 8, 14, 0, tzinfo=UTC))
+    deliver(client, clock, second, "payment.submitted", clock.now())
+    clock.set(inflow_settles)
+    deliver(client, clock, second, "payment.settled", inflow_settles)
+    spend(client, customer, 2_000, spent_after)
+
+    clock.set(datetime(2026, 10, 20, 14, 0, tzinfo=UTC))
+    response = deliver_return(client, clock, payment, OCTOBER)
+
+    assert response.json()["outcome"] == "applied", response.text
+    for moment in (OCTOBER, spent_after, inflow_settles, clock.now()):
+        assert short_by(client, customer, moment) == 0, moment
+    assert payments(client).owed(customer) == AMOUNT + 2_000
+    raised = payments(client).payment(payment["id"]).return_exceptions
+    assert [(e.exposure, e.effective_at) for e in raised] == [
+        (AMOUNT, OCTOBER),
+        (2_000, spent_after),
+    ]
+    # What's left is the second pull's, not yet Available; the receivable stays owed.
+    assert customer_balances(client, payment) == (AMOUNT, 0, 0)
+
+
+@pytest.mark.parametrize("availability_job_first", [True, False])
+@pytest.mark.parametrize(
+    ("after_available", "late"), [(timedelta(0), False), (timedelta(seconds=1), True)]
+)
+def test_a_late_return_is_decided_by_time_not_by_when_the_availability_job_ran(
+    client: TestClient,
+    clock: ManualClock,
+    payment: dict[str, Any],
+    availability_job_first: bool,
+    after_available: timedelta,
+    late: bool,
+) -> None:
+    """The R01-R03 window and availability end at the same moment: a Return then is not
+    late, one a second after is, whichever of the Return and the job the Ledger saw first."""
+    settled(client, clock, payment)
+    spend(client, payment["customer_account"], AMOUNT, SETTLED_AT)
+    returned_at = AVAILABLE_AT + after_available
+    clock.set(returned_at)
+    if availability_job_first:
+        payments(client).make_available()
+
+    deliver_return(client, clock, payment, returned_at, code="R01")
+    payments(client).make_available()
+
+    [exception] = payments(client).payment(payment["id"]).return_exceptions
+    assert exception.late is late
+
+
+def test_two_returns_for_one_customer_at_once_move_the_whole_deficit_between_them(
+    client: TestClient, clock: ManualClock, payment: dict[str, Any]
+) -> None:
+    """Funded 150.00 by two pulls, spent 112.50, both returned at once. Each alone would
+    leave 37.50 short; together they leave 112.50 short. Returns on one Customer Balance are
+    booked one at a time, so the second sees the first's Reversal and moves the rest, and the
+    Recovery Receivable both open is opened once."""
+    customer = payment["customer_account"]
+    second = another_pull(client, payment)
+    for pull in (payment, second):
+        deliver(client, clock, pull, "payment.submitted")
+    clock.set(SETTLED_AT)
+    for pull in (payment, second):
+        deliver(client, clock, pull, "payment.settled", SETTLED_AT)
+    spend(client, customer, AMOUNT * 3 // 2, SETTLED_AT)
+    clock.set(MONDAY)
+    bodies = []
+    for pull in (payment, second):
+        body = json.dumps(
+            {
+                "event_id": unique("evt-return"),
+                "type": "payment.returned",
+                "occurred_at": MONDAY.isoformat(),
+                "payment": {"id": pull["provider_payment_id"]},
+                "return": {"code": "R01"},
+            }
+        ).encode()
+        bodies.append((body, {SIGNATURE_HEADER: sign(SECRET, body, clock.now())}))
+    start = Barrier(2)
+
+    def apply(body: bytes, headers: dict[str, str]) -> str:
+        start.wait()
+        return payments(client).receive("simulator", body, headers).outcome
+
+    with ThreadPoolExecutor(2) as pool:
+        outcomes = [f.result() for f in [pool.submit(apply, *b) for b in bodies]]
+
+    assert outcomes == ["applied", "applied"]
+    assert payments(client).owed(customer) == AMOUNT * 3 // 2
+    assert short_by(client, customer, MONDAY) == 0
+    assert sorted(e.exposure for e in payments(client).return_exceptions(customer)) == [
+        AMOUNT // 2,
+        AMOUNT,
+    ]

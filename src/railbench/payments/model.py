@@ -2,14 +2,13 @@
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Literal, Self
+from typing import Annotated, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from railbench.common.returns import NachaReturnCode
 from railbench.ledger.model import BIGINT_MAX, AccountCode, Currency, IdempotencyKey
-from railbench.payments.state_machine import PaymentState, Rail
-
-Direction = Literal["pull", "push"]
+from railbench.payments.state_machine import Direction, PaymentState, Rail
 
 
 class _Value(BaseModel):
@@ -77,7 +76,7 @@ class ReturnException(_Value):
     customer_account: str
     recovery_account: str
     currency: str
-    return_code: str
+    return_code: NachaReturnCode
     exposure: int
     late: bool
     recovery_transaction_id: int

@@ -12,13 +12,19 @@ Entry (the New York date it settled on), on the Banking Day calendar:
 
 "Opening of business" is modelled as midnight New York time at the start of that Banking Day,
 the same moment ACH funds become Available (ADR 0004, ADR 0010). Both bounds are inclusive: a
-Return can come at the moment of settlement, and at the deadline itself. Checked against
-nacha.org on 2026-11-27 (see ADR 0013).
+Return can come at the moment of settlement, and at the deadline itself. A Late Return is one
+after the 2-Banking-Day deadline, when the funds are (or would be) Available.
+
+`NachaReturnCode` is the type every model carries a return code as: a known `ReturnCode`,
+read from and written as its name (`"R10"`).
 """
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
+from typing import Annotated, Any
+
+from pydantic import BeforeValidator, PlainSerializer, WithJsonSchema
 
 from railbench.common.calendar import (
     add_banking_days,
@@ -31,9 +37,19 @@ STANDARD_BANKING_DAYS = 2
 EXTENDED_CALENDAR_DAYS = 60
 
 
+class UnknownReturnCode(ValueError):
+    """A return code the Simulator and the Ledger don't know."""
+
+
 class WindowKind(StrEnum):
-    BANKING_DAYS = "banking_days"  # by the opening of the 2nd Banking Day after settlement
-    EXTENDED = "extended"  # by the opening of the Banking Day after the 60th calendar day
+    BANKING_DAYS = "banking_days"
+    EXTENDED = "extended"
+
+    @property
+    def label(self) -> str:
+        if self is WindowKind.BANKING_DAYS:
+            return "to the opening of the 2nd Banking Day after settlement"
+        return "to the opening of the Banking Day after the 60th calendar day after settlement"
 
 
 @dataclass(frozen=True)
@@ -41,6 +57,16 @@ class ReturnCode:
     code: str
     reason: str
     window: WindowKind
+
+    def deadline(self, settled_at: datetime) -> datetime:
+        """The last moment this Return can arrive for an Entry settled at `settled_at`."""
+        if self.window is WindowKind.BANKING_DAYS:
+            return _standard_deadline(settled_at)
+        sixtieth = new_york_date(settled_at) + timedelta(days=EXTENDED_CALENDAR_DAYS)
+        return banking_day_starts(next_banking_day(sixtieth))
+
+    def within_window(self, settled_at: datetime, returned_at: datetime) -> bool:
+        return settled_at <= returned_at <= self.deadline(settled_at)
 
 
 RETURN_CODES: dict[str, ReturnCode] = {
@@ -76,26 +102,47 @@ RETURN_CODES: dict[str, ReturnCode] = {
 }
 
 
+def return_code(name: str) -> ReturnCode:
+    """The known return code called `name`. Raises UnknownReturnCode."""
+    found = RETURN_CODES.get(name)
+    if found is None:
+        raise UnknownReturnCode(f"no NACHA return code {name!r} is known")
+    return found
+
+
+def _parse(value: Any) -> ReturnCode:
+    if isinstance(value, ReturnCode):
+        return value
+    if not isinstance(value, str):
+        raise UnknownReturnCode(f"a return code is a name such as 'R10', not {value!r}")
+    return return_code(value)
+
+
+NachaReturnCode = Annotated[
+    ReturnCode,
+    BeforeValidator(_parse),
+    PlainSerializer(lambda code: code.code, return_type=str),
+    WithJsonSchema({"type": "string", "examples": ["R10"]}),
+]
+
+
 def return_deadline(code: str, settled_at: datetime) -> datetime:
     """The last moment a Return with `code` can arrive for an Entry settled at `settled_at`.
-    Raises KeyError for a code the Simulator doesn't know."""
-    window = RETURN_CODES[code].window
-    settlement_date = new_york_date(settled_at)
-    if window is WindowKind.BANKING_DAYS:
-        return banking_day_starts(add_banking_days(settlement_date, STANDARD_BANKING_DAYS))
-    sixtieth = settlement_date + timedelta(days=EXTENDED_CALENDAR_DAYS)
-    return banking_day_starts(next_banking_day(sixtieth))
-
-
-def is_late(settled_at: datetime, returned_at: datetime) -> bool:
-    """Whether a Return at `returned_at` comes after the 2-Banking-Day window has closed,
-    when the Ledger has made the funds Available (ADR 0004): a Late Return."""
-    settlement_date = new_york_date(settled_at)
-    return returned_at > banking_day_starts(
-        add_banking_days(settlement_date, STANDARD_BANKING_DAYS)
-    )
+    Raises UnknownReturnCode."""
+    return return_code(code).deadline(settled_at)
 
 
 def within_return_window(code: str, settled_at: datetime, returned_at: datetime) -> bool:
     """Whether a Return with `code` at `returned_at` is inside its Return Window."""
-    return settled_at <= returned_at <= return_deadline(code, settled_at)
+    return return_code(code).within_window(settled_at, returned_at)
+
+
+def is_late(settled_at: datetime, returned_at: datetime) -> bool:
+    """Whether a Return at `returned_at` comes after the 2-Banking-Day window has closed,
+    the moment ACH funds settled at `settled_at` become Available (ADR 0004): a Late
+    Return. Decided by time alone, never by whether the availability job has run yet."""
+    return returned_at > _standard_deadline(settled_at)
+
+
+def _standard_deadline(settled_at: datetime) -> datetime:
+    return banking_day_starts(add_banking_days(new_york_date(settled_at), STANDARD_BANKING_DAYS))

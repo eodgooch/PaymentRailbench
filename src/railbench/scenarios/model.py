@@ -35,7 +35,6 @@ from typing import Annotated, Literal, Self
 import yaml
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
-from railbench.common.returns import return_deadline, within_return_window
 from railbench.ledger.model import BIGINT_MAX
 from railbench.marketplace.model import payout_key
 from railbench.payments.service import customer_balance_account
@@ -219,10 +218,10 @@ class Scenario(_Strict):
         if pull is None:
             raise ValueError(f"Fault {fault.id}: only an ACH pull is returned, not a Payout")
         settles_at = ach_settles_at(self.start + pull.at)
-        if not within_return_window(fault.code, settles_at, settles_at + fault.at):
+        if not fault.code.within_window(settles_at, settles_at + fault.at):
             raise ValueError(
-                f"Fault {fault.id}: a {fault.code} Return {fault.at} after settlement is "
-                f"outside its Return Window (until {return_deadline(fault.code, settles_at)})"
+                f"Fault {fault.id}: a {fault.code.code} Return {fault.at} after settlement is "
+                f"outside its Return Window (until {fault.code.deadline(settles_at)})"
             )
 
     def customer(self, customer_id: str) -> Customer:

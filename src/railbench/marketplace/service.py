@@ -74,7 +74,7 @@ from railbench.marketplace.model import (
 from railbench.marketplace.tables import auction_closes, lots, payout_steps, payouts
 from railbench.payments.model import NewPayment, PaymentRef
 from railbench.payments.provider import ProviderError
-from railbench.payments.service import Payments, recovery_receivable_account
+from railbench.payments.service import Payments
 from railbench.payments.state_machine import PaymentState
 
 log = logging.getLogger(__name__)
@@ -550,13 +550,8 @@ class Marketplace:
         Recovery Receivable (ADR 0013): a buyer whose funding was returned owes for their
         lots still, though the deficit moved out of their Customer Balance."""
         now = self._clock.now()
-        journal = self._journal.within(connection)
-        available = journal.balances(code, now, now).available
-        try:
-            owed = journal.balances(recovery_receivable_account(code), now, now).posted
-        except AccountNotFound:
-            owed = 0
-        return available - owed
+        available = self._journal.within(connection).balances(code, now, now).available
+        return available - self._payments.owed(code, connection)
 
 
 def _payout(

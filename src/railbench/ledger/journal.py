@@ -252,6 +252,40 @@ class Journal:
             available=posted - held - outflows,
         )
 
+    def balance_moments(
+        self, code: str, after: datetime, known_at: datetime | None = None
+    ) -> list[datetime]:
+        """The Effective Times after `after`, in order, at which the Account's Posted Balance
+        or unsettled outflows can change, as known at `known_at` (default: now): those of its
+        Entries and of the Settlements of Transactions with Entries on it. Holds aren't
+        counted."""
+        known_at = self._clock.now() if known_at is None else known_at
+        with self._reading() as connection:
+            account_id = connection.scalar(select(accounts.c.id).where(accounts.c.code == code))
+            if account_id is None:
+                raise AccountNotFound(f"no Account {code}")
+            on_account = (
+                select(entries.c.transaction_id)
+                .where(entries.c.account_id == account_id, entries.c.recorded_at <= known_at)
+                .scalar_subquery()
+            )
+            moments = connection.scalars(
+                select(entries.c.effective_at)
+                .where(
+                    entries.c.account_id == account_id,
+                    entries.c.effective_at > after,
+                    entries.c.recorded_at <= known_at,
+                )
+                .union(
+                    select(settlements.c.effective_at).where(
+                        settlements.c.transaction_id.in_(on_account),
+                        settlements.c.effective_at > after,
+                        settlements.c.recorded_at <= known_at,
+                    )
+                )
+            ).all()
+        return sorted(set(moments))
+
     def post(self, new: NewTransaction) -> Posted:
         """Post a Transaction exactly once per Idempotency Key."""
         return self._write(

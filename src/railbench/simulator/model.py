@@ -8,9 +8,9 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from railbench.common.returns import RETURN_CODES
+from railbench.common.returns import NachaReturnCode
 
 BIGINT_MAX = 2**63 - 1
 
@@ -73,7 +73,7 @@ class SimulatedPayment(BaseModel):
     ended_at: datetime | None = None
     # When it was returned, if it was, and with which NACHA return code.
     returned_at: datetime | None = None
-    return_code: str | None = None
+    return_code: NachaReturnCode | None = None
 
 
 class ReturnRequest(BaseModel):
@@ -81,7 +81,7 @@ class ReturnRequest(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    code: str
+    code: NachaReturnCode
 
 
 # Scripting the Simulator (SPEC §6): how a Payment ends and which delivery Faults to inject.
@@ -159,15 +159,8 @@ class PlannedReturn(_Fault):
 
     kind: Literal["return"] = "return"
     event: Literal["returned"] = "returned"
-    code: str
+    code: NachaReturnCode
     at: timedelta
-
-    @field_validator("code")
-    @classmethod
-    def _known_code(cls, code: str) -> str:
-        if code not in RETURN_CODES:
-            raise ValueError(f"the Simulator knows no NACHA return code {code!r}")
-        return code
 
     @model_validator(mode="after")
     def _after_settlement(self) -> Self:

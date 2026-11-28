@@ -11,6 +11,7 @@ import pytest
 
 from railbench.common.returns import (
     RETURN_CODES,
+    UnknownReturnCode,
     WindowKind,
     return_deadline,
     within_return_window,
@@ -68,5 +69,5 @@ def test_a_return_cannot_come_before_the_settlement(code: str) -> None:
 
 
 def test_an_unknown_code_has_no_window() -> None:
-    with pytest.raises(KeyError):
+    with pytest.raises(UnknownReturnCode):
         return_deadline("R99", FRIDAY_SETTLEMENT)

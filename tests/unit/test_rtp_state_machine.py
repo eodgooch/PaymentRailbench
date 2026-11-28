@@ -16,7 +16,7 @@ CAN, DEC = PaymentState.CANCELED, PaymentState.DECLINED
 
 @pytest.mark.parametrize("ending", [SET, DEC])
 def test_an_rtp_payment_goes_straight_from_created_to_its_ending(ending: PaymentState) -> None:
-    assert decide(C, ending, rail="rtp") == Advance(path=(ending,))
+    assert decide(C, ending, rail="rtp", direction="push") == Advance(path=(ending,))
 
 
 @pytest.mark.parametrize(
@@ -25,7 +25,7 @@ def test_an_rtp_payment_goes_straight_from_created_to_its_ending(ending: Payment
 def test_an_rtp_event_for_a_state_already_reached_is_stale(
     current: PaymentState, reported: PaymentState
 ) -> None:
-    assert decide(current, reported, rail="rtp") == Stale()
+    assert decide(current, reported, rail="rtp", direction="push") == Stale()
 
 
 @pytest.mark.parametrize(
@@ -41,7 +41,7 @@ def test_an_rtp_event_for_a_state_already_reached_is_stale(
     ],
 )
 def test_anything_else_on_rtp_is_impossible(current: PaymentState, reported: PaymentState) -> None:
-    decision = decide(current, reported, rail="rtp")
+    decision = decide(current, reported, rail="rtp", direction="push")
 
     assert isinstance(decision, Impossible)
     assert "RTP" in decision.reason
@@ -49,4 +49,4 @@ def test_anything_else_on_rtp_is_impossible(current: PaymentState, reported: Pay
 
 
 def test_the_same_report_means_something_else_on_ach() -> None:
-    assert decide(C, SET, rail="ach") == Advance(path=(SUB, SET))
+    assert decide(C, SET, rail="ach", direction="pull") == Advance(path=(SUB, SET))
