@@ -17,9 +17,9 @@ from typing import Any, Protocol
 
 import httpx
 
+from railbench.common.returns import ReturnCode, return_code
 from railbench.common.signing import SIGNATURE_HEADER, BadSignature, verify
-from railbench.payments.model import Direction
-from railbench.payments.state_machine import PaymentState, Rail
+from railbench.payments.state_machine import Direction, PaymentState, Rail
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,8 @@ class ProviderEvent:
     provider_payment_id: str
     reported: PaymentState
     occurred_at: datetime
+    # A Return's NACHA return code (`returned` events only).
+    return_code: ReturnCode | None = None
 
 
 class ProviderError(Exception):
@@ -77,6 +79,7 @@ EVENT_STATES = {
     "payment.settled": PaymentState.SETTLED,
     "payment.canceled": PaymentState.CANCELED,
     "payment.declined": PaymentState.DECLINED,
+    "payment.returned": PaymentState.RETURNED,
 }
 
 
@@ -125,11 +128,16 @@ class SimulatorProvider:
             occurred_at = datetime.fromisoformat(event["occurred_at"])
             if occurred_at.utcoffset() is None:
                 raise ValueError("occurred_at has no UTC offset")
+            reported = EVENT_STATES[event["type"]]
+            code = None
+            if reported is PaymentState.RETURNED:  # an unknown code is a ValueError too
+                code = return_code(str(event["return"]["code"]))
             return ProviderEvent(
                 event_id=str(event["event_id"]),
                 provider_payment_id=str(event["payment"]["id"]),
-                reported=EVENT_STATES[event["type"]],
+                reported=reported,
                 occurred_at=occurred_at,
+                return_code=code,
             )
         except (ValueError, KeyError, TypeError, AttributeError) as error:
             raise MalformedEvent(f"not a Simulator Provider Event: {error!r}") from error

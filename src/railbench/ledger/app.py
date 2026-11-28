@@ -11,7 +11,9 @@ query parameters and must carry a UTC offset.
 
 Payments (`railbench.payments`) are served here too: `POST /payments` asks a Provider for an
 ACH pull, `GET /payments/{id}` reads one, and `POST /providers/{provider}/events` is the
-webhook receiver for Provider Events. The receiver answers 401 to a webhook whose signature
+webhook receiver for Provider Events. `GET /return-exceptions` lists the exceptions raised
+when a Return left a Customer Balance short (optionally for one `customer_account`); a
+Payment's own are on `GET /payments/{id}` too. The receiver answers 401 to a webhook whose signature
 doesn't verify, 400 to a verified body it can't read, and 503 (retry later) to an event for a
 Payment it hasn't recorded yet.
 
@@ -59,7 +61,7 @@ from railbench.marketplace.service import (
     Marketplace,
     MarketplaceError,
 )
-from railbench.payments.model import NewPayment, Payment, Receipt
+from railbench.payments.model import NewPayment, Payment, Receipt, ReturnException
 from railbench.payments.provider import MalformedEvent, Provider, ProviderError, SimulatorProvider
 from railbench.payments.service import (
     NotACustomerBalance,
@@ -297,6 +299,12 @@ def create_app(
     @app.get("/payments/{payment_id}")
     def get_payment(payment_id: int, payments: PaymentsDep) -> Payment:
         return payments.payment(payment_id)
+
+    @app.get("/return-exceptions")
+    def list_return_exceptions(
+        payments: PaymentsDep, customer_account: Annotated[str | None, Query()] = None
+    ) -> list[ReturnException]:
+        return payments.return_exceptions(customer_account)
 
     @app.post(
         "/auction-closes",

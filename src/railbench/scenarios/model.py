@@ -16,8 +16,14 @@ the Simulator gets a plan for each Payment the Payout could make (`<payout>:rtp`
 one of them that emits its event.
 
 Fault kinds are a discriminated union on `kind`, shared with the Simulator. A new kind
-(Returns, Cutoff and Settlement Report Faults, #7 and #8) is one more variant in that union
-plus the Simulator's case for injecting it; the rest of the Scenario file stays as it is.
+(Cutoff and Settlement Report Faults, #8) is one more variant in that union plus the
+Simulator's case for injecting it; the rest of the Scenario file stays as it is.
+
+A `return` Fault returns an ACH pull with a NACHA return code, `at` after it settles
+(ADR 0013). The Scenario knows when each pull settles (the Ledger originates it at `at` after
+the start, and ACH timing is fixed by the calendar), so a Return outside its code's Return
+Window is refused here, before anything runs; the Simulator checks again when it creates the
+Payment. Only a pull that settles can be returned, never a Payout.
 """
 
 import random
@@ -40,8 +46,10 @@ from railbench.simulator.model import (
     Outcome,
     OutOfOrderDelivery,
     PaymentPlan,
+    PlannedReturn,
     events_for,
 )
+from railbench.simulator.provider import ach_settles_at
 
 Slug = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,39}$")]
 RANDOM_PREFIX = "random-"
@@ -131,7 +139,11 @@ class OutOfOrder(OutOfOrderDelivery, _OnPayment):
     pass
 
 
-ScenarioFault = Annotated[Duplicate | Delay | OutOfOrder, Field(discriminator="kind")]
+class Return(PlannedReturn, _OnPayment):
+    pass
+
+
+ScenarioFault = Annotated[Duplicate | Delay | OutOfOrder | Return, Field(discriminator="kind")]
 FaultKind = Literal["duplicate", "delay", "out_of_order"]
 
 
@@ -196,8 +208,21 @@ class Scenario(_Strict):
                 raise ValueError(f"Fault {fault.id} names no known Payment or Payout")
             if fault.id.startswith(RANDOM_PREFIX):
                 raise ValueError(f"Fault ids starting {RANDOM_PREFIX!r} are kept for random ones")
+            if isinstance(fault, Return):
+                self._check_return(fault)
         self.plans(self.seed)  # every Fault fits the Payment it's on
         return self
+
+    def _check_return(self, fault: "Return") -> None:
+        pull = next((p for p in self.payments if p.id == fault.payment), None)
+        if pull is None:
+            raise ValueError(f"Fault {fault.id}: only an ACH pull is returned, not a Payout")
+        settles_at = ach_settles_at(self.start + pull.at)
+        if not fault.code.within_window(settles_at, settles_at + fault.at):
+            raise ValueError(
+                f"Fault {fault.id}: a {fault.code.code} Return {fault.at} after settlement is "
+                f"outside its Return Window (until {fault.code.deadline(settles_at)})"
+            )
 
     def customer(self, customer_id: str) -> Customer:
         return next(c for c in self.customers if c.id == customer_id)
@@ -322,6 +347,8 @@ def _plain(fault: ScenarioFault) -> FaultPlan:
             return DelayedDelivery(**data)
         case OutOfOrder():
             return OutOfOrderDelivery(**data)
+        case Return():
+            return PlannedReturn(**data)
 
 
 def load(path: Path | str) -> Scenario:

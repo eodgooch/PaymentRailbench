@@ -1,0 +1,35 @@
+# A named adversarial Scenario (SPEC §10): a duplicate settlement event after a Reversal.
+# Kit's ACH pull settles on Friday 4 September, and on Labor Day, inside R01's 2-Banking-Day
+# window, her bank returns it R01 (insufficient funds): the Ledger reverses the funding.
+# Then the Provider redelivers the old settlement event.
+# Expected:
+# - the Return is a posted Reversal of the funding and of its sweep to Bank Cash, and ends
+#   the availability Hold, so the money is never Available;
+# - the redelivered settlement has the same event ID: the Inbox recognises it and applies
+#   nothing (no second Settlement, no new Hold, nothing un-reversed);
+# - Kit's Customer Balance ends at 0, with nothing in Recovery Receivable and no exception:
+#   she spent nothing;
+# - the Clearing Account nets to zero, and replaying the Inbox reproduces the Ledger.
+name: duplicate-settlement-after-return
+description: A settlement event redelivered after the Return reversed the pull.
+seed: 12
+start: 2026-09-03T15:00:00-04:00 # Thursday, before Cutoff; settles Friday before Labor Day
+customers:
+  - id: c-kit
+    name: Kit Oyelaran
+payments:
+  - id: kit-funding
+    customer: c-kit
+    amount: 12000
+    description: Buyer funds their Customer Balance
+faults:
+  - id: kit-r01
+    kind: return
+    payment: kit-funding
+    code: R01
+    at: P3DT3H30M # Labor Day, Monday 7 September, at noon New York
+  - id: settlement-redelivered
+    kind: duplicate
+    payment: kit-funding
+    event: settled
+    after: returned

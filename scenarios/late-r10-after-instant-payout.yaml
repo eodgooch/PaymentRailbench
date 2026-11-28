@@ -1,0 +1,51 @@
+# The headline Scenario (SPEC §4.3, §10, ADR 0004, ADR 0013): a Late Return after an Instant
+# Payout cleared. Imogen funds her Customer Balance by ACH pull on Thursday afternoon and buys
+# Tobias's card at the 17:00 New York Auction Close for 300.00. Tobias takes an Instant
+# Payout: 270.00 (the hammer price less Mintwharf's fictional 10% fee) goes out over RTP at
+# once, at Mintwharf's risk, and clears. Imogen's pull settles on Friday and is Available on
+# Wednesday 9 September (after a weekend and Labor Day). On Tuesday 6 October her bank
+# returns it R10 (she says she never authorized the debit), inside R10's 60-day Return
+# Window, and the Return is delivered twice.
+# Expected:
+# - the Return posts as a Reversal of the funding and of its sweep to Bank Cash, applied once;
+# - Imogen's Customer Balance would be -300.00: the deficit moves to her Recovery Receivable
+#   (recovery-receivable:customer:c-imogen:usd = 30000), so her Customer Balance ends at 0;
+# - one return exception: R10, a Late Return, exposure 30000 Minor Units;
+# - Bank Cash ends at -27000: the pull came in and went back out, the Payout went out;
+# - Fee Revenue keeps its 3000; Tobias is unaffected: paid, his Customer Balance at 0;
+# - every Clearing Account nets to zero;
+# - the Fault Manifest names the Late Return (cause late_return) and the duplicate delivery;
+# - replaying the Inbox reproduces the Ledger exactly.
+name: late-r10-after-instant-payout
+description: A Late R10 Return after the seller's Instant Payout over RTP cleared.
+seed: 10
+start: 2026-09-03T15:00:00-04:00 # Thursday, before the 16:00 New York ACH Cutoff
+instant_payout_limit: 50000
+seller_fee_bps: 1000
+customers:
+  - id: c-imogen
+    name: Imogen Achterberg
+  - id: c-tobias
+    name: Tobias Wrenfield
+payments:
+  - id: imogen-funding
+    customer: c-imogen
+    amount: 30000
+    description: Buyer funds their Customer Balance
+auction_closes:
+  - id: thursday-evening
+    at: PT2H
+    lots:
+      - {id: lot-1, buyer: c-imogen, seller: c-tobias, hammer_price: 30000}
+    payouts:
+      - {id: tobias-payout, seller: c-tobias, speed: instant}
+faults:
+  - id: imogen-r10
+    kind: return
+    payment: imogen-funding
+    code: R10
+    at: P32D # Friday 4 September 08:30 + 32 days: Tuesday 6 October, 08:30 New York
+  - id: return-delivered-twice
+    kind: duplicate
+    payment: imogen-funding
+    event: returned

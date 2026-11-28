@@ -1,7 +1,7 @@
-"""SQLAlchemy Core views of the `payments` schema (migrations 0004 and 0007 are the source of
+"""SQLAlchemy Core views of the `payments` schema (migrations 0004, 0007 and 0008 are the source of
 truth)."""
 
-from sqlalchemy import BigInteger, Column, DateTime, LargeBinary, MetaData, Table, Text
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, LargeBinary, MetaData, Table, Text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from railbench.common.db import PAYMENTS_SCHEMA
@@ -59,6 +59,24 @@ transitions = Table(
     Column("job_version", Text),
     Column("transaction_id", BigInteger),
     Column("hold_id", BigInteger),
+    Column("effective_at", DateTime(timezone=True), nullable=False),
+    Column("recorded_at", DateTime(timezone=True), nullable=False),
+)
+
+return_exceptions = Table(
+    "return_exceptions",
+    metadata,
+    Column("id", BigInteger, primary_key=True),
+    Column("payment_id", BigInteger, nullable=False),
+    Column("inbox_id", BigInteger, nullable=False),
+    Column("customer_account", Text, nullable=False),
+    Column("recovery_account", Text, nullable=False),
+    Column("currency", Text, nullable=False),
+    Column("return_code", Text, nullable=False),
+    Column("exposure", BigInteger, nullable=False),
+    Column("late", Boolean, nullable=False),
+    Column("recovery_transaction_id", BigInteger, nullable=False, unique=True),
+    Column("detail", Text, nullable=False),
     Column("effective_at", DateTime(timezone=True), nullable=False),
     Column("recorded_at", DateTime(timezone=True), nullable=False),
 )

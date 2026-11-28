@@ -23,14 +23,16 @@ job as Actor:
   spend the same limit.
 
 The funds behind a Standard Payout are Available when none of the buyers of its seller's
-lots in that auction, nor the seller, has a negative Available Balance: a buyer who funded
-by ACH once the Ledger releases their funding's Hold, the seller once their own purchases
-are paid for. `release_payouts()`, the `payout-release` job on the Ledger's Clock, then
-sends it over ACH. The job also makes a declined Instant Payout Standard (its Hold stays),
-releases the Hold of a Payout whose ACH Payment ended without moving money, and sends any
-Payout whose Payment didn't go out (the Provider was unreachable). Each step is one
-database transaction, appended at most once per Payout, so the job is safe to run at any
-time. A Standard Payout's view says who it's waiting for.
+lots in that auction, nor the seller, has a negative Available Balance less what they owe in
+Recovery Receivable: a buyer who funded by ACH once the Ledger releases their funding's
+Hold, the seller once their own purchases are paid for. A buyer whose funding was returned
+(ADR 0013) holds the Payouts behind them up again, and keeps an Instant Payout's risk on its
+seller's limit, until they fund what they owe. `release_payouts()`, the `payout-release`
+job on the Ledger's Clock, then sends it over ACH. The job also makes a declined Instant
+Payout Standard (its Hold stays), releases the Hold of a Payout whose ACH Payment ended
+without moving money, and sends any Payout whose Payment didn't go out (the Provider was
+unreachable). Each step is one database transaction, appended at most once per Payout, so
+the job is safe to run at any time. A Standard Payout's view says who it's waiting for.
 """
 
 import logging
@@ -544,8 +546,12 @@ class Marketplace:
         return [code for code in checked if available[code] < 0]
 
     def _available(self, connection: Connection, code: str) -> int:
+        """The Customer Balance's Available Balance less what the Customer owes Mintwharf in
+        Recovery Receivable (ADR 0013): a buyer whose funding was returned owes for their
+        lots still, though the deficit moved out of their Customer Balance."""
         now = self._clock.now()
-        return self._journal.within(connection).balances(code, now, now).available
+        available = self._journal.within(connection).balances(code, now, now).available
+        return available - self._payments.owed(code, connection)
 
 
 def _payout(

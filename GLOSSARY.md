@@ -171,7 +171,11 @@ _Avoid_: Bounce, chargeback (chargebacks are a card concept)
 A Return that arrives after the funds were already Available, so Mintwharf may have paid them out.
 
 **Return Window**:
-How long after settlement a Return can still arrive. It depends on the return code.
+How long after settlement a Return can still arrive. It depends on the return code: most codes by the opening of the second Banking Day after the Settlement Date, unauthorized consumer debits (such as R10) by the opening of the Banking Day after the 60th calendar day.
+
+**Return exception**:
+The record raised when a Return leaves a Customer Balance short: the deficit moved to Recovery Receivable, as the exposure in Minor Units, with the return code and whether it was a Late Return. It is for a person to work; it is not a Break.
+_Avoid_: Break (Breaks come from Reconciliation)
 
 **Provider Adjustment**:
 A Provider clawing back part of an already settled amount after the fact (for example a fee correction or a partial recall of a Payout batch).

@@ -4,6 +4,7 @@ ACH, a pull or a push:
 
     created → submitted → settled → available (a pull only; the Ledger decides it)
     created | submitted → canceled | declined
+    settled | available → returned (a pull only: a Return, with its NACHA return code)
 
 RTP, a credit push only, instant and final:
 
@@ -17,7 +18,14 @@ canceled or declined is impossible (the Provider may really have sent the debit)
 that skips ahead along the main path (a `settled` for a Payment still `created`) advances
 through every state it skipped, so the Ledger books each step. Anything else (a decline
 after settlement, a settlement after a decline) is impossible: the caller records an
-exception and writes nothing to the Ledger. Returns join in #7 (ACH only).
+exception and writes nothing to the Ledger.
+
+A Return is final, and can only follow a settlement the Ledger has recorded: a Return for a
+Payment still created or submitted is impossible (SPEC §4.2's own example), even if only the
+settlement is late, and so is one after a decline or cancellation. After a Return, every
+state on the main path counts as passed (a late settlement or a second Return is stale),
+and a decline or cancellation is impossible. Only a pull is returned: a Return of a push (a
+Payout) is impossible.
 
 Nothing follows an RTP ending: a settled RTP Payment can't be declined or returned, and RTP
 has no submission or cancellation step, so any other RTP event is impossible.
@@ -29,6 +37,7 @@ from enum import StrEnum
 from typing import Literal
 
 Rail = Literal["ach", "rtp"]
+Direction = Literal["pull", "push"]
 
 
 class PaymentState(StrEnum):
@@ -38,6 +47,7 @@ class PaymentState(StrEnum):
     AVAILABLE = "available"
     CANCELED = "canceled"
     DECLINED = "declined"
+    RETURNED = "returned"
 
 
 MAIN_PATH = (
@@ -47,6 +57,7 @@ MAIN_PATH = (
     PaymentState.AVAILABLE,
 )
 ENDS_BEFORE_SETTLEMENT = (PaymentState.CANCELED, PaymentState.DECLINED)
+RETURNABLE = (PaymentState.SETTLED, PaymentState.AVAILABLE)
 RTP_ENDINGS = (PaymentState.SETTLED, PaymentState.DECLINED)
 
 
@@ -76,9 +87,11 @@ def decide(
     reached: Collection[PaymentState] = (),
     *,
     rail: Rail,
+    direction: Direction,
 ) -> Decision:
-    """What an event reporting `reported` does to a Payment on `rail` now at `current`,
-    having been recorded in the states `reached` (its history, `current` included or not)."""
+    """What an event reporting `reported` does to a `direction` Payment on `rail` now at
+    `current`, having been recorded in the states `reached` (its history, `current` included
+    or not)."""
     if rail == "rtp":
         return _decide_rtp(current, reported)
 
@@ -88,6 +101,14 @@ def decide(
     if current in ENDS_BEFORE_SETTLEMENT:
         passed = {current, PaymentState.CREATED, *reached}
         return Stale() if reported in passed else impossible()
+    if current is PaymentState.RETURNED:
+        return Stale() if reported in (*MAIN_PATH, PaymentState.RETURNED) else impossible()
+    if reported is PaymentState.RETURNED:
+        if direction == "push":
+            return Impossible("an ACH push (a Payout) can't be returned here: only pulls are")
+        if current in RETURNABLE:
+            return Advance(path=(PaymentState.RETURNED,))
+        return Impossible(f"an ACH Payment can't go from {current} to returned: it never settled")
     position = MAIN_PATH.index(current)
     if reported in ENDS_BEFORE_SETTLEMENT:
         return Advance(path=(reported,)) if position < 2 else impossible()

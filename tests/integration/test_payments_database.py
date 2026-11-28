@@ -17,6 +17,7 @@ COLUMNS = {
     "inbox": "provider",
     "inbox_outcomes": "detail",
     "transitions": "state",
+    "return_exceptions": "detail",
 }
 TABLES = tuple(COLUMNS)
 EDITS = {

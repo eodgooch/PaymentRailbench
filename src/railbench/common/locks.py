@@ -19,6 +19,7 @@ class LockSpace(IntEnum):
     AUCTION = 5  # closing one auction (marketplace)
     PAYOUT = 6  # moving one Payout on a step (marketplace)
     SELLER = 7  # one Customer's Instant Payout exposure (marketplace)
+    CUSTOMER = 8  # booking a Return's deficit on one Customer Balance (Payments)
 
 
 def lock(connection: Connection, space: LockSpace, key: int) -> None:

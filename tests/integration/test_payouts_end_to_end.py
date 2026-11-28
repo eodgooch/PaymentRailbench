@@ -78,12 +78,20 @@ class Stack:
         self.journal.open_account(NewAccount(code=code, type=AccountType.LIABILITY, currency="USD"))
         return code
 
-    def fund(self, customer: str, amount: int) -> int:
-        """An ACH pull into the Customer Balance; returns the Ledger's Payment id."""
+    def fund(self, customer: str, amount: int, returned: dict[str, Any] | None = None) -> int:
+        """An ACH pull into the Customer Balance, returned as planned if `returned` gives a
+        code and `at`; returns the Ledger's Payment id."""
+        key = unique("funding")
+        if returned is not None:
+            self.simulator.plan(
+                PaymentPlan.model_validate(
+                    {"idempotency_key": key, "faults": [{"id": "r", "kind": "return", **returned}]}
+                )
+            )
         response = self.ledger.post(
             "/payments",
             json={
-                "idempotency_key": unique("funding"),
+                "idempotency_key": key,
                 "rail": "ach",
                 "direction": "pull",
                 "customer_account": customer,
@@ -710,3 +718,62 @@ def test_two_auctions_closing_at_once_cannot_both_spend_a_sellers_limit(
         next(p["speed"] for p in c.auction_close.model_dump()["payouts"]) for c in closed
     )
     assert speeds == ["instant", "standard"]
+
+
+# Returns (ADR 0013): a buyer's Return takes their funding back, so the Payouts it was behind
+# are at risk again; the deficit in Recovery Receivable keeps them so.
+LABOR_DAY = datetime(2026, 9, 7, 16, 0, tzinfo=UTC)
+
+
+def test_a_standard_payout_behind_a_returned_buyer_goes_on_waiting(stack: Stack) -> None:
+    buyer, seller = stack.customer(), stack.customer()
+    funding = stack.fund(buyer, 25_000, {"code": "R01", "at": LABOR_DAY - FRIDAY_SETTLEMENT})
+    stack.tick()
+    stack.clock.set(THURSDAY_5PM)
+    closed = stack.close([(buyer, seller, 25_000)])
+
+    stack.at(FRIDAY_SETTLEMENT)
+    stack.at(LABOR_DAY)  # R01: insufficient funds, before the funds were Available
+    stack.at(WEDNESDAY_START)
+    stack.at(THURSDAY_AFTER_SETTLEMENT)
+
+    assert stack.payments.payment(funding).state == "returned"
+    # The buyer's balance is back to zero, the deficit in Recovery Receivable: they still
+    # owe for the lot, so the seller's Payout waits for them.
+    assert stack.balances(buyer) == {"posted": 0, "pending": 0, "available": 0}
+    assert stack.balances(f"recovery-receivable:{buyer}")["posted"] == 25_000
+    payout = stack.payout(closed["auction_id"], seller)
+    assert [s["step"] for s in payout["steps"]] == ["reserved", "standard"]
+    assert payout["waiting_for"] == [buyer]
+
+    # Once the buyer funds their purchase again, the Payout goes.
+    stack.fund(buyer, 25_000)
+    stack.tick()
+    stack.at(datetime(2026, 9, 11, 12, 30, tzinfo=UTC))  # Friday: settles
+    stack.at(datetime(2026, 9, 15, 4, 0, tzinfo=UTC))  # Tuesday: Available
+    payout = stack.payout(closed["auction_id"], seller)
+    assert [s["step"] for s in payout["steps"]] == ["reserved", "standard", "released"]
+
+
+def test_a_late_return_puts_an_instant_payouts_risk_back_on_the_limit(stack: Stack) -> None:
+    seller, first_buyer, second_buyer = stack.customer(), stack.customer(), stack.customer()
+    stack.fund(first_buyer, 30_000, {"code": "R10", "at": "P10D"})
+    stack.tick()
+    stack.clock.set(THURSDAY_5PM)
+    first = stack.close([(first_buyer, seller, 30_000)], instant_payouts=[seller])
+    assert stack.payout(first["auction_id"], seller)["speed"] == "instant"
+    stack.at(FRIDAY_SETTLEMENT)
+    stack.at(WEDNESDAY_START)  # Available: the risk looked over
+
+    stack.at(FRIDAY_SETTLEMENT + timedelta(days=10))  # the Late Return
+    second = stack.close(
+        [(second_buyer, seller, 30_000)],
+        instant_payouts=[seller],
+        closed_at=stack.clock.now().isoformat(),
+    )
+
+    # 27,000 is at risk again (the first buyer owes it to Mintwharf), so another 27,000
+    # would take the seller over the limit.
+    assert stack.balances(f"recovery-receivable:{first_buyer}")["posted"] == 30_000
+    assert stack.payout(second["auction_id"], seller)["speed"] == "standard"
+    assert stack.balances(seller)["posted"] == 27_000  # the first Payout stays paid

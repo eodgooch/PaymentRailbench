@@ -2,9 +2,11 @@
 
 A `hypothesis.stateful` machine originates ACH pulls and plays a Provider that reports each
 one submitted and then ended (settled, declined or canceled), sometimes contradicting itself
-with a second, different ending. It delivers those Provider Events in any order, redelivers
-them, lets time pass between deliveries, and runs the Ledger's availability job, all through
-the real Payments service and Journal against Postgres, with signed webhook bodies.
+with a second, different ending, and sometimes returning a settled one (with a NACHA return
+code, at any time after it settled: before or after the Ledger makes it Available). It
+delivers those Provider Events in any order, redelivers them, lets time pass between
+deliveries, and runs the Ledger's availability job, all through the real Payments service
+and Journal against Postgres, with signed webhook bodies.
 
 After every step:
 
@@ -15,7 +17,10 @@ After every step:
   the amount for one still in flight;
 - a stale or impossible event writes nothing to the Ledger, and the outcome of each
   delivery is the one the state machine's rules give (written out here as a table);
-- each Customer Balance's Posted, Pending and Available match the Payment's furthest state.
+- each Customer Balance's Posted, Pending and Available match the Payment's furthest state;
+- a negative Customer Balance always has a matching Recovery Receivable (here nothing is
+  spent, so a Return never leaves a deficit: no Customer Balance goes negative and no return
+  exception is raised; `test_return_properties` spends before returning).
 
 At the end of each example (not after every step, to keep the run short), replaying its
 Inbox from the database alone into an empty Ledger reproduces it exactly.
@@ -61,7 +66,15 @@ SECRET = "property-secret"
 START = datetime(2026, 9, 1, 14, 0, tzinfo=UTC)  # a Tuesday morning in New York
 CLEARING = clearing_account("simulator", "ach", "USD")
 ENDINGS = ("settled", "declined", "canceled")
-RANK = {"created": 0, "submitted": 1, "settled": 2, "available": 3, "declined": 4, "canceled": 4}
+RANK = {
+    "created": 0,
+    "submitted": 1,
+    "settled": 2,
+    "available": 3,
+    "declined": 4,
+    "canceled": 4,
+    "returned": 4,
+}
 LEDGER_TABLES = (entries, settlements, holds, hold_ends)
 
 
@@ -79,6 +92,10 @@ def expected_outcome(reached: list[str], reported: str) -> str:
     current = reached[-1]
     if current in ENDS_BEFORE_SETTLEMENT:
         return "exception"  # nothing follows a cancellation or decline
+    if current == "returned":
+        return "stale" if reported in MAIN_LINE else "exception"  # a Return is final
+    if reported == "returned":  # only after a settlement the Ledger has recorded
+        return "applied" if current in ("settled", "available") else "exception"
     if reported in ENDS_BEFORE_SETTLEMENT:
         return "applied" if current in ("created", "submitted") else "exception"
     return "applied" if MAIN_LINE.index(reported) > MAIN_LINE.index(current) else "exception"
@@ -154,9 +171,15 @@ class AchPullMachine(RuleBasedStateMachine):
         ending=st.sampled_from(ENDINGS),
         contradiction=st.none() | st.sampled_from(ENDINGS),
         settles_after=st.integers(min_value=60, max_value=3 * 24 * 3600),
+        returned_after=st.none() | st.integers(min_value=0, max_value=10 * 24 * 3600),
     )
     def originate(
-        self, amount: int, ending: str, contradiction: str | None, settles_after: int
+        self,
+        amount: int,
+        ending: str,
+        contradiction: str | None,
+        settles_after: int,
+        returned_after: int | None,
     ) -> None:
         self._pass_time()
         n = len(self.pulls)
@@ -185,6 +208,9 @@ class AchPullMachine(RuleBasedStateMachine):
             story.append(
                 Event(f"evt-{key}-{contradiction}", contradiction, ended_at + timedelta(hours=1))
             )
+        if returned_after is not None and ending == "settled":
+            returned_at = ended_at + timedelta(seconds=returned_after)
+            story.append(Event(f"evt-{key}-returned", "returned", returned_at))
         self.pulls.append(Pull(created.id, created.provider_payment_id, customer, amount, story))
 
     @precondition(lambda self: self.pulls)
@@ -204,6 +230,7 @@ class AchPullMachine(RuleBasedStateMachine):
                 "type": f"payment.{event.type}",
                 "occurred_at": event.occurred_at.isoformat(),
                 "payment": {"id": pull.provider_id},
+                **({"return": {"code": "R10"}} if event.type == "returned" else {}),
             }
         ).encode()
         receipt = self.payments.receive(
@@ -211,6 +238,8 @@ class AchPullMachine(RuleBasedStateMachine):
         )
 
         self.seen["duplicate" if receipt.duplicate else receipt.outcome] += 1
+        if event.type == "returned" and receipt.outcome == "applied" and not receipt.duplicate:
+            self.seen["returned"] += 1
         assert receipt.duplicate == event.delivered
         if expected is not None:
             assert receipt.outcome == expected, (pull.reached, event.type, receipt.detail)
@@ -269,11 +298,13 @@ class AchPullMachine(RuleBasedStateMachine):
             assert len(event_ids) == len(set(event_ids))
             assert set(event_ids) == {e.event_id for e in pull.events if e.delivered}
 
-            booked = {s["transaction"] for s in found["transitions"]} - {None}
+            # Every Ledger row this Payment booked, a Return's second Reversal included.
+            own = f"prop-{self.run}-{self.pulls.index(pull)}/"
             clearing = sum(
                 entry[2]
-                for key in booked
-                for entry in transactions[key]["entries"]
+                for key, transaction in transactions.items()
+                if key.startswith(own)
+                for entry in transaction["entries"]
                 if entry[0] == CLEARING
             )
             assert clearing == (pull.amount if payment.state == "submitted" else 0)
@@ -286,12 +317,16 @@ class AchPullMachine(RuleBasedStateMachine):
                 "available": (pull.amount, 0, pull.amount),
                 "declined": (0, 0, 0),
                 "canceled": (0, 0, 0),
+                "returned": (0, 0, 0),
             }[payment.state]
             assert (balances.posted, balances.pending, balances.available) == (
                 posted,
                 pending,
                 available,
             )
+            # Nothing is spent here, so a Return never leaves a deficit.
+            assert balances.posted >= 0
+            assert found["return_exceptions"] == []
 
     def teardown(self) -> None:
         self.start[0] = self.clock.now() + timedelta(days=1)
@@ -343,4 +378,6 @@ def test_the_ach_payment_machine_keeps_its_invariants_under_any_event_order(
     finally:
         for engine in engines:
             engine.dispose()
-    assert set(seen) == {"applied", "stale", "exception", "duplicate", "available"}, seen
+    assert set(seen) == {"applied", "stale", "exception", "duplicate", "available", "returned"}, (
+        seen
+    )

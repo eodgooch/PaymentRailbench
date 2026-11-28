@@ -1,4 +1,4 @@
-"""SQLAlchemy Core views of the Simulator's tables (migrations 0005-0007 are the source of
+"""SQLAlchemy Core views of the Simulator's tables (migrations 0005-0008 are the source of
 truth)."""
 
 from sqlalchemy import BigInteger, Column, DateTime, Integer, MetaData, Table, Text
@@ -32,6 +32,9 @@ payments = Table(
     _time("settles_at"),
     _time("settled_at"),
     _time("ended_at"),
+    Column("return_code", Text),
+    _time("returns_at"),
+    _time("returned_at"),
 )
 
 events = Table(
