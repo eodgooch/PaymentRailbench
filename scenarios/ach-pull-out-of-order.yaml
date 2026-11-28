@@ -1,7 +1,9 @@
 # Provider Events arrive out of order and late, and one pull is declined. Expected: a
 # settlement heard before its submission books both steps and the late submission is stale;
-# a decline heard before its submission books nothing; a delayed settlement still settles
-# at its Effective Time; nothing moves backward and no exception is raised.
+# a decline heard before its submission books nothing, and the late submission is an
+# exception (as far as the Ledger knows the pull was never submitted, so a submission now
+# may mean the debit really went out); a delayed settlement still settles at its Effective
+# Time; nothing moves backward.
 name: ach-pull-out-of-order
 description: Out-of-order and delayed webhooks, and a declined pull.
 seed: 23

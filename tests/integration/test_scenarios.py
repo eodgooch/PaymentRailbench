@@ -8,11 +8,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, select
 
 from railbench.common.db import LEDGER_APP_ROLE, make_engine
+from railbench.payments.tables import inbox
 from railbench.scenarios.model import Scenario, load
-from railbench.scenarios.replay import replay_inbox
+from railbench.scenarios.replay import availability_job_runs, replay_inbox
 from railbench.scenarios.runner import Run, fresh_database, run
 from railbench.scenarios.summary import ledger_summary
 
@@ -28,9 +29,16 @@ def fresh(database_url: str) -> Iterator[str]:
         yield url
 
 
-def run_in_fresh_database(database_url: str, scenario: Scenario, seed: int | None = None) -> Run:
+@pytest.fixture
+def manifests(tmp_path: Path) -> Path:
+    return tmp_path
+
+
+def run_in_fresh_database(
+    database_url: str, manifests: Path, scenario: Scenario, seed: int | None = None
+) -> Run:
     with fresh_database(database_url) as url:
-        return run(scenario, url, seed)
+        return run(scenario, url, seed, manifests / f"{scenario.name}-{seed}.json")
 
 
 def payment(found: Run, payment_id: str) -> dict[str, Any]:
@@ -55,8 +63,10 @@ def no_exceptions(found: Run) -> bool:
     )
 
 
-def test_duplicate_webhooks_are_applied_once(database_url: str) -> None:
-    found = run_in_fresh_database(database_url, load(SCENARIOS / "ach-pull-duplicates.yaml"))
+def test_duplicate_webhooks_are_applied_once(database_url: str, manifests: Path) -> None:
+    found = run_in_fresh_database(
+        database_url, manifests, load(SCENARIOS / "ach-pull-duplicates.yaml")
+    )
 
     assert [(f.fault_id, f.cause_code) for f in found.manifest.faults] == [
         ("dup-avery-submitted", "duplicate_delivery"),
@@ -69,8 +79,12 @@ def test_duplicate_webhooks_are_applied_once(database_url: str) -> None:
     assert no_exceptions(found)
 
 
-def test_out_of_order_and_delayed_webhooks_still_move_payments_forward(database_url: str) -> None:
-    found = run_in_fresh_database(database_url, load(SCENARIOS / "ach-pull-out-of-order.yaml"))
+def test_out_of_order_and_delayed_webhooks_still_move_payments_forward(
+    database_url: str, manifests: Path
+) -> None:
+    found = run_in_fresh_database(
+        database_url, manifests, load(SCENARIOS / "ach-pull-out-of-order.yaml")
+    )
 
     # Settled heard first: both steps booked by the settlement event, and the late
     # submission is stale.
@@ -80,9 +94,10 @@ def test_out_of_order_and_delayed_webhooks_still_move_payments_forward(database_
     settled_event = cleo["inbox_outcomes"][0]["event_id"]
     assert [step["actor"] for step in cleo["transitions"][1:3]] == [settled_event] * 2
 
-    # Declined heard first: nothing was ever pending, so nothing is reversed.
+    # Declined heard first: nothing was ever pending, so nothing is reversed. The late
+    # submission reports a state the Payment never reached: an exception, no Ledger write.
     assert states(found, "dov-funding") == ["created", "declined"]
-    assert outcomes(found, "dov-funding") == ["applied", "stale"]
+    assert outcomes(found, "dov-funding") == ["applied", "exception"]
     assert [step["transaction"] for step in payment(found, "dov-funding")["transitions"]] == [
         None,
         None,
@@ -94,15 +109,16 @@ def test_out_of_order_and_delayed_webhooks_still_move_payments_forward(database_
     assert [step["state"] for step in top_up] == ["created", "submitted", "settled", "available"]
     assert top_up[2]["effective_at"] == "2026-09-04T12:30:00+00:00"
     assert top_up[2]["recorded_at"] == "2026-09-04T18:30:00+00:00"
-    assert no_exceptions(found)
+    assert outcomes(found, "cleo-top-up") == ["applied", "applied"]
     assert {f.kind for f in found.manifest.faults} == {"out_of_order", "delay"}
 
 
 def test_a_declined_or_canceled_pull_runs_end_to_end_through_real_webhooks(
-    database_url: str,
+    database_url: str, manifests: Path
 ) -> None:
     found = run_in_fresh_database(
         database_url,
+        manifests,
         Scenario.model_validate(
             {
                 "name": "declined-and-canceled",
@@ -127,9 +143,13 @@ def test_a_declined_or_canceled_pull_runs_end_to_end_through_real_webhooks(
 
 
 def test_a_run_writes_its_fault_manifest(database_url: str, tmp_path: Path) -> None:
-    found = run_in_fresh_database(database_url, load(SCENARIOS / "ach-pull-out-of-order.yaml"))
+    with fresh_database(database_url) as url:
+        found = run(
+            load(SCENARIOS / "ach-pull-out-of-order.yaml"), url, manifest_path=tmp_path / "m.json"
+        )
 
-    written = json.loads(found.manifest.write(tmp_path / "manifest.json").read_text())
+    assert found.manifest_path == tmp_path / "m.json"
+    written = json.loads((tmp_path / "m.json").read_text())
 
     assert (written["scenario"], written["seed"]) == ("ach-pull-out-of-order", 23)
     late = next(f for f in written["faults"] if f["fault_id"] == "settlement-six-hours-late")
@@ -138,7 +158,7 @@ def test_a_run_writes_its_fault_manifest(database_url: str, tmp_path: Path) -> N
         "kind": "delay",
         "payment": "cleo-top-up",
         "idempotency_key": "scenario:ach-pull-out-of-order:23:cleo-top-up",
-        "provider_payment_id": late["provider_payment_id"],
+        "payment_id": late["payment_id"],
         "event_id": late["event_id"],
         "event_type": "payment.settled",
         "params": {"by": "PT6H"},
@@ -146,22 +166,36 @@ def test_a_run_writes_its_fault_manifest(database_url: str, tmp_path: Path) -> N
         "cause_code": "delayed_delivery",
         "root_cause": late["root_cause"],
     }
+    assert late["payment_id"].startswith("simpay_")
     assert late["event_id"] in late["root_cause"]
     assert "6:00:00" in late["root_cause"]
 
 
-def test_the_same_scenario_and_seed_replay_exactly(database_url: str) -> None:
+def test_the_same_scenario_and_seed_replay_exactly(database_url: str, manifests: Path) -> None:
     scenario = load(SCENARIOS / "ach-pull-random-faults.yaml")
 
-    first = run_in_fresh_database(database_url, scenario)
-    second = run_in_fresh_database(database_url, scenario)
-    other_seed = run_in_fresh_database(database_url, scenario, seed=scenario.seed + 1)
+    first = run_in_fresh_database(database_url, manifests, scenario)
+    second = run_in_fresh_database(database_url, manifests, scenario)
+    # A database that already holds another Scenario's run: different sequences, same names.
+    with fresh_database(database_url) as url:
+        run(load(SCENARIOS / "ach-pull-duplicates.yaml"), url, manifest_path=manifests / "d.json")
+        crowded = run(scenario, url, manifest_path=manifests / "crowded.json")
+    other_seed = run_in_fresh_database(database_url, manifests, scenario, seed=scenario.seed + 1)
 
     assert first.manifest.faults  # the seed drew some Faults
-    assert first.manifest == second.manifest
-    assert first.ticks == second.ticks
-    assert first.summary == second.summary
+    assert first.manifest == second.manifest == crowded.manifest
+    assert first.ticks == second.ticks == crowded.ticks
+    assert first.summary == second.summary == only(scenario.name, crowded.summary)
     assert other_seed.manifest.faults != first.manifest.faults
+
+
+def only(name: str, summary: dict[str, Any]) -> dict[str, Any]:
+    """The part of a Ledger summary belonging to one Scenario's Payments."""
+    prefix = f"scenario:{name}:"
+    return {
+        section: {key: value for key, value in rows.items() if key.startswith(prefix)}
+        for section, rows in summary.items()
+    }
 
 
 ALL_FAULTS = Scenario.model_validate(
@@ -209,16 +243,22 @@ ALL_FAULTS = Scenario.model_validate(
 
 
 def test_replaying_the_inbox_from_scratch_reproduces_the_ledger_exactly(
-    database_url: str, fresh: str
+    database_url: str, fresh: str, manifests: Path
 ) -> None:
     with fresh_database(database_url) as source:
-        original = run(ALL_FAULTS, source)
+        original = run(ALL_FAULTS, source, manifest_path=manifests / "all.json")
         assert {f.kind for f in original.manifest.faults} == {"duplicate", "delay", "out_of_order"}
 
         owner: Engine = create_engine(source)
         target = make_engine(fresh, role=LEDGER_APP_ROLE)
         try:
-            replay_inbox(owner, target, original.ticks)
+            with owner.connect() as connection:
+                job_runs = availability_job_runs(connection)
+                received = set(connection.scalars(select(inbox.c.received_at)))
+            # The availability job ran at moments no Provider Event arrived, so a replay that
+            # only applied the Inbox would miss them: they come from the job's own records.
+            assert job_runs and not set(job_runs) <= received
+            replay_inbox(owner, target)
         finally:
             owner.dispose()
             target.dispose()

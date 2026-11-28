@@ -6,9 +6,9 @@ the same amounts, Accounts, Effective Times, Recorded Times and Actors. What dif
 databases is only their surrogate keys (sequence-generated IDs), so the summary names every
 row by something stable instead:
 
-- Transactions, Settlements, Holds and Hold ends by their Idempotency Key, with the Payment's
-  database ID inside a Payments key (`payment:<id>:…`) swapped for the Payment's own
-  Idempotency Key;
+- Transactions, Settlements, Holds and Hold ends by their Idempotency Key, a Payments step's
+  key (`ledger_key`, which holds the Payment's database ID) renamed `<Payment's Idempotency
+  Key>/<step>`;
 - Payments by Idempotency Key;
 - a Provider Event Actor by the Provider event ID instead of its Inbox row ID.
 
@@ -17,7 +17,6 @@ Ledger rows that touch them or belong to those Payments, for databases shared wi
 work (the property tests). Without it, the whole Ledger is summarised.
 """
 
-import re
 from collections.abc import Collection
 from datetime import datetime
 from typing import Any
@@ -25,9 +24,8 @@ from typing import Any
 from sqlalchemy import Connection, Engine, select
 
 from railbench.ledger.tables import accounts, entries, hold_ends, holds, settlements, transactions
+from railbench.payments.service import parse_ledger_key
 from railbench.payments.tables import inbox, inbox_outcomes, payments, transitions
-
-_PAYMENT_KEY = re.compile(r"^payment:(\d+):")
 
 Summary = dict[str, Any]
 
@@ -193,18 +191,18 @@ class _Summariser:
         """Whether a Ledger row with this Idempotency Key is in scope."""
         if self._scope is None:
             return True
-        match = _PAYMENT_KEY.match(key)
-        return match is not None and int(match.group(1)) in self._payments
+        parsed = parse_ledger_key(key)
+        return parsed is not None and parsed[0] in self._payments
 
     def _key(self, key: str) -> str:
-        """An Idempotency Key with any Payment database ID swapped for the Payment's own key."""
-        match = _PAYMENT_KEY.match(key)
-        if match is None:
+        """A Payments step's Idempotency Key named by the Payment's own Idempotency Key and the
+        step (`<payment key>/<step>`) instead of the Payment's database id; any other key as
+        it is."""
+        parsed = parse_ledger_key(key)
+        payment = None if parsed is None else self._payments.get(parsed[0])
+        if parsed is None or payment is None:
             return key
-        payment = self._payments.get(int(match.group(1)))
-        if payment is None:
-            return key
-        return f"payment:{payment.idempotency_key}:{key[match.end() :]}"
+        return f"{payment.idempotency_key}/{parsed[1]}"
 
     def _transaction_key(self, transaction_id: int) -> str:
         key: str = self._c.execute(

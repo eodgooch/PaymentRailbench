@@ -34,6 +34,7 @@ Each Journal write still has an Idempotency Key derived from the Payment and the
 """
 
 import logging
+import re
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -123,6 +124,26 @@ class PaymentNotYetKnown(PaymentsError):
 def clearing_account(provider: str, rail: str, currency: str) -> str:
     """The Clearing Account for one Provider, Rail and currency (SPEC §3.1)."""
     return f"clearing:{provider}:{rail}:{currency.lower()}"
+
+
+def customer_balance_account(customer_id: str, currency: str) -> str:
+    """The Customer Balance of one Customer in one currency (SPEC §3.1)."""
+    return f"customer:{customer_id}:{currency.lower()}"
+
+
+_LEDGER_KEY = re.compile(r"^payment:(\d+):(.+)$")
+
+
+def ledger_key(payment_id: int, step: str) -> str:
+    """The Idempotency Key of the Ledger row a Payment's step books, e.g. its pending
+    Transaction or its availability Hold."""
+    return f"payment:{payment_id}:{step}"
+
+
+def parse_ledger_key(key: str) -> tuple[int, str] | None:
+    """The Payment id and step in a `ledger_key`, or None for any other key."""
+    match = _LEDGER_KEY.match(key)
+    return None if match is None else (int(match.group(1)), match.group(2))
 
 
 def bank_cash_account(currency: str) -> str:
@@ -336,7 +357,8 @@ class Payments:
             if recorded is not None:
                 return recorded
             payment = connection.execute(select(payments).where(payments.c.id == payment_id)).one()
-            decision = decide(_current(_states(connection, payment_id)), event.reported)
+            reached = _states(connection, payment_id)
+            decision = decide(_current(reached), event.reported, reached)
             outcome, detail = Outcome.APPLIED, ""
             match decision:
                 case Stale():
@@ -382,7 +404,6 @@ class Payments:
         event: ProviderEvent,
     ) -> _Booked:
         actor = ProviderEventActor(inbox_id=str(inbox_id))
-        key = f"payment:{payment.id}"
         clearing = clearing_account(payment.provider, payment.rail, payment.currency)
         customer = payment.customer_account
 
@@ -396,7 +417,7 @@ class Payments:
             case AchState.SUBMITTED:
                 pending = journal.post(
                     NewTransaction(
-                        idempotency_key=f"{key}:pending",
+                        idempotency_key=ledger_key(payment.id, "pending"),
                         actor=actor,
                         effective_at=event.occurred_at,
                         description=f"ACH pull {payment.provider_payment_id} submitted",
@@ -411,14 +432,14 @@ class Payments:
                 journal.settle(
                     pending_id,
                     SettlementRequest(
-                        idempotency_key=f"{key}:settlement",
+                        idempotency_key=ledger_key(payment.id, "settlement"),
                         actor=actor,
                         effective_at=event.occurred_at,
                     ),
                 )
                 sweep = journal.post(
                     NewTransaction(
-                        idempotency_key=f"{key}:bank-cash",
+                        idempotency_key=ledger_key(payment.id, "bank-cash"),
                         actor=actor,
                         effective_at=event.occurred_at,
                         description=f"ACH pull {payment.provider_payment_id} settled to Bank Cash",
@@ -428,7 +449,7 @@ class Payments:
                 until = available_at(event.occurred_at)
                 hold = journal.place_hold(
                     NewHold(
-                        idempotency_key=f"{key}:availability-hold",
+                        idempotency_key=ledger_key(payment.id, "availability-hold"),
                         actor=actor,
                         effective_at=event.occurred_at,
                         account=customer,
@@ -445,7 +466,7 @@ class Payments:
                 reversal = journal.reverse(
                     pending_id,
                     ReversalRequest(
-                        idempotency_key=f"{key}:{state}",
+                        idempotency_key=ledger_key(payment.id, state),
                         actor=actor,
                         effective_at=event.occurred_at,
                         description=f"ACH pull {payment.provider_payment_id} {state}",
@@ -496,7 +517,7 @@ class Payments:
             self._journal.within(connection).release_hold(
                 hold_id,
                 ReleaseRequest(
-                    idempotency_key=f"payment:{payment_id}:available",
+                    idempotency_key=ledger_key(payment_id, "available"),
                     actor=AVAILABILITY_JOB,
                     effective_at=due,
                 ),

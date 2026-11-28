@@ -157,7 +157,7 @@ class PaymentPlan(BaseModel):
 
 
 class InjectedFault(BaseModel):
-    """One line of the fault manifest: a Fault the Simulator injected and its true root
+    """One line of the Fault Manifest: a Fault the Simulator injected and its true root
     cause. Only Scenario tooling and the triage evaluation read these; the Ledger never does
     (its database role can't reach the `simulator` schema)."""
 

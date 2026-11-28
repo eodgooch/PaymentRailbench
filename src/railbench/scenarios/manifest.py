@@ -1,15 +1,13 @@
-"""The fault manifest (SPEC §6, §7.4, ADR 0011): every Fault a run injected, with its true
+"""The Fault Manifest (SPEC §6, §7.4, ADR 0011): every Fault a run injected, with its true
 root cause, for the triage evaluation to score against.
 
 The Simulator records each Fault as it injects it (`simulator.faults`); this module adds the
-Scenario's names for the Payments and writes the manifest as JSON. The Ledger never reads
+Scenario's names for the Payments and writes it as JSON. The Ledger never reads
 it: the `ledger` and `payments` packages don't import this package (an import-boundary test
 proves it) and the Ledger's database role can't read the `simulator` schema.
 """
 
-from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -19,20 +17,10 @@ from railbench.simulator.model import InjectedFault, PaymentPlan
 DEFAULT_DIRECTORY = Path("reports") / "manifests"
 
 
-class ManifestEntry(BaseModel):
-    model_config = ConfigDict(frozen=True)
+class ManifestEntry(InjectedFault):
+    """A Fault the Simulator injected, with the Scenario's name for its Payment."""
 
-    fault_id: str
-    kind: str
-    payment: str  # the Scenario's id for the Payment
-    idempotency_key: str
-    provider_payment_id: str
-    event_id: str
-    event_type: str
-    params: dict[str, Any]
-    injected_at: datetime
-    cause_code: str
-    root_cause: str
+    payment: str
 
 
 class Manifest(BaseModel):
@@ -61,19 +49,7 @@ def manifest_for(
         scenario=scenario.name,
         seed=seed,
         faults=tuple(
-            ManifestEntry(
-                fault_id=fault.fault_id,
-                kind=fault.kind,
-                payment=names[fault.idempotency_key],
-                idempotency_key=fault.idempotency_key,
-                provider_payment_id=fault.payment_id,
-                event_id=fault.event_id,
-                event_type=fault.event_type,
-                params=fault.params,
-                injected_at=fault.injected_at,
-                cause_code=fault.cause_code,
-                root_cause=fault.root_cause,
-            )
+            ManifestEntry(**fault.model_dump(), payment=names[fault.idempotency_key])
             for fault in injected
             if fault.idempotency_key in names
         ),

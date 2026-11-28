@@ -17,7 +17,8 @@ After every step:
   delivery is the one the state machine's rules give (written out here as a table);
 - each Customer Balance's Posted, Pending and Available match the Payment's furthest state.
 
-At the end of each example, replaying its Inbox into an empty Ledger reproduces it exactly.
+At the end of each example (not after every step, to keep the run short), replaying its
+Inbox from the database alone into an empty Ledger reproduces it exactly.
 """
 
 import json
@@ -48,7 +49,7 @@ from railbench.ledger.model import AccountType, NewAccount
 from railbench.ledger.tables import entries, hold_ends, holds, settlements
 from railbench.payments.model import NewPayment
 from railbench.payments.provider import SimulatorProvider
-from railbench.payments.service import Payments, clearing_account
+from railbench.payments.service import Payments, clearing_account, customer_balance_account
 from railbench.scenarios.replay import replay_inbox
 from railbench.scenarios.runner import fresh_database
 from railbench.scenarios.summary import Summary, ledger_summary
@@ -64,23 +65,31 @@ RANK = {"created": 0, "submitted": 1, "settled": 2, "available": 3, "declined": 
 LEDGER_TABLES = (entries, settlements, holds, hold_ends)
 
 
-def expected_outcome(furthest: str, reported: str) -> str:
-    """What delivering `reported` to a Payment at `furthest` does, from SPEC §4.1-4.2: forward
-    moves apply, a state already passed is stale, anything else is an exception."""
-    if reported == "submitted":
-        return "applied" if furthest == "created" else "stale"
-    if furthest in ("declined", "canceled"):
-        return "stale" if reported == furthest else "exception"
-    if reported == "settled":
-        return "applied" if furthest in ("created", "submitted") else "stale"
-    # declined or canceled
-    return "applied" if furthest in ("created", "submitted") else "exception"
+MAIN_LINE = ("created", "submitted", "settled", "available")
+ENDS_BEFORE_SETTLEMENT = ("declined", "canceled")
 
 
-def furthest_after(furthest: str, reported: str) -> str:
-    if expected_outcome(furthest, reported) != "applied":
-        return furthest
-    return reported
+def expected_outcome(reached: list[str], reported: str) -> str:
+    """What delivering `reported` does to a Payment that has been in the states `reached`,
+    from SPEC §4.1-4.2's wording: an event for a state already passed (one the Payment has
+    been in) is stale; a move forward along `created → submitted → settled`, or to
+    canceled or declined before settlement, applies; anything else is impossible."""
+    if reported in reached:
+        return "stale"
+    current = reached[-1]
+    if current in ENDS_BEFORE_SETTLEMENT:
+        return "exception"  # nothing follows a cancellation or decline
+    if reported in ENDS_BEFORE_SETTLEMENT:
+        return "applied" if current in ("created", "submitted") else "exception"
+    return "applied" if MAIN_LINE.index(reported) > MAIN_LINE.index(current) else "exception"
+
+
+def reached_after(reached: list[str], reported: str) -> list[str]:
+    """The states the Payment has been in after `reported` applied. A settlement heard
+    before the submission passes through submitted on the way (#4 books each step)."""
+    if reported == "settled" and "submitted" not in reached:
+        return [*reached, "submitted", "settled"]
+    return [*reached, reported]
 
 
 @dataclass
@@ -98,8 +107,12 @@ class Pull:
     customer: str
     amount: int
     events: list[Event]
-    furthest: str = "created"
+    reached: list[str] = field(default_factory=lambda: ["created"])
     seen_states: list[str] = field(default_factory=list)
+
+    @property
+    def furthest(self) -> str:
+        return self.reached[-1]
 
 
 class AchPullMachine(RuleBasedStateMachine):
@@ -131,7 +144,6 @@ class AchPullMachine(RuleBasedStateMachine):
         self.journal = Journal(self.source, self.clock)
         self.payments = Payments(self.source, self.clock, self.journal, provider)
         self.pulls: list[Pull] = []
-        self.ticks: list[datetime] = []
 
     def _pass_time(self, seconds: int = 1) -> None:
         self.clock.advance(timedelta(seconds=seconds))
@@ -148,7 +160,7 @@ class AchPullMachine(RuleBasedStateMachine):
     ) -> None:
         self._pass_time()
         n = len(self.pulls)
-        customer = f"customer:prop-{self.run}-{n}:usd"
+        customer = customer_balance_account(f"prop-{self.run}-{n}", "USD")
         self.journal.open_account(
             NewAccount(code=customer, type=AccountType.LIABILITY, currency="USD")
         )
@@ -184,7 +196,7 @@ class AchPullMachine(RuleBasedStateMachine):
         event = data.draw(st.sampled_from(pull.events))
         self.clock.set(max(self.clock.now(), event.occurred_at) + timedelta(seconds=wait))
         before = self._ledger_rows()
-        expected = expected_outcome(pull.furthest, event.type) if not event.delivered else None
+        expected = expected_outcome(pull.reached, event.type) if not event.delivered else None
 
         body = json.dumps(
             {
@@ -201,8 +213,9 @@ class AchPullMachine(RuleBasedStateMachine):
         self.seen["duplicate" if receipt.duplicate else receipt.outcome] += 1
         assert receipt.duplicate == event.delivered
         if expected is not None:
-            assert receipt.outcome == expected, (pull.furthest, event.type, receipt.detail)
-            pull.furthest = furthest_after(pull.furthest, event.type)
+            assert receipt.outcome == expected, (pull.reached, event.type, receipt.detail)
+            if expected == "applied":
+                pull.reached = reached_after(pull.reached, event.type)
         if receipt.duplicate or receipt.outcome != "applied":
             assert self._ledger_rows() == before  # nothing written
         event.delivered = True
@@ -212,12 +225,11 @@ class AchPullMachine(RuleBasedStateMachine):
     def run_the_availability_job(self, hours: int) -> None:
         self._pass_time(hours * 3600)
         self.payments.make_available()
-        self.ticks.append(self.clock.now())
         for pull in self.pulls:
             payment = self.payments.payment(pull.ledger_id)
             due = payment.available_at
             if pull.furthest == "settled" and due is not None and due <= self.clock.now():
-                pull.furthest = "available"
+                pull.reached = [*pull.reached, "available"]
                 self.seen["available"] += 1
 
     def _ledger_rows(self) -> tuple[int, ...]:
@@ -286,7 +298,7 @@ class AchPullMachine(RuleBasedStateMachine):
         if not self.pulls:
             return
         accounts = {p.customer for p in self.pulls}
-        replay_inbox(self.owner, self.target, self.ticks, accounts)
+        replay_inbox(self.owner, self.target, accounts)
         assert ledger_summary(self.replay_owner, accounts) == self._summary()
 
 

@@ -7,8 +7,9 @@ the concrete `PaymentPlan`s the Simulator follows. All randomness (which events 
 Faults, and their parameters) is drawn here from one `random.Random(seed)` in a fixed order,
 so the same file and seed give the same plans, and the Simulator makes no random choices.
 
-Fault kinds are a discriminated union on `kind`, shared with the Simulator; Returns, Cutoff
-and Settlement Report Faults join as new kinds (#7, #8) without changing this schema.
+Fault kinds are a discriminated union on `kind`, shared with the Simulator. A new kind
+(Returns, Cutoff and Settlement Report Faults, #7 and #8) is one more variant in that union
+plus the Simulator's case for injecting it; the rest of the Scenario file stays as it is.
 """
 
 import random
@@ -20,6 +21,7 @@ from typing import Annotated, Literal, Self
 import yaml
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
+from railbench.payments.service import customer_balance_account
 from railbench.simulator.model import (
     DelayedDelivery,
     DuplicateDelivery,
@@ -40,13 +42,13 @@ class _Strict(BaseModel):
 
 
 class Customer(_Strict):
-    """A fictional Mintwharf Customer. Their USD Customer Balance is `customer:<id>:usd`."""
+    """A fictional Mintwharf Customer, with a Customer Balance per currency they use."""
 
     id: Slug
     name: Annotated[str, Field(min_length=1, max_length=100)]
 
     def account(self, currency: str) -> str:
-        return f"customer:{self.id}:{currency.lower()}"
+        return customer_balance_account(self.id, currency)
 
 
 class ScenarioPayment(_Strict):

@@ -2,7 +2,7 @@
 
 The run gets a throwaway database on the Postgres at DATABASE_URL (`make dev` starts one),
 migrated, used and dropped, with the Ledger and the Simulator in-process on one ManualClock.
-It writes the fault manifest (default reports/manifests/<scenario>-<seed>.json) and prints
+It writes the Fault Manifest (default reports/manifests/<scenario>-<seed>.json) and prints
 each Payment's states and Inbox outcomes.
 """
 
@@ -30,15 +30,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     scenario = load(args.scenario)
     with fresh_database(args.database_url or Settings().database_url) as url:
-        result = run(scenario, url, args.seed)
-    written = result.manifest.write(args.manifest)
+        result = run(scenario, url, args.seed, args.manifest)
 
     print(f"Scenario {scenario.name}, seed {result.seed}: {len(result.ticks)} ticks")
     for key, payment in result.summary["payments"].items():
         steps = " → ".join(step["state"] for step in payment["transitions"])
         seen = ", ".join(outcome["outcome"] for outcome in payment["inbox_outcomes"])
         print(f"  {key}: {steps} (Inbox: {seen})")
-    print(f"{len(result.manifest.faults)} Faults injected; manifest: {written}")
+    print(f"{len(result.manifest.faults)} Faults injected; manifest: {result.manifest_path}")
     return 0
 
 

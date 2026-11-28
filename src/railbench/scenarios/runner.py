@@ -12,13 +12,18 @@ of Mintwharf's buyers and of time:
 4. move the Clock straight to the next moment anything is due (a Payment to originate, a
    Payment to settle or end, a webhook to deliver, ACH funds due to become Available),
    tick the Simulator and then the Ledger's availability job, and repeat until nothing is
-   left to do.
+   left to do;
+5. write the Fault Manifest.
 
 No randomness is drawn here and no wall clock is read, so a Scenario and seed give the same
-Ledger, event IDs, delivery order and fault manifest every run. The database must be
-migrated and hold no other Scenario's Accounts (`fresh_database()` makes one).
+Ledger, Payment and event IDs, delivery order and Fault Manifest every run. The one
+dependency on wall time left is the webhook timeout (DELIVERY_TIMEOUT): a delivery that
+fails or times out fails the run (DeliveryFailed) rather than being retried off the seed's
+course. The database must be migrated and hold no other Scenario's Accounts
+(`fresh_database()` makes one).
 """
 
+import secrets
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -48,7 +53,7 @@ from railbench.simulator.provider import Simulator
 ALEMBIC_INI = Path(__file__).parents[3] / "alembic.ini"
 # A run that hasn't gone quiet after this many ticks is stuck (a bug, not a long Scenario).
 MAX_TICKS = 10_000
-SIGNING_SECRET = "scenario-run-secret"  # in-process only: both ends are this process
+DELIVERY_TIMEOUT = 60.0  # seconds of wall time: generous, since a timeout fails the run
 
 
 class RunDidNotSettle(RuntimeError):
@@ -60,17 +65,23 @@ class Run:
     scenario: Scenario
     seed: int
     manifest: Manifest
-    # Every moment the Ledger's availability job ran, in order: with the Inbox, what a
-    # replay needs to reproduce the Ledger's Recorded Times.
+    manifest_path: Path
+    # Every moment the runner ticked both services, in order (part of what must repeat).
     ticks: list[datetime]
     # Scenario Payment id → the Ledger's Payment id.
     payments: dict[str, int]
     summary: Summary = field(repr=False)
 
 
-def run(scenario: Scenario, database_url: str, seed: int | None = None) -> Run:
+def run(
+    scenario: Scenario,
+    database_url: str,
+    seed: int | None = None,
+    manifest_path: Path | None = None,
+) -> Run:
     """Run `scenario` with `seed` (default: the Scenario's own) against the migrated, empty
-    database at `database_url`."""
+    database at `database_url`, and write its Fault Manifest to `manifest_path` (default
+    reports/manifests/<scenario>-<seed>.json)."""
     seed = scenario.seed if seed is None else seed
     plans = scenario.plans(seed)
     clock = ManualClock(scenario.start)
@@ -81,10 +92,26 @@ def run(scenario: Scenario, database_url: str, seed: int | None = None) -> Run:
     settings = Settings(
         simulator_url=f"http://127.0.0.1:{simulator_port}",
         ledger_webhook_url=f"{ledger_url}/providers/simulator/events",
-        webhook_signing_secret=SIGNING_SECRET,
+        # Both ends are this process, so each run signs with a throwaway secret of its own.
+        webhook_signing_secret=secrets.token_hex(16),
     )
     ledger_app = create_ledger_app(app_engine, clock, settings)
-    simulator_app = create_simulator_app(owner, clock, settings)
+    delivery_http = httpx.Client(timeout=DELIVERY_TIMEOUT)
+    simulator_app = create_simulator_app(
+        owner,
+        clock,
+        settings,
+        # Every webhook must land first time: a retry would move the run off its seed, so
+        # a failed or timed-out delivery fails the run instead of quietly diverging.
+        Simulator(
+            owner,
+            clock,
+            webhook_url=settings.ledger_webhook_url,
+            signing_secret=settings.webhook_signing_secret.get_secret_value(),
+            http=delivery_http,
+            fail_on_delivery_error=True,
+        ),
+    )
     journal: Journal = ledger_app.state.journal
     payments: Payments = ledger_app.state.payments
     simulator: Simulator = simulator_app.state.simulator
@@ -149,15 +176,18 @@ def run(scenario: Scenario, database_url: str, seed: int | None = None) -> Run:
                 if not due:
                     break
                 clock.set(max(min(due), now))
+        manifest = manifest_for(scenario, seed, plans, simulator.faults())
         return Run(
             scenario=scenario,
             seed=seed,
-            manifest=manifest_for(scenario, seed, plans, simulator.faults()),
+            manifest=manifest,
+            manifest_path=manifest.write(manifest_path),
             ticks=ticks,
             payments=originated,
             summary=ledger_summary(owner),
         )
     finally:
+        delivery_http.close()
         app_engine.dispose()
         owner.dispose()
 

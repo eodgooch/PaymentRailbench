@@ -19,9 +19,10 @@ or is declined or canceled at the time it would have settled) and which delivery
 inject. The Faults act on the outbox when the event is emitted: a duplicate adds more
 delivery rows with the same event ID and body; a delay pushes the first attempt out; an
 out-of-order Fault holds the event until a later event of the same Payment has been
-delivered. Each injected Fault is written to the fault manifest (`faults()`) with its true
-root cause. Event IDs are derived from the Payment's Idempotency Key and the event type, so
-a Scenario run names its events the same way every time. Returns join in #7.
+delivered. Each injected Fault is written to the Fault Manifest (`faults()`) with its true
+root cause. Payment IDs are derived from the Payment's Idempotency Key, and event IDs from
+that key and the event type, so a Scenario run names its Payments and events the same way
+every time, whatever else the database holds. Returns join in #7.
 """
 
 import hashlib
@@ -72,6 +73,11 @@ class IdempotencyConflict(Exception):
     """The Idempotency Key was already used with a different payload."""
 
 
+class DeliveryFailed(RuntimeError):
+    """A webhook delivery failed while the Simulator was told every delivery must succeed
+    (a Scenario run, where a retry would make the run diverge from its seed)."""
+
+
 class PlanConflict(Exception):
     """A different plan was already made for this Idempotency Key."""
 
@@ -92,6 +98,13 @@ def ach_settles_at(submitted_at: datetime) -> datetime:
     if not is_banking_day(day) or at_new_york(day, ACH_CUTOFF) <= submitted_at:
         day = next_banking_day(day)
     return at_new_york(next_banking_day(day), ACH_SETTLEMENT_TIME)
+
+
+def payment_id_for(idempotency_key: str) -> str:
+    """The Simulator's ID for the Payment created under `idempotency_key`, derived from the
+    key rather than a database sequence, so a Scenario run names its Payments the same way
+    whatever else the database holds."""
+    return f"simpay_{hashlib.sha256(f'payment\x00{idempotency_key}'.encode()).hexdigest()[:24]}"
 
 
 def event_id_for(idempotency_key: str, type_: EventType) -> str:
@@ -118,8 +131,10 @@ class Simulator:
         webhook_url: str,
         signing_secret: str,
         http: httpx.Client | None = None,
+        fail_on_delivery_error: bool = False,
     ) -> None:
         self._engine = engine
+        self._fail_on_delivery_error = fail_on_delivery_error
         self._clock = clock
         self._webhook_url = webhook_url
         self._secret = signing_secret
@@ -137,6 +152,7 @@ class Simulator:
             payment_id = connection.scalar(
                 pg_insert(payments)
                 .values(
+                    public_id=payment_id_for(request.idempotency_key),
                     idempotency_key=request.idempotency_key,
                     payload_fingerprint=fingerprint,
                     rail=request.rail,
@@ -187,10 +203,10 @@ class Simulator:
             raise PlanConflict(f"{plan.idempotency_key!r} already has a different plan")
 
     def faults(self) -> list[InjectedFault]:
-        """The fault manifest: every Fault injected so far, in the order it was injected."""
+        """The Fault Manifest: every Fault injected so far, in the order it was injected."""
         with self._engine.connect() as connection:
             rows = connection.execute(
-                select(faults, payments.c.idempotency_key)
+                select(faults, payments.c.idempotency_key, payments.c.public_id)
                 .join(payments, payments.c.id == faults.c.payment_id)
                 .order_by(faults.c.id)
             ).all()
@@ -198,7 +214,7 @@ class Simulator:
             InjectedFault(
                 fault_id=row.fault_id,
                 kind=row.kind,
-                payment_id=_public_id(row.payment_id),
+                payment_id=row.public_id,
                 idempotency_key=row.idempotency_key,
                 event_id=row.event_id,
                 event_type=row.event_type,
@@ -229,7 +245,7 @@ class Simulator:
     def payment(self, public_id: str) -> SimulatedPayment:
         with self._engine.connect() as connection:
             row = connection.execute(
-                select(payments).where(payments.c.id == _internal_id(public_id))
+                select(payments).where(payments.c.public_id == public_id)
             ).one_or_none()
         if row is None:
             raise PaymentNotFound(public_id)
@@ -240,7 +256,8 @@ class Simulator:
         with self._engine.connect() as connection:
             rows = connection.execute(
                 select(events)
-                .where(events.c.payment_id == _internal_id(public_id))
+                .join(payments, payments.c.id == events.c.payment_id)
+                .where(payments.c.public_id == public_id)
                 .order_by(events.c.id)
             ).all()
         return [
@@ -394,6 +411,8 @@ class Simulator:
         for event_id, body, attempts in claimed:
             error = self._post(body.encode())
             self._record_attempt(event_id, attempts + 1, error)
+            if error is not None and self._fail_on_delivery_error:
+                raise DeliveryFailed(f"delivering outbox row {event_id}: {error}")
 
     def _record_attempt(self, event_id: int, attempts: int, error: str | None) -> None:
         now = self._clock.now()
@@ -441,13 +460,9 @@ def _deliverable() -> Any:
     )
 
 
-def _public_id(internal: int) -> str:
-    return f"simpay_{internal}"
-
-
 def _payment(row: Row[Any]) -> SimulatedPayment:
     return SimulatedPayment(
-        id=_public_id(row.id),
+        id=row.public_id,
         idempotency_key=row.idempotency_key,
         rail=row.rail,
         direction=row.direction,
@@ -460,13 +475,6 @@ def _payment(row: Row[Any]) -> SimulatedPayment:
         settled_at=row.settled_at,
         ended_at=row.ended_at,
     )
-
-
-def _internal_id(public_id: str) -> int:
-    prefix, _, number = public_id.partition("_")
-    if prefix != "simpay" or not number.isdigit():
-        raise PaymentNotFound(public_id)
-    return int(number)
 
 
 def _iso(value: object) -> str:

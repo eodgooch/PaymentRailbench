@@ -17,6 +17,7 @@ payments = Table(
     "payments",
     metadata,
     Column("id", BigInteger, primary_key=True),
+    Column("public_id", Text, nullable=False, unique=True),
     Column("idempotency_key", Text, nullable=False, unique=True),
     Column("payload_fingerprint", Text, nullable=False),
     Column("rail", Text, nullable=False),

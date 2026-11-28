@@ -40,11 +40,6 @@ def test_the_payment_moves_forward(
         (AV, SUB),
         (DEC, DEC),
         (CAN, CAN),
-        # A decline or cancellation delivered before the `submitted` it followed: the
-        # Payment has passed created and submitted on its way to the end (an out-of-order
-        # delivery, not a contradiction).
-        (DEC, SUB),
-        (CAN, SUB),
         (DEC, C),
     ],
 )
@@ -54,12 +49,28 @@ def test_an_event_for_a_state_already_passed_is_stale(
     assert decide(current, reported) == Stale()
 
 
+@pytest.mark.parametrize("ending", [DEC, CAN])
+def test_a_submitted_for_a_payment_submitted_before_it_ended_is_stale(ending: AchState) -> None:
+    assert decide(ending, SUB, reached=[C, SUB, ending]) == Stale()
+
+
+@pytest.mark.parametrize("ending", [DEC, CAN])
+def test_a_submitted_for_a_payment_that_ended_without_being_submitted_is_impossible(
+    ending: AchState,
+) -> None:
+    """It went created → canceled|declined, so a `submitted` now may mean the Provider
+    really sent the debit after all: an exception, not something to shrug off."""
+    assert isinstance(decide(ending, SUB, reached=[C, ending]), Impossible)
+
+
 @pytest.mark.parametrize(
     ("current", "reported"),
     [
         (SET, DEC),  # declined after the money settled
         (AV, CAN),
         (DEC, SET),  # settled after a decline
+        (CAN, SUB),
+        (DEC, SUB),
         (DEC, CAN),
         (C, AV),  # only the Ledger decides Available, and only after settlement
         (SUB, AV),

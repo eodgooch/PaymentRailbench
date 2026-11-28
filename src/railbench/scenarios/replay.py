@@ -1,21 +1,24 @@
 """Replay a Ledger's Inbox from scratch into an empty database (SPEC §4.2, ADR 0011).
 
 The Ledger's inputs are its own decisions (open an Account, originate a Payment), the
-Provider Events in its Inbox, and its Clock (when the availability job ran). Replaying feeds
-the same inputs, in the same order, at the same Clock times, into a freshly migrated
-database: Accounts and Payments as recorded (a stand-in Provider answers each origination
-with the Provider's ID it gave the first time), every Inbox body applied through
-`Payments.replay` at the time it was first received, and the availability job run at every
-original tick. Because the Ledger reads time only from its Clock, Recorded Times come out
-the same too, and `ledger_summary` of the two databases must be equal.
+Provider Events in its Inbox, and its Clock (when the availability job ran). All three are
+read back from the source database itself, nothing from the process that wrote it, and fed
+in the same order, at the same Clock times, into a freshly migrated database: Accounts and
+Payments as recorded (a stand-in Provider answers each origination with the Provider's ID
+it gave the first time), every Inbox body applied through `Payments.replay` at the time it
+was first received, and the availability job run at each moment it recorded doing
+something. Because the Ledger reads time only from its Clock, Recorded Times come out the
+same too, and `ledger_summary` of the two databases must be equal.
 """
 
 from collections.abc import Collection, Mapping
 from contextlib import suppress
+from dataclasses import dataclass, field
 from datetime import datetime
+from enum import IntEnum
 from typing import Any
 
-from sqlalchemy import Engine, select
+from sqlalchemy import Connection, Engine, select
 
 from railbench.common.clock import ManualClock
 from railbench.ledger.journal import Journal
@@ -28,13 +31,9 @@ from railbench.payments.provider import (
     ProviderPayment,
     SimulatorProvider,
 )
-from railbench.payments.service import PaymentNotYetKnown, Payments
+from railbench.payments.service import AVAILABILITY_JOB, PaymentNotYetKnown, Payments
 from railbench.payments.state_machine import AchState
-from railbench.payments.tables import inbox, payments
-
-# At one moment: Accounts first, then originations, then Provider Events, then the job,
-# which is the order a run does them in.
-ACCOUNT, ORIGINATION, EVENT, TICK = range(4)
+from railbench.payments.tables import inbox, payments, transitions
 
 
 class RecordedProvider:
@@ -62,22 +61,59 @@ class RecordedProvider:
         return self._reader.read_event(body)
 
 
+def availability_job_runs(
+    connection: Connection, payment_ids: Collection[int] | None = None
+) -> list[datetime]:
+    """When the Ledger's availability job did something, read from what it recorded: each
+    `available` state change it appended, at its Recorded Time (the job's Clock reading).
+    A run that released nothing wrote nothing, and replaying it would release nothing, so
+    these are all the runs a replay needs."""
+    query = select(transitions.c.recorded_at).where(
+        transitions.c.job_name == AVAILABILITY_JOB.name, transitions.c.state == AchState.AVAILABLE
+    )
+    if payment_ids is not None:
+        query = query.where(transitions.c.payment_id.in_(payment_ids))
+    return sorted(set(connection.scalars(query)))
+
+
+class StepKind(IntEnum):
+    """What the Ledger did, in the order it does them at one moment of a run."""
+
+    OPEN_ACCOUNT = 0
+    ORIGINATE = 1
+    RECEIVE_EVENT = 2
+    RUN_AVAILABILITY_JOB = 3
+
+
+@dataclass(frozen=True)
+class Step:
+    at: datetime
+    kind: StepKind
+    order: int  # the source row's id, to keep the original order within a moment
+    row: Any = field(default=None, compare=False)
+
+    @property
+    def sort_key(self) -> tuple[datetime, int, int]:
+        return (self.at, self.kind, self.order)
+
+
 def replay_inbox(
-    source: Engine,
-    target: Engine,
-    ticks: Collection[datetime],
-    accounts_in_scope: Collection[str] | None = None,
+    source: Engine, target: Engine, accounts_in_scope: Collection[str] | None = None
 ) -> None:
     """Rebuild the Ledger in `source` (read as its owner) into the empty `target` (written
-    as the Ledger's app role). `accounts_in_scope` limits the replay to the Payments funding
-    those Customer Balances, for a source shared with other work."""
+    as the Ledger's app role), from the source database alone. `accounts_in_scope` limits the
+    replay to the Payments funding those Customer Balances, for a source shared with other
+    work."""
     with source.connect() as connection:
         account_rows = connection.execute(select(accounts).order_by(accounts.c.id)).all()
         payment_rows = connection.execute(select(payments).order_by(payments.c.id)).all()
         inbox_rows = connection.execute(select(inbox).order_by(inbox.c.id)).all()
-    if accounts_in_scope is not None:
-        account_rows = [a for a in account_rows if a.code in accounts_in_scope]
-        payment_rows = [p for p in payment_rows if p.customer_account in accounts_in_scope]
+        if accounts_in_scope is not None:
+            account_rows = [a for a in account_rows if a.code in accounts_in_scope]
+            payment_rows = [p for p in payment_rows if p.customer_account in accounts_in_scope]
+        job_runs = availability_job_runs(
+            connection, None if accounts_in_scope is None else [p.id for p in payment_rows]
+        )
     providers = {p.provider for p in payment_rows}
     if len(providers) > 1:
         raise NotImplementedError(f"replaying more than one Provider: {sorted(providers)}")
@@ -93,38 +129,42 @@ def replay_inbox(
         and provider.read_event(row.body).provider_payment_id in ours
     ]
 
-    timeline: list[tuple[datetime, int, int, Any]] = [
-        *((a.recorded_at, ACCOUNT, a.id, a) for a in account_rows),
-        *((p.recorded_at, ORIGINATION, p.id, p) for p in payment_rows),
-        *((e.received_at, EVENT, e.id, e) for e in inbox_rows),
-        *((moment, TICK, n, None) for n, moment in enumerate(ticks)),
-    ]
-    timeline.sort(key=lambda item: item[:3])
-    if not timeline:
+    steps = sorted(
+        [
+            *(Step(a.recorded_at, StepKind.OPEN_ACCOUNT, a.id, a) for a in account_rows),
+            *(Step(p.recorded_at, StepKind.ORIGINATE, p.id, p) for p in payment_rows),
+            *(Step(e.received_at, StepKind.RECEIVE_EVENT, e.id, e) for e in inbox_rows),
+            *(Step(at, StepKind.RUN_AVAILABILITY_JOB, n) for n, at in enumerate(job_runs)),
+        ],
+        key=lambda step: step.sort_key,
+    )
+    if not steps:
         return
-    clock = ManualClock(timeline[0][0])
+    clock = ManualClock(steps[0].at)
     journal = Journal(target, clock)
     service = Payments(target, clock, journal, provider)
-    for moment, kind, _, row in timeline:
-        clock.set(moment)
-        if kind == ACCOUNT:
-            journal.open_account(
-                NewAccount(code=row.code, type=AccountType(row.type), currency=row.currency)
-            )
-        elif kind == ORIGINATION:
-            service.originate(
-                NewPayment(
-                    idempotency_key=row.idempotency_key,
-                    rail=row.rail,
-                    direction=row.direction,
-                    customer_account=row.customer_account,
-                    amount=row.amount,
-                    currency=row.currency,
-                    description=row.description,
+    for step in steps:
+        clock.set(step.at)
+        row = step.row
+        match step.kind:
+            case StepKind.OPEN_ACCOUNT:
+                journal.open_account(
+                    NewAccount(code=row.code, type=AccountType(row.type), currency=row.currency)
                 )
-            )
-        elif kind == EVENT:
-            with suppress(PaymentNotYetKnown):  # kept with no outcome, as the first time
-                service.replay(provider.name, bytes(row.body), row.headers)
-        else:
-            service.make_available()
+            case StepKind.ORIGINATE:
+                service.originate(
+                    NewPayment(
+                        idempotency_key=row.idempotency_key,
+                        rail=row.rail,
+                        direction=row.direction,
+                        customer_account=row.customer_account,
+                        amount=row.amount,
+                        currency=row.currency,
+                        description=row.description,
+                    )
+                )
+            case StepKind.RECEIVE_EVENT:
+                with suppress(PaymentNotYetKnown):  # kept with no outcome, as the first time
+                    service.replay(provider.name, bytes(row.body), row.headers)
+            case StepKind.RUN_AVAILABILITY_JOB:
+                service.make_available()
