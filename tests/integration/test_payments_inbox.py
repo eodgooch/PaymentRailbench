@@ -8,7 +8,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from threading import Barrier
-from typing import Any
+from typing import Any, NoReturn
 from uuid import uuid4
 
 import httpx
@@ -20,8 +20,9 @@ from railbench.common.clock import ManualClock
 from railbench.common.settings import Settings
 from railbench.common.signing import SIGNATURE_HEADER, sign
 from railbench.ledger.app import create_app
-from railbench.ledger.journal import Journal
+from railbench.ledger.journal import Journal, Rejected
 from railbench.ledger.model import AccountType, NewAccount
+from railbench.ledger.tables import transactions
 from railbench.payments.provider import SimulatorProvider
 from railbench.payments.service import Payments, clearing_account
 from railbench.payments.tables import inbox
@@ -58,7 +59,7 @@ def client(app_engine: Engine, clock: ManualClock) -> TestClient:
             base_url="http://simulator.invalid", transport=httpx.MockTransport(fake_simulator)
         ),
     )
-    return TestClient(create_app(app_engine, clock, Settings(), providers={"simulator": provider}))
+    return TestClient(create_app(app_engine, clock, Settings(), provider=provider))
 
 
 def payments(client: TestClient) -> Payments:
@@ -369,3 +370,35 @@ def test_a_pull_needs_a_customer_balance_and_a_whole_positive_amount(
     )
 
     assert response.status_code == 422
+
+
+def test_a_refused_step_rolls_back_every_ledger_write_of_the_event(
+    client: TestClient,
+    clock: ManualClock,
+    payment: dict[str, Any],
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse(*_args: object, **_kwargs: object) -> NoReturn:
+        raise Rejected("injected refusal")
+
+    # A settled event for a Payment still created books two steps: the pending
+    # Transaction (which succeeds), then its Settlement (refused here).
+    monkeypatch.setattr(Journal, "settle", refuse)
+    clock.set(SETTLED_AT)
+
+    response = deliver(client, clock, payment, "payment.settled", SETTLED_AT)
+
+    assert response.json()["outcome"] == "exception"
+    assert "injected refusal" in response.json()["detail"]
+    with engine.connect() as connection:
+        booked = connection.execute(
+            select(func.count())
+            .select_from(transactions)
+            .where(transactions.c.idempotency_key.startswith(f"payment:{payment['id']}:"))
+        ).scalar_one()
+    assert booked == 0
+    assert customer_balances(client, payment) == (0, 0, 0)
+    found = payments(client).payment(payment["id"])
+    assert (found.state, [t.state for t in found.transitions]) == ("created", ["created"])
+    assert [e.inbox_id for e in found.exceptions] == [response.json()["inbox_id"]]

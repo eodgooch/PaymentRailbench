@@ -26,13 +26,13 @@ Inbox ID as Actor:
   start of the second Banking Day after the settlement's Banking Day. The Provider never
   says when funds are Available; the Ledger decides from the calendar.
 
-Every Journal write has an Idempotency Key derived from the Payment and the step, so if
-applying fails half way the redelivered event replays the writes already made instead of
-duplicating them. The state change is appended last, in the same commit as the outcome.
+Applying one event is one database transaction: the Journal runs as a unit of work on the
+same connection (`Journal.within`), so the Ledger writes, the state changes and the outcome
+commit together or not at all. If the Ledger refuses any step, a savepoint rolls back every
+Ledger write and state change of that event, and only the `exception` outcome is recorded.
+Each Journal write still has an Idempotency Key derived from the Payment and the step.
 """
 
-import hashlib
-import json
 import logging
 from collections.abc import Mapping
 from contextlib import suppress
@@ -43,16 +43,14 @@ from typing import Any
 from sqlalchemy import Connection, Engine, Row, func, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from railbench.common.calendar import add_banking_days, banking_date, banking_day_starts
+from railbench.common.calendar import add_banking_days, banking_day_starts, new_york_date
 from railbench.common.clock import Clock
+from railbench.common.fingerprint import fingerprint as payload_fingerprint
 from railbench.ledger.journal import (
     AccountNotFound,
-    Conflict,
     DuplicateAccount,
     Journal,
     LedgerError,
-    NotFound,
-    Rejected,
 )
 from railbench.ledger.model import (
     AccountType,
@@ -98,23 +96,27 @@ AVAILABLE_AFTER_BANKING_DAYS = 2
 LOCK_SPACE = 4
 
 
-class PaymentNotFound(NotFound):
+class PaymentsError(Exception):
+    """A request Payments refuses. Subclasses say why; the HTTP layer maps each to a status."""
+
+
+class PaymentNotFound(PaymentsError):
     pass
 
 
-class PaymentConflict(Conflict):
+class PaymentConflict(PaymentsError):
     """The Idempotency Key was already used for a different Payment."""
 
 
-class NotACustomerBalance(Rejected):
+class NotACustomerBalance(PaymentsError):
     pass
 
 
-class UnknownProvider(NotFound):
+class UnknownProvider(PaymentsError):
     pass
 
 
-class PaymentNotYetKnown(LedgerError):
+class PaymentNotYetKnown(PaymentsError):
     """A Provider Event for a Payment the Ledger hasn't recorded yet. Retry later."""
 
 
@@ -129,7 +131,7 @@ def bank_cash_account(currency: str) -> str:
 
 def available_at(settled_at: datetime) -> datetime:
     """When ACH money settled at `settled_at` becomes Available (ADR 0004)."""
-    day = add_banking_days(banking_date(settled_at), AVAILABLE_AFTER_BANKING_DAYS)
+    day = add_banking_days(new_york_date(settled_at), AVAILABLE_AFTER_BANKING_DAYS)
     return banking_day_starts(day)
 
 
@@ -140,22 +142,20 @@ class _Booked:
 
 
 class Payments:
-    def __init__(
-        self, engine: Engine, clock: Clock, journal: Journal, providers: Mapping[str, Provider]
-    ) -> None:
+    def __init__(self, engine: Engine, clock: Clock, journal: Journal, provider: Provider) -> None:
         self._engine = engine
         self._clock = clock
         self._journal = journal
-        self._providers = dict(providers)
+        self._provider = provider
 
     # Origination
 
-    def originate(self, new: NewPayment, provider_name: str = "simulator") -> PaymentCreated:
+    def originate(self, new: NewPayment) -> PaymentCreated:
         """Ask the Provider to make the Payment, once per Idempotency Key, and record it as
         `created`. The Provider is asked with the same Idempotency Key, so a retry after a
         failure part way never makes a second Payment."""
-        provider = self._provider(provider_name)
-        fingerprint = _fingerprint(new.model_dump(exclude={"idempotency_key"}))
+        provider = self._provider
+        fingerprint = payload_fingerprint(new.model_dump(exclude={"idempotency_key"}))
         existing = self._by_key(new.idempotency_key, fingerprint)
         if existing is not None:
             return PaymentCreated(payment=existing, replayed=True)
@@ -269,7 +269,7 @@ class Payments:
     def receive(self, provider_name: str, body: bytes, headers: Mapping[str, str]) -> Receipt:
         """Verify, store raw, deduplicate, then apply one webhook. Raises BadSignature,
         MalformedEvent or PaymentNotYetKnown."""
-        provider = self._provider(provider_name)
+        provider = self._named(provider_name)
         provider.verify_event(body, headers, self._clock.now())
         return self._store_and_apply(provider, body, headers)
 
@@ -278,7 +278,7 @@ class Payments:
         again (its signature's timestamp is long past). Replaying the Inbox in order into an
         empty Ledger reproduces the Ledger (SPEC §4.2). In-process only: no HTTP route
         reaches it."""
-        return self._store_and_apply(self._provider(provider_name), body, headers)
+        return self._store_and_apply(self._named(provider_name), body, headers)
 
     def _store_and_apply(
         self, provider: Provider, body: bytes, headers: Mapping[str, str]
@@ -318,26 +318,19 @@ class Payments:
         )
 
     def _apply(self, provider: str, inbox_id: int, event: ProviderEvent) -> tuple[Outcome, str]:
-        with self._engine.connect() as connection:
+        """Apply one Inbox event in one database transaction: the Ledger writes, the state
+        changes and the outcome commit together or not at all."""
+        with self._engine.begin() as connection:
             payment_id = connection.scalar(
                 select(payments.c.id).where(
                     payments.c.provider == provider,
                     payments.c.provider_payment_id == event.provider_payment_id,
                 )
             )
-        if payment_id is None:
-            raise PaymentNotYetKnown(f"no Payment for {provider} {event.provider_payment_id} yet")
-        try:
-            return self._apply_once(payment_id, inbox_id, event)
-        except LedgerError as error:
-            # The Ledger refused a step: an exception for a person, not a crash. The state
-            # changes appended in that commit rolled back with it.
-            return self._record_refusal(payment_id, inbox_id, error)
-
-    def _apply_once(
-        self, payment_id: int, inbox_id: int, event: ProviderEvent
-    ) -> tuple[Outcome, str]:
-        with self._engine.begin() as connection:
+            if payment_id is None:
+                raise PaymentNotYetKnown(
+                    f"no Payment for {provider} {event.provider_payment_id} yet"
+                )
             _lock(connection, payment_id)
             recorded = _outcome(connection, inbox_id)
             if recorded is not None:
@@ -350,45 +343,38 @@ class Payments:
                     outcome = Outcome.STALE
                 case Impossible(reason=reason):
                     outcome, detail = Outcome.EXCEPTION, reason
-                    log.warning(
-                        "impossible Provider Event",
-                        extra={"payment_id": payment_id, "inbox_id": inbox_id, "reason": reason},
-                    )
                 case Advance(path=path):
-                    for state in path:
-                        booked = self._book(connection, payment, state, inbox_id, event)
-                        _append_transition(
-                            connection,
-                            payment_id,
-                            state,
-                            event.occurred_at,
-                            self._clock.now(),
-                            inbox_id=inbox_id,
-                            booked=booked,
-                        )
+                    try:
+                        # A savepoint: if the Ledger refuses any step, every Ledger write and
+                        # state change of this event rolls back, and only the exception stays.
+                        with connection.begin_nested():
+                            journal = self._journal.within(connection)
+                            for state in path:
+                                booked = self._book(
+                                    journal, connection, payment, state, inbox_id, event
+                                )
+                                _append_transition(
+                                    connection,
+                                    payment_id,
+                                    state,
+                                    event.occurred_at,
+                                    self._clock.now(),
+                                    inbox_id=inbox_id,
+                                    booked=booked,
+                                )
+                    except LedgerError as error:
+                        outcome, detail = Outcome.EXCEPTION, f"the Ledger refused it: {error}"
+            if outcome is Outcome.EXCEPTION:
+                log.warning(
+                    "Provider Event not applied",
+                    extra={"payment_id": payment_id, "inbox_id": inbox_id, "reason": detail},
+                )
             _record_outcome(connection, payment_id, inbox_id, outcome, detail, self._clock.now())
         return outcome, detail
 
-    def _record_refusal(
-        self, payment_id: int, inbox_id: int, error: LedgerError
-    ) -> tuple[Outcome, str]:
-        detail = f"the Ledger refused it: {error}"
-        log.warning(
-            "Provider Event refused by the Ledger",
-            extra={"payment_id": payment_id, "inbox_id": inbox_id, "reason": str(error)},
-        )
-        with self._engine.begin() as connection:
-            _lock(connection, payment_id)
-            recorded = _outcome(connection, inbox_id)
-            if recorded is not None:
-                return recorded
-            _record_outcome(
-                connection, payment_id, inbox_id, Outcome.EXCEPTION, detail, self._clock.now()
-            )
-        return Outcome.EXCEPTION, detail
-
     def _book(
         self,
+        journal: Journal,
         connection: Connection,
         payment: Row[Any],
         state: AchState,
@@ -408,7 +394,7 @@ class Payments:
 
         match state:
             case AchState.SUBMITTED:
-                pending = self._journal.post(
+                pending = journal.post(
                     NewTransaction(
                         idempotency_key=f"{key}:pending",
                         actor=actor,
@@ -422,7 +408,7 @@ class Payments:
             case AchState.SETTLED:
                 pending_id = _booked_by(connection, payment.id, AchState.SUBMITTED)
                 assert pending_id is not None
-                self._journal.settle(
+                journal.settle(
                     pending_id,
                     SettlementRequest(
                         idempotency_key=f"{key}:settlement",
@@ -430,7 +416,7 @@ class Payments:
                         effective_at=event.occurred_at,
                     ),
                 )
-                sweep = self._journal.post(
+                sweep = journal.post(
                     NewTransaction(
                         idempotency_key=f"{key}:bank-cash",
                         actor=actor,
@@ -440,7 +426,7 @@ class Payments:
                     )
                 ).transaction
                 until = available_at(event.occurred_at)
-                hold = self._journal.place_hold(
+                hold = journal.place_hold(
                     NewHold(
                         idempotency_key=f"{key}:availability-hold",
                         actor=actor,
@@ -456,7 +442,7 @@ class Payments:
                 pending_id = _booked_by(connection, payment.id, AchState.SUBMITTED)
                 if pending_id is None:
                     return _Booked()
-                reversal = self._journal.reverse(
+                reversal = journal.reverse(
                     pending_id,
                     ReversalRequest(
                         idempotency_key=f"{key}:{state}",
@@ -507,7 +493,7 @@ class Payments:
                     transitions.c.state == AchState.SETTLED,
                 )
             ).scalar_one()
-            self._journal.release_hold(
+            self._journal.within(connection).release_hold(
                 hold_id,
                 ReleaseRequest(
                     idempotency_key=f"payment:{payment_id}:available",
@@ -528,11 +514,10 @@ class Payments:
 
     # Helpers
 
-    def _provider(self, name: str) -> Provider:
-        try:
-            return self._providers[name]
-        except KeyError as error:
-            raise UnknownProvider(f"no Provider {name}") from error
+    def _named(self, name: str) -> Provider:
+        if name != self._provider.name:
+            raise UnknownProvider(f"no Provider {name}")
+        return self._provider
 
     def _by_key(self, key: str, fingerprint: str) -> Payment | None:
         with self._engine.connect() as connection:
@@ -640,8 +625,3 @@ def _lock(connection: Connection, payment_id: int) -> None:
     """Serialise applying events to one Payment until this commit ends (an advisory lock:
     the app role has no UPDATE, so no row locks)."""
     connection.execute(select(func.pg_advisory_xact_lock(LOCK_SPACE, payment_id % 2_147_483_647)))
-
-
-def _fingerprint(payload: dict[str, Any]) -> str:
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode()).hexdigest()

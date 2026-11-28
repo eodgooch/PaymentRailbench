@@ -9,6 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from railbench.ledger.model import BIGINT_MAX, AccountCode, Currency, IdempotencyKey
 from railbench.payments.state_machine import AchState
 
+Rail = Literal["ach"]  # RTP joins with Payouts (#6)
+Direction = Literal["pull"]
+
 
 class _Value(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -18,8 +21,8 @@ class NewPayment(_Value):
     """An ACH pull from the Customer's bank into their Customer Balance."""
 
     idempotency_key: IdempotencyKey
-    rail: Literal["ach"]
-    direction: Literal["pull"]
+    rail: Rail
+    direction: Direction
     customer_account: AccountCode
     amount: Annotated[int, Field(strict=True, gt=0, le=BIGINT_MAX)]
     currency: Currency
@@ -55,8 +58,8 @@ class Payment(_Value):
     idempotency_key: str
     provider: str
     provider_payment_id: str
-    rail: str
-    direction: str
+    rail: Rail
+    direction: Direction
     customer_account: str
     currency: str
     amount: int

@@ -17,7 +17,7 @@ Payment it hasn't recorded yet.
 """
 
 import logging
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -48,15 +48,31 @@ from railbench.ledger.model import (
 )
 from railbench.payments.model import NewPayment, Payment, Receipt
 from railbench.payments.provider import MalformedEvent, Provider, ProviderError, SimulatorProvider
-from railbench.payments.service import PaymentNotYetKnown, Payments
+from railbench.payments.service import (
+    NotACustomerBalance,
+    PaymentConflict,
+    PaymentNotFound,
+    PaymentNotYetKnown,
+    Payments,
+    PaymentsError,
+    UnknownProvider,
+)
 
 log = logging.getLogger(__name__)
 
 ERROR_STATUS = {
-    PaymentNotYetKnown: status.HTTP_503_SERVICE_UNAVAILABLE,
     NotFound: status.HTTP_404_NOT_FOUND,
     Conflict: status.HTTP_409_CONFLICT,
     Rejected: status.HTTP_422_UNPROCESSABLE_CONTENT,
+}
+
+
+PAYMENTS_ERROR_STATUS = {
+    PaymentNotFound: status.HTTP_404_NOT_FOUND,
+    UnknownProvider: status.HTTP_404_NOT_FOUND,
+    PaymentConflict: status.HTTP_409_CONFLICT,
+    NotACustomerBalance: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    PaymentNotYetKnown: status.HTTP_503_SERVICE_UNAVAILABLE,
 }
 
 
@@ -89,17 +105,16 @@ def create_app(
     engine: Engine,
     clock: Clock,
     settings: Settings | None = None,
-    providers: Mapping[str, Provider] | None = None,
+    provider: Provider | None = None,
 ) -> FastAPI:
-    """The Ledger API. `providers` defaults to the Simulator at SIMULATOR_URL."""
+    """The Ledger API. `provider` defaults to the Simulator at SIMULATOR_URL."""
     settings = settings or Settings()
-    if providers is None:
-        simulator = SimulatorProvider(
+    if provider is None:
+        provider = SimulatorProvider(
             settings.simulator_url, settings.webhook_signing_secret.get_secret_value()
         )
-        providers = {simulator.name: simulator}
     journal = Journal(engine, clock)
-    payments = Payments(engine, clock, journal, providers)
+    payments = Payments(engine, clock, journal, provider)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -109,11 +124,16 @@ def create_app(
     app = create_service_app("ledger", engine, clock, lifespan=lifespan)
     app.state.journal = journal
     app.state.payments = payments
-    app.state.providers = providers
+    app.state.provider = provider
 
     @app.exception_handler(LedgerError)
     def ledger_error(_request: Request, error: LedgerError) -> JSONResponse:
         return JSONResponse(status_code=error_status(error), content={"detail": str(error)})
+
+    @app.exception_handler(PaymentsError)
+    def payments_error(_request: Request, error: PaymentsError) -> JSONResponse:
+        code = PAYMENTS_ERROR_STATUS.get(type(error), status.HTTP_422_UNPROCESSABLE_CONTENT)
+        return JSONResponse(status_code=code, content={"detail": str(error)})
 
     @app.exception_handler(ProviderError)
     def provider_error(_request: Request, error: ProviderError) -> JSONResponse:

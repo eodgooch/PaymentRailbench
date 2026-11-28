@@ -18,6 +18,7 @@ from typing import Any, Protocol
 import httpx
 
 from railbench.common.signing import SIGNATURE_HEADER, BadSignature, verify
+from railbench.payments.model import Direction, Rail
 from railbench.payments.state_machine import AchState
 
 
@@ -26,8 +27,8 @@ class PaymentOrder:
     """What the Ledger asks a Provider to do. The Idempotency Key makes a retry safe."""
 
     idempotency_key: str
-    rail: str
-    direction: str
+    rail: Rail
+    direction: Direction
     amount: int
     currency: str
     reference: str
@@ -36,7 +37,7 @@ class PaymentOrder:
 @dataclass(frozen=True)
 class ProviderPayment:
     provider_payment_id: str
-    status: str
+    status: AchState
 
 
 @dataclass(frozen=True)
@@ -82,14 +83,11 @@ EVENT_STATES = {
 class SimulatorProvider:
     """The Simulator, over its HTTP API and signed webhooks."""
 
+    name = "simulator"
+
     def __init__(
-        self,
-        base_url: str,
-        signing_secret: str,
-        name: str = "simulator",
-        http: httpx.Client | None = None,
+        self, base_url: str, signing_secret: str, http: httpx.Client | None = None
     ) -> None:
-        self.name = name
         self._secret = signing_secret
         self._http = http or httpx.Client(base_url=base_url, timeout=10.0)
 
@@ -148,4 +146,4 @@ class SimulatorProvider:
 
     @staticmethod
     def _payment(body: dict[str, Any]) -> ProviderPayment:
-        return ProviderPayment(provider_payment_id=body["id"], status=body["status"])
+        return ProviderPayment(provider_payment_id=body["id"], status=AchState(body["status"]))

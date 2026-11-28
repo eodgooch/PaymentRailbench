@@ -11,11 +11,11 @@ the same event ID and bytes, signed afresh.
 Nothing happens on its own: `tick()` settles what's due by the Clock and delivers due
 events. A delivery that doesn't get a 2xx (or doesn't connect, or times out) is retried
 after 30 s, then 60 s, doubling to at most an hour, and abandoned after MAX_ATTEMPTS.
-Events go out in the order they were emitted. Faults (duplicates, reordering, delays) and
+Events go out in the order they were emitted, claimed briefly and POSTed outside any
+database transaction, so a slow receiver holds no locks. Faults (duplicates, reordering, delays) and
 Returns join in later issues.
 """
 
-import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
@@ -25,10 +25,11 @@ import httpx
 from sqlalchemy import Connection, Engine, Row, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from railbench.common.calendar import at_new_york, banking_date, is_banking_day, next_banking_day
+from railbench.common.calendar import at_new_york, is_banking_day, new_york_date, next_banking_day
 from railbench.common.clock import Clock
+from railbench.common.fingerprint import fingerprint as payload_fingerprint
 from railbench.common.signing import SIGNATURE_HEADER, sign
-from railbench.simulator.model import PaymentRequest, SimulatedPayment
+from railbench.simulator.model import EventType, PaymentRequest, PaymentStatus, SimulatedPayment
 from railbench.simulator.tables import events, payments
 
 ACH_CUTOFF = time(16, 0)
@@ -36,6 +37,7 @@ ACH_SETTLEMENT_TIME = time(8, 30)
 FIRST_RETRY = timedelta(seconds=30)
 LONGEST_RETRY = timedelta(hours=1)
 MAX_ATTEMPTS = 10
+CLAIM_LEASE = timedelta(minutes=1)
 DELIVERY_TIMEOUT = 5.0
 
 
@@ -59,7 +61,7 @@ class Delivery:
 
 def ach_settles_at(submitted_at: datetime) -> datetime:
     """When an ACH Payment submitted at `submitted_at` settles."""
-    day = banking_date(submitted_at)
+    day = new_york_date(submitted_at)
     if not is_banking_day(day) or at_new_york(day, ACH_CUTOFF) <= submitted_at:
         day = next_banking_day(day)
     return at_new_york(next_banking_day(day), ACH_SETTLEMENT_TIME)
@@ -88,7 +90,7 @@ class Simulator:
     def create_payment(self, request: PaymentRequest) -> tuple[SimulatedPayment, bool]:
         """Create and submit a Payment once per Idempotency Key. Returns the Payment and
         whether this was a replay of an earlier request."""
-        fingerprint = _fingerprint(request.model_dump(exclude={"idempotency_key"}))
+        fingerprint = payload_fingerprint(request.model_dump(exclude={"idempotency_key"}))
         now = self._clock.now()
         with self._engine.begin() as connection:
             payment_id = connection.scalar(
@@ -101,7 +103,7 @@ class Simulator:
                     currency=request.currency,
                     amount=request.amount,
                     reference=request.reference,
-                    status="submitted",
+                    status=PaymentStatus.SUBMITTED,
                     created_at=now,
                     submitted_at=now,
                     settles_at=ach_settles_at(now),
@@ -110,7 +112,7 @@ class Simulator:
                 .returning(payments.c.id)
             )
             if payment_id is not None:
-                self._emit(connection, payment_id, "payment.submitted", now)
+                self._emit(connection, payment_id, EventType.SUBMITTED, now)
         with self._engine.connect() as connection:
             row = connection.execute(
                 select(payments).where(payments.c.idempotency_key == request.idempotency_key)
@@ -160,7 +162,7 @@ class Simulator:
         with self._engine.begin() as connection:
             due = connection.execute(
                 select(payments.c.id, payments.c.settles_at)
-                .where(payments.c.status == "submitted", payments.c.settles_at <= now)
+                .where(payments.c.status == PaymentStatus.SUBMITTED, payments.c.settles_at <= now)
                 .order_by(payments.c.id)
                 .with_for_update(skip_locked=True)
             ).all()
@@ -168,12 +170,12 @@ class Simulator:
                 connection.execute(
                     update(payments)
                     .where(payments.c.id == payment_id)
-                    .values(status="settled", settled_at=settles_at)
+                    .values(status=PaymentStatus.SETTLED, settled_at=settles_at)
                 )
-                self._emit(connection, payment_id, "payment.settled", settles_at)
+                self._emit(connection, payment_id, EventType.SETTLED, settles_at)
 
     def _emit(
-        self, connection: Connection, payment_id: int, type_: str, occurred_at: datetime
+        self, connection: Connection, payment_id: int, type_: EventType, occurred_at: datetime
     ) -> None:
         row = connection.execute(select(payments).where(payments.c.id == payment_id)).one()
         event_id = connection.scalar(
@@ -200,32 +202,47 @@ class Simulator:
         )
 
     def _deliver_due(self) -> None:
+        """Claim the due events in one short commit, POST each outside any transaction, and
+        record each result in its own short commit, so a slow receiver holds no locks.
+        Claiming pushes `next_attempt_at` out by CLAIM_LEASE: a concurrent tick skips the
+        claimed events, and an event whose result never got recorded (a crash mid-POST) is
+        retried once the lease runs out."""
+        now = self._clock.now()
         with self._engine.begin() as connection:
-            due = connection.execute(
+            claimed = connection.execute(
                 select(events.c.id, events.c.body, events.c.attempts)
                 .where(
                     events.c.delivered_at.is_(None),
                     events.c.abandoned_at.is_(None),
-                    events.c.next_attempt_at <= self._clock.now(),
+                    events.c.next_attempt_at <= now,
                 )
                 .order_by(events.c.id)
                 .with_for_update(skip_locked=True)
             ).all()
-            for event_id, body, attempts in due:
-                error = self._post(body.encode())
-                now = self._clock.now()
-                attempts += 1
-                if error is None:
-                    values: dict[str, Any] = {"attempts": attempts, "delivered_at": now}
-                elif attempts >= MAX_ATTEMPTS:
-                    values = {"attempts": attempts, "abandoned_at": now, "last_error": error}
-                else:
-                    values = {
-                        "attempts": attempts,
-                        "next_attempt_at": now + retry_delay(attempts),
-                        "last_error": error,
-                    }
-                connection.execute(update(events).where(events.c.id == event_id).values(values))
+            if claimed:
+                connection.execute(
+                    update(events)
+                    .where(events.c.id.in_([row.id for row in claimed]))
+                    .values(next_attempt_at=now + CLAIM_LEASE)
+                )
+        for event_id, body, attempts in claimed:
+            error = self._post(body.encode())
+            self._record_attempt(event_id, attempts + 1, error)
+
+    def _record_attempt(self, event_id: int, attempts: int, error: str | None) -> None:
+        now = self._clock.now()
+        if error is None:
+            values: dict[str, Any] = {"attempts": attempts, "delivered_at": now}
+        elif attempts >= MAX_ATTEMPTS:
+            values = {"attempts": attempts, "abandoned_at": now, "last_error": error}
+        else:
+            values = {
+                "attempts": attempts,
+                "next_attempt_at": now + retry_delay(attempts),
+                "last_error": error,
+            }
+        with self._engine.begin() as connection:
+            connection.execute(update(events).where(events.c.id == event_id).values(values))
 
     def _post(self, body: bytes) -> str | None:
         """Deliver one webhook. None on a 2xx, otherwise what went wrong."""
@@ -251,7 +268,7 @@ def _payment(row: Row[Any]) -> SimulatedPayment:
         currency=row.currency,
         amount=row.amount,
         reference=row.reference,
-        status=row.status,
+        status=PaymentStatus(row.status),
         created_at=row.created_at,
         submitted_at=row.submitted_at,
         settled_at=row.settled_at,
@@ -273,8 +290,3 @@ def _iso(value: object) -> str:
     if isinstance(value, datetime):
         return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
     raise TypeError(f"can't serialise {type(value).__name__}")
-
-
-def _fingerprint(payload: dict[str, Any]) -> str:
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode()).hexdigest()

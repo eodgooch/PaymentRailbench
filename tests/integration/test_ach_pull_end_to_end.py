@@ -29,8 +29,9 @@ from railbench.ledger.app import create_app as create_ledger_app
 from railbench.ledger.journal import Journal
 from railbench.ledger.model import AccountType, NewAccount
 from railbench.payments.model import NewPayment
-from railbench.payments.provider import SimulatorProvider
+from railbench.payments.provider import Provider, ProviderPayment, SimulatorProvider
 from railbench.payments.service import Payments
+from railbench.payments.state_machine import AchState
 from railbench.payments.tables import inbox
 from railbench.simulator.app import create_app as create_simulator_app
 from railbench.simulator.provider import Simulator
@@ -53,6 +54,7 @@ class Stack:
     simulator: Simulator
     payments: Payments
     journal: Journal
+    provider: Provider
 
     def tick(self) -> None:
         """What both running services do on their timers: the Simulator settles and
@@ -88,6 +90,7 @@ def stack(engine: Engine, app_engine: Engine) -> Iterator[Stack]:
             simulator=simulator_app.state.simulator,
             payments=ledger_app.state.payments,
             journal=ledger_app.state.journal,
+            provider=ledger_app.state.provider,
         )
 
 
@@ -160,6 +163,10 @@ def test_an_ach_pull_is_pending_then_posted_then_available_two_banking_days_late
     stack.tick()
     assert state(stack, payment["id"]) == "settled"
     assert stack.balances(customer) == {"posted": 25_000, "pending": 0, "available": 0}
+    # The Provider agrees, read back through the Provider interface's get Payment.
+    assert stack.provider.get_payment(payment["provider_payment_id"]) == ProviderPayment(
+        provider_payment_id=payment["provider_payment_id"], status=AchState.SETTLED
+    )
     # The Clearing Account has passed the money on to Bank Cash: it nets to zero again.
     assert clearing_and_bank_cash(stack, payment["id"]) == {
         CLEARING: {"settled": 0, "unsettled": 0},
@@ -304,7 +311,7 @@ def test_replaying_the_inbox_reproduces_the_ledger(
             ),
         )
         journal = Journal(replay_engine, clock)
-        payments = Payments(replay_engine, clock, journal, {"simulator": provider})
+        payments = Payments(replay_engine, clock, journal, provider)
         journal.open_account(NewAccount(code=customer, type=AccountType.LIABILITY, currency="USD"))
         replayed = payments.originate(
             NewPayment.model_validate(

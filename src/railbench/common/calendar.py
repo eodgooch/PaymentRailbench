@@ -77,7 +77,7 @@ def add_banking_days(day: date, count: int) -> date:
     return day
 
 
-def banking_date(moment: datetime) -> date:
+def new_york_date(moment: datetime) -> date:
     """The calendar date of `moment` in New York."""
     if moment.tzinfo is None or moment.utcoffset() is None:
         raise ValueError("a moment must be timezone-aware")
