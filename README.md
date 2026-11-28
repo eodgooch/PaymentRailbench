@@ -269,6 +269,7 @@ faults:
   - {id: short, kind: wrong_report_amount, payment: wren-funding, by: -500}
   - {id: gone, kind: missing_report_line, payment: pax-funding}
   - {id: late, kind: settlement_after_cutoff, payment: jules-funding}
+  - {id: twice, kind: duplicate_report_line, payment: ottoline-payout}
   - {id: fee, kind: provider_adjustment, payment: wren-funding, amount: 150, reason: fee_correction, after: 2}
   - {id: recall, kind: provider_adjustment, payment: ottoline-payout, amount: 2000, reason: payout_recall}
   - {id: stranger, kind: orphan_adjustment, payment: pax-funding, amount: 450}
@@ -305,7 +306,7 @@ the two arrived, so re-running a day finds the same Breaks and adds nothing. The
 | missing at Provider | settled for D's report, on no report up to the next Banking Day's |
 | timing mismatch | its line is on another day's report than the one it counts toward |
 | amount mismatch | its line's amount isn't what settled |
-| duplicate | a second settlement line for one Payment, or a re-issued report stating other lines |
+| duplicate | a second settlement line for one Payment (`duplicate_report_line` makes one), or a re-issued report stating other lines |
 | status mismatch | a line for a Payment the Ledger hasn't recorded settled, or a Provider Adjustment still pending |
 | missing in Ledger | a line for no Payment the Ledger has (or contradicting it), or an unmatched Provider Adjustment |
 
@@ -316,9 +317,12 @@ Adjustment none (ADR 0015 has the table; tested against the Fault Manifest). Eac
 stores its exposure in Minor Units, its facts and its evidence, as foreign keys to the
 Payments, state changes, Inbox events, Ledger Transactions, reports, lines and Provider
 Adjustment decisions it rests on; its id is a hash of Provider, day, Break Type and match
-key, the same in every run of a Scenario. Its age runs from detection.
+key, the same in every run of a Scenario. Its age runs from when its Banking Day's report
+was due. A line more than a Banking Day late is missing at the Provider on its own day and
+a timing mismatch on the day it lands, and the two name each other (`related_breaks`).
 
-`GET /breaks` is the **Exception Queue**: open Breaks, largest exposure first, then oldest
+`GET /breaks` is the **Exception Queue**: open Breaks, within each currency largest exposure
+first, then oldest
 (`status=resolved|all`, `provider`, `banking_day`, `break_type` filter it). `GET /breaks/{id}`
 reads one with its evidence. `POST /breaks/{id}/resolution` resolves it once, by a person
 (`{"actor": {"operator_id": …, "proposal_id": …}}`, the Proposal optional) with exactly one
@@ -326,6 +330,8 @@ of a `correcting_transaction_id` already in the Ledger or a `reason`; a retry an
 another resolution 409. Nothing resolves a Break on its own. `GET /reconciliations/{provider}/{date}`
 says whether the day is reconciled and how many Breaks are open with what exposure (for
 Daily Close); `POST` to it, or `make reconcile DAY=2026-09-04`, reconciles the day. A
+running service waits `RECONCILIATION_SETTLE_SECONDS` (default 300) after a day's second
+report before reconciling it, so writes in flight have committed. A
 Scenario run reconciles every Banking Day it covers and prints the Breaks; replaying the
 Ledger reproduces them.
 
