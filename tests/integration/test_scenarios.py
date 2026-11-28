@@ -280,10 +280,10 @@ def test_an_auction_close_scenario_pays_sellers_standard_and_instant(
     [close] = found.summary["auction_closes"].values()
     payouts = {account.split(":")[1]: p for account, p in close["payouts"].items()}
     assert {name: [s["step"] for s in p["steps"]] for name, p in payouts.items()} == {
-        "c-bram": ["held", "released"],
-        "c-cleo": ["instant"],
-        "c-dara": ["held", "released"],  # over the limit
-        "c-emil": ["instant", "held", "released"],  # declined over RTP
+        "c-bram": ["reserved", "standard", "released"],
+        "c-cleo": ["reserved", "instant"],
+        "c-dara": ["reserved", "standard", "released"],  # over the limit
+        "c-emil": ["reserved", "instant", "standard", "released"],  # declined over RTP
     }
     assert payouts["c-cleo"]["steps"][0]["effective_at"] == "2026-09-03T21:00:00+00:00"
     released = {payouts[n]["steps"][-1]["effective_at"] for n in ("c-bram", "c-dara", "c-emil")}

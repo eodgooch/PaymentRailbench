@@ -166,6 +166,7 @@ class _Summariser:
                 "amount": row.amount,
                 "description": row.description,
                 "recorded_at": _time(row.recorded_at),
+                "hold": None if row.hold_id is None else self._key(self._hold_key(row.hold_id)),
                 "transitions": [
                     {
                         "state": s.state,

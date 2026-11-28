@@ -21,11 +21,18 @@ from railbench.common.settings import Settings
 from railbench.common.signing import SIGNATURE_HEADER, sign
 from railbench.ledger.app import create_app
 from railbench.ledger.journal import Journal, Rejected
-from railbench.ledger.model import AccountType, NewAccount, NewEntry, NewTransaction, SystemJob
+from railbench.ledger.model import (
+    AccountType,
+    NewAccount,
+    NewEntry,
+    NewHold,
+    NewTransaction,
+    SystemJob,
+)
 from railbench.ledger.tables import accounts, entries, transactions
 from railbench.payments.model import NewPayment
 from railbench.payments.provider import SimulatorProvider
-from railbench.payments.service import Payments, clearing_account
+from railbench.payments.service import HoldMismatch, Payments, clearing_account
 from railbench.payments.tables import inbox
 from tests.integration.helpers import unique
 
@@ -575,3 +582,34 @@ def test_the_payments_api_only_originates_pulls(
     )
 
     assert response.status_code == 422
+
+
+def test_a_push_can_only_name_a_hold_reserving_its_own_amount(client: TestClient) -> None:
+    customer = funded_customer(client, 10_000)
+    hold = (
+        journal(client)
+        .place_hold(
+            NewHold(
+                idempotency_key=unique("reservation"),
+                actor=SystemJob(name="test", version="1"),
+                effective_at=SUBMITTED_AT,
+                account=customer,
+                currency="USD",
+                amount=5_000,
+            )
+        )
+        .hold
+    )
+
+    with pytest.raises(HoldMismatch):
+        payments(client).originate(
+            NewPayment(
+                idempotency_key=unique("payout"),
+                rail="rtp",
+                direction="push",
+                customer_account=customer,
+                amount=7_500,
+                currency="USD",
+                hold_id=hold.id,
+            )
+        )

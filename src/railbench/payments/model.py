@@ -27,11 +27,17 @@ class NewPayment(_Value):
     amount: Annotated[int, Field(strict=True, gt=0, le=BIGINT_MAX)]
     currency: Currency
     description: Annotated[str, Field(max_length=200)] = ""
+    # A push may name the Hold reserving its amount on the Customer Balance: the Transaction
+    # that books the money going out captures it, so the money is never Available on its
+    # way out (ADR 0012).
+    hold_id: Annotated[int, Field(strict=True, gt=0)] | None = None
 
     @model_validator(mode="after")
     def _rtp_pushes_only(self) -> Self:
         if self.rail == "rtp" and self.direction != "push":
             raise ValueError("RTP is credit push only: it can't pull money")
+        if self.hold_id is not None and self.direction != "push":
+            raise ValueError("only a push reserves its amount with a Hold")
         return self
 
 
@@ -71,12 +77,23 @@ class Payment(_Value):
     amount: int
     description: str
     recorded_at: datetime
+    hold_id: int | None
     state: PaymentState
     # When a settled ACH pull becomes Available: the start (midnight, New York) of the
     # second Banking Day after the Banking Day it settled on (ADR 0004, ADR 0010).
     available_at: datetime | None
     transitions: list[Transition]
     exceptions: list[PaymentException]
+
+
+class PaymentRef(_Value):
+    """A Payment's identity and where it stands, without its history."""
+
+    id: int
+    idempotency_key: str
+    rail: Rail
+    direction: Direction
+    state: PaymentState
 
 
 class PaymentCreated(_Value):

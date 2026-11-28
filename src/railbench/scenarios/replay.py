@@ -8,10 +8,16 @@ and Payments as recorded (a stand-in Provider answers each origination with the 
 ID it gave the first time), each Auction Close from its lots and Payout requests with the fee
 and Instant Payout limit it was booked under, every Inbox body applied through
 `Payments.replay` at the time it was first received, and the availability and Payout
-release jobs run at each moment they recorded doing something. At one moment they go in the
-order the Ledger does them: Accounts, originations, Auction Closes, Provider Events, then
-the two jobs. Because the Ledger reads time only from its Clock, Recorded Times come out the
-same too, and `ledger_summary` of the two databases must be equal.
+release jobs run at each moment they recorded doing something. At one moment they go in this
+order: Accounts, Auction Closes, originations, Provider Events, then the two jobs. Every
+Payment is originated from its row, a Payout's too, naming the Hold that reserves it (found
+in the target by the Hold's Idempotency Key), so a Payout's Payment exists before Provider
+Events about it arrive, even when the run made it and heard of it at one Clock moment.
+Booking an Auction Close doesn't depend on Payments originated at the same moment, so
+putting it first changes nothing else.
+
+Because the Ledger reads time only from its Clock, Recorded Times come out the same too, and
+`ledger_summary` of the two databases must be equal.
 """
 
 from collections.abc import Collection, Mapping
@@ -26,9 +32,9 @@ from sqlalchemy import Connection, Engine, select
 from railbench.common.clock import ManualClock
 from railbench.ledger.journal import Journal
 from railbench.ledger.model import AccountType, NewAccount
-from railbench.ledger.tables import accounts
+from railbench.ledger.tables import accounts, holds
 from railbench.marketplace.model import NewAuctionClose, NewLot
-from railbench.marketplace.service import PAYOUT_JOB, Marketplace
+from railbench.marketplace.service import PAYOUT_JOB, AuctionTerms, Marketplace
 from railbench.marketplace.tables import auction_closes, lots, payout_steps, payouts
 from railbench.payments.model import NewPayment
 from railbench.payments.provider import (
@@ -95,8 +101,8 @@ class StepKind(IntEnum):
     """What the Ledger did, in the order it does them at one moment of a run."""
 
     OPEN_ACCOUNT = 0
-    ORIGINATE = 1
-    CLOSE_AUCTION = 2
+    CLOSE_AUCTION = 1
+    ORIGINATE = 2
     RECEIVE_EVENT = 3
     RUN_AVAILABILITY_JOB = 4
     RUN_PAYOUT_JOB = 5
@@ -125,6 +131,7 @@ def replay_inbox(
         account_rows = connection.execute(select(accounts).order_by(accounts.c.id)).all()
         payment_rows = connection.execute(select(payments).order_by(payments.c.id)).all()
         inbox_rows = connection.execute(select(inbox).order_by(inbox.c.id)).all()
+        hold_keys = dict(connection.execute(select(holds.c.id, holds.c.idempotency_key)).all())
         if accounts_in_scope is not None:
             account_rows = [a for a in account_rows if a.code in accounts_in_scope]
             payment_rows = [p for p in payment_rows if p.customer_account in accounts_in_scope]
@@ -167,9 +174,8 @@ def replay_inbox(
     clock = ManualClock(steps[0].at)
     journal = Journal(target, clock)
     service = Payments(target, clock, journal, provider)
-
-    def marketplace(fee_bps: int = 0, limit: int = 0) -> Marketplace:
-        return Marketplace(target, clock, journal, service, fee_bps, limit)
+    # Each Auction Close is booked under the terms it recorded; the release job needs none.
+    marketplace = Marketplace(target, clock, journal, service)
 
     for step in steps:
         clock.set(step.at)
@@ -189,6 +195,9 @@ def replay_inbox(
                         amount=row.amount,
                         currency=row.currency,
                         description=row.description,
+                        hold_id=None
+                        if row.hold_id is None
+                        else _hold_in(target, hold_keys[row.hold_id]),
                     )
                 )
             case StepKind.RECEIVE_EVENT:
@@ -198,9 +207,11 @@ def replay_inbox(
                 service.make_available()
             case StepKind.CLOSE_AUCTION:
                 close, new = row
-                marketplace(close.seller_fee_bps, close.instant_payout_limit).close(new)
+                marketplace.close(
+                    new, AuctionTerms(close.seller_fee_bps, close.instant_payout_limit)
+                )
             case StepKind.RUN_PAYOUT_JOB:
-                marketplace().release_payouts()
+                marketplace.release_payouts()
 
 
 def _auction_closes(connection: Connection) -> list[tuple[Any, NewAuctionClose]]:
@@ -232,4 +243,13 @@ def _auction_closes(connection: Connection) -> list[tuple[Any, NewAuctionClose]]
             instant_payouts=list(instant),
         )
         found.append((close, new))
+    return found
+
+
+def _hold_in(target: Engine, key: str) -> int:
+    """The id of the Hold with this Idempotency Key in the target database."""
+    with target.connect() as connection:
+        found: int = connection.execute(
+            select(holds.c.id).where(holds.c.idempotency_key == key)
+        ).scalar_one()
     return found

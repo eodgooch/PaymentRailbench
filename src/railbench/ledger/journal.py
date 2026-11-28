@@ -652,7 +652,7 @@ def _held(account_id: int, effective_at: datetime, known_at: datetime) -> Select
 def _lock(connection: Connection, transaction_id: int) -> None:
     """Serialise settling and reversing one Transaction until this commit ends. An advisory
     lock, since row locks need UPDATE, which the app role doesn't have. It's keyed by the
-    Transaction id alone: the Ledger takes no other advisory locks."""
+    Transaction id alone, the one-key form (see `railbench.common.locks`)."""
     connection.execute(select(func.pg_advisory_xact_lock(transaction_id)))
 
 

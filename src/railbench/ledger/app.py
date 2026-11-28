@@ -55,6 +55,7 @@ from railbench.marketplace.model import AuctionClose, NewAuctionClose
 from railbench.marketplace.service import (
     AuctionCloseConflict,
     AuctionCloseNotFound,
+    AuctionTerms,
     Marketplace,
     MarketplaceError,
 )
@@ -145,8 +146,10 @@ def create_app(
         clock,
         journal,
         payments,
-        seller_fee_bps=settings.seller_fee_bps,
-        instant_payout_limit=settings.instant_payout_limit_cents,
+        AuctionTerms(
+            seller_fee_bps=settings.seller_fee_bps,
+            instant_payout_limit=settings.instant_payout_limit_cents,
+        ),
     )
 
     def jobs() -> None:

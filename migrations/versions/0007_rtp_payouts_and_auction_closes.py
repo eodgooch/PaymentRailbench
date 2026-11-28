@@ -1,7 +1,9 @@
 """RTP, Payouts and Auction Closes (SPEC §4.1, §4.4, ADR 0012).
 
 - `payments.payments` now holds pushes too: an ACH pull or push, or an RTP push (RTP is
-  credit push only, so an RTP pull is refused here as well as in code).
+  credit push only, so an RTP pull is refused here as well as in code). A push may name the
+  Hold that reserves its amount (`hold_id`), which the Transaction booking its outflow
+  captures.
 - `simulator.plans.rail`: the Rail a Scenario planned the Payment for, since what a Payment
   emits depends on it (an RTP Payment emits only its ending).
 - A new `marketplace` schema, append-only like the Ledger:
@@ -12,9 +14,12 @@
     and the Ledger Transaction that booked it;
   - `payouts`: what each seller is owed from the auction and whether they asked for an
     Instant Payout;
-  - `payout_steps`: what happened to each Payout, at most once per step: `instant` (sent
-    over RTP at once), `held` (a Standard Payout waiting, with its Hold) and `released`
-    (the Hold released and the Payout sent over ACH), each with the system job behind it.
+  - `payout_steps`: what happened to each Payout, at most once per step: `reserved` (a
+    Hold on the seller's Customer Balance for the amount, at the close, named here),
+    `instant` (sent over RTP), `standard` (to wait until the funds behind it are Available,
+    at the close or after a declined RTP), `released` (sent over ACH) and `returned` (its
+    ACH Payment ended without moving money, so the Hold was released), each with the
+    system job behind it.
 
 The app role gets USAGE on the schema and SELECT and INSERT on its tables, explicitly (no
 default privileges, ADR 0008), and each table gets an append-only trigger.
@@ -42,7 +47,9 @@ ALTER TABLE payments.payments
     DROP CONSTRAINT payments_direction_check,
     ADD CONSTRAINT payments_rail_check CHECK (rail IN ('ach', 'rtp')),
     ADD CONSTRAINT payments_direction_check CHECK (direction IN ('pull', 'push')),
-    ADD CONSTRAINT payments_rtp_is_push_only CHECK (rail <> 'rtp' OR direction = 'push');
+    ADD CONSTRAINT payments_rtp_is_push_only CHECK (rail <> 'rtp' OR direction = 'push'),
+    ADD COLUMN hold_id BIGINT REFERENCES ledger.holds (id),
+    ADD CONSTRAINT payments_hold_reserves_a_push CHECK (hold_id IS NULL OR direction = 'push');
 
 ALTER TABLE simulator.plans
     ADD COLUMN rail TEXT NOT NULL DEFAULT 'ach' CHECK (rail IN ('ach', 'rtp'));
@@ -87,7 +94,8 @@ CREATE TABLE marketplace.payouts (
 CREATE TABLE marketplace.payout_steps (
     id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     payout_id    BIGINT NOT NULL REFERENCES marketplace.payouts (id),
-    step         TEXT NOT NULL CHECK (step IN ('instant', 'held', 'released')),
+    step         TEXT NOT NULL
+                 CHECK (step IN ('reserved', 'instant', 'standard', 'released', 'returned')),
     detail       TEXT NOT NULL DEFAULT '',
     hold_id      BIGINT REFERENCES ledger.holds (id),
     job_name     TEXT NOT NULL CHECK (job_name <> ''),
@@ -95,8 +103,8 @@ CREATE TABLE marketplace.payout_steps (
     effective_at TIMESTAMPTZ NOT NULL,
     recorded_at  TIMESTAMPTZ NOT NULL,
     UNIQUE (payout_id, step),
-    -- A Standard Payout's steps name its Hold; an Instant Payout has none.
-    CHECK ((step = 'instant') = (hold_id IS NULL))
+    -- The reservation names its Hold; the other steps act on it.
+    CHECK ((step = 'reserved') = (hold_id IS NOT NULL))
 );
 
 CREATE FUNCTION marketplace.reject_history_edits() RETURNS trigger
@@ -132,6 +140,8 @@ DROP FUNCTION marketplace.reject_history_edits();
 DROP SCHEMA marketplace;
 ALTER TABLE simulator.plans DROP COLUMN rail;
 ALTER TABLE payments.payments
+    DROP CONSTRAINT payments_hold_reserves_a_push,
+    DROP COLUMN hold_id,
     DROP CONSTRAINT payments_rtp_is_push_only,
     DROP CONSTRAINT payments_rail_check,
     DROP CONSTRAINT payments_direction_check,

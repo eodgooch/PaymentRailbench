@@ -12,7 +12,11 @@ from railbench.ledger.model import BIGINT_MAX, AccountCode, Currency
 AuctionId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9:._-]{0,119}$")]
 LotId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,39}$")]
 Speed = Literal["instant", "standard"]
-Step = Literal["instant", "held", "released"]
+# What happens to a Payout, each at most once: its amount `reserved` by a Hold at the close;
+# sent `instant` over RTP, or made `standard` (at the close, or after a declined RTP) to
+# wait for the funds behind it; `released` over ACH; `returned` to the Customer Balance if
+# its ACH Payment ended without moving money.
+Step = Literal["reserved", "instant", "standard", "released", "returned"]
 KEY_LIMIT = 200
 
 
@@ -111,6 +115,9 @@ class Payout(_Value):
     speed: Speed
     steps: list[PayoutStep]
     payments: list[PayoutPayment]
+    # A Standard Payout not released yet: the Customer Balances whose Available Balance is
+    # negative and so holding it up (its seller's buyers in the auction, or the seller).
+    waiting_for: list[str]
 
 
 class CustomerPosition(_Value):

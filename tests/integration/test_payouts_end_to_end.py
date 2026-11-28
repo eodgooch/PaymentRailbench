@@ -11,8 +11,11 @@ Day, and is Available on Wednesday 9 September.
 """
 
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from threading import Barrier, BrokenBarrierError
 from typing import Any
 
 import httpx
@@ -23,8 +26,9 @@ from railbench.common.clock import ManualClock
 from railbench.common.settings import Settings
 from railbench.ledger.app import create_app as create_ledger_app
 from railbench.ledger.journal import Journal
-from railbench.ledger.model import AccountType, NewAccount
+from railbench.ledger.model import AccountType, NewAccount, NewEntry, NewTransaction, SystemJob
 from railbench.ledger.tables import accounts, entries, transactions
+from railbench.marketplace.model import NewAuctionClose
 from railbench.marketplace.service import Marketplace
 from railbench.payments.service import Payments
 from railbench.scenarios.servers import free_port, serving
@@ -286,7 +290,7 @@ def test_a_standard_payout_waits_until_the_buyers_funds_are_available(stack: Sta
         "standard",
         22_500,
     )
-    assert [s["step"] for s in payout["steps"]] == ["held"]
+    assert [s["step"] for s in payout["steps"]] == ["reserved", "standard"]
     # The seller's proceeds are Posted but held: not Available until the buyer's are.
     assert stack.balances(seller) == {"posted": 22_500, "pending": 0, "available": 0}
 
@@ -298,7 +302,10 @@ def test_a_standard_payout_waits_until_the_buyers_funds_are_available(stack: Sta
         WEDNESDAY_START - timedelta(seconds=1),
     ):
         stack.at(moment)
-        assert [s["step"] for s in stack.payout(auction_id, seller)["steps"]] == ["held"]
+        assert [s["step"] for s in stack.payout(auction_id, seller)["steps"]] == [
+            "reserved",
+            "standard",
+        ]
         assert stack.payout(auction_id, seller)["payments"] == []
     assert stack.balances(buyer)["available"] < 0
 
@@ -307,8 +314,8 @@ def test_a_standard_payout_waits_until_the_buyers_funds_are_available(stack: Sta
     stack.at(WEDNESDAY_START)
     assert stack.payments.payment(funding).state == "available"
     payout = stack.payout(auction_id, seller)
-    assert [s["step"] for s in payout["steps"]] == ["held", "released"]
-    assert payout["steps"][1]["effective_at"] == "2026-09-09T04:00:00Z"
+    assert [s["step"] for s in payout["steps"]] == ["reserved", "standard", "released"]
+    assert payout["steps"][2]["effective_at"] == "2026-09-09T04:00:00Z"
     [sent] = payout["payments"]
     assert sent["rail"] == "ach"
     stack.tick()  # the Simulator reports it submitted
@@ -350,7 +357,11 @@ def test_a_payout_waits_for_every_buyer_behind_it(stack: Stack) -> None:
     stack.at(FRIDAY_SETTLEMENT)
     stack.at(WEDNESDAY_START)
 
-    assert [s["step"] for s in stack.payout(closed["auction_id"], seller)["steps"]] == ["held"]
+    assert [s["step"] for s in stack.payout(closed["auction_id"], seller)["steps"]] == [
+        "reserved",
+        "standard",
+    ]
+    assert stack.payout(closed["auction_id"], seller)["waiting_for"] == [unfunded]
 
 
 def test_a_buyer_who_also_sold_must_fund_their_own_purchases(stack: Stack) -> None:
@@ -367,8 +378,12 @@ def test_a_buyer_who_also_sold_must_fund_their_own_purchases(stack: Stack) -> No
     stack.at(FRIDAY_SETTLEMENT)
     stack.at(WEDNESDAY_START)  # Bram's funding is Available; Avery never funded
 
-    assert [s["step"] for s in stack.payout(auction_id, cleo)["steps"]] == ["held", "released"]
-    assert [s["step"] for s in stack.payout(auction_id, bram)["steps"]] == ["held"]
+    assert [s["step"] for s in stack.payout(auction_id, cleo)["steps"]] == [
+        "reserved",
+        "standard",
+        "released",
+    ]
+    assert [s["step"] for s in stack.payout(auction_id, bram)["steps"]] == ["reserved", "standard"]
 
 
 # Instant Payouts
@@ -388,7 +403,7 @@ def test_an_instant_payout_goes_out_over_rtp_at_once_at_mintwharfs_risk(stack: S
         "instant",
         27_000,
     )
-    assert [s["step"] for s in payout["steps"]] == ["instant"]
+    assert [s["step"] for s in payout["steps"]] == ["reserved", "instant"]
     [sent] = payout["payments"]
     assert sent["rail"] == "rtp"
     # The buyer's pull hasn't even settled, and the seller is paid on the next tick.
@@ -399,7 +414,10 @@ def test_an_instant_payout_goes_out_over_rtp_at_once_at_mintwharfs_risk(stack: S
     assert clearing_net(stack, sent["payment_id"]) == 0
     # Nothing more for the release job to do with it, ever.
     stack.at(WEDNESDAY_START)
-    assert [s["step"] for s in stack.payout(closed["auction_id"], seller)["steps"]] == ["instant"]
+    assert [s["step"] for s in stack.payout(closed["auction_id"], seller)["steps"]] == [
+        "reserved",
+        "instant",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -420,8 +438,8 @@ def test_an_instant_payout_over_the_limit_falls_back_to_a_standard_payout(
     payout = stack.payout(closed["auction_id"], seller)
     assert (payout["amount"], payout["requested"], payout["speed"]) == (owed, "instant", speed)
     if speed == "standard":
-        assert [s["step"] for s in payout["steps"]] == ["held"]
-        assert "over the limit" in payout["steps"][0]["detail"]
+        assert [s["step"] for s in payout["steps"]] == ["reserved", "standard"]
+        assert "over the limit" in payout["steps"][1]["detail"]
         assert payout["payments"] == []
         assert stack.balances(seller)["available"] == 0  # held like any Standard Payout
     else:
@@ -471,16 +489,224 @@ def test_a_declined_instant_payout_falls_back_to_a_standard_payout(stack: Stack)
     stack.tick()  # the decline arrives, and the release job falls back at once
     payout = stack.payout(auction_id, seller)
     assert (payout["requested"], payout["speed"]) == ("instant", "standard")
-    assert [s["step"] for s in payout["steps"]] == ["instant", "held"]
-    assert "declined" in payout["steps"][1]["detail"]
+    assert [s["step"] for s in payout["steps"]] == ["reserved", "instant", "standard"]
+    assert "declined" in payout["steps"][2]["detail"]
     assert [(p["rail"], p["state"]) for p in payout["payments"]] == [("rtp", "declined")]
     assert stack.balances(seller) == {"posted": 27_000, "pending": 0, "available": 0}
 
     stack.at(FRIDAY_SETTLEMENT)
     stack.at(WEDNESDAY_START)
     payout = stack.payout(auction_id, seller)
-    assert [s["step"] for s in payout["steps"]] == ["instant", "held", "released"]
+    assert [s["step"] for s in payout["steps"]] == ["reserved", "instant", "standard", "released"]
     assert [p["rail"] for p in payout["payments"]] == ["rtp", "ach"]
     stack.tick()
     stack.at(THURSDAY_AFTER_SETTLEMENT)
     assert stack.balances(seller) == {"posted": 0, "pending": 0, "available": 0}
+
+
+# Proceeds on their way out are never Available (ADR 0012)
+
+
+def fund_now(stack: Stack, customer: str, amount: int) -> None:
+    """Money already Available in the Customer Balance, without an ACH pull."""
+    source = unique("test-funding")
+    stack.journal.open_account(NewAccount(code=source, type=AccountType.ASSET, currency="USD"))
+    stack.journal.post(
+        NewTransaction(
+            idempotency_key=unique("fund-now"),
+            actor=SystemJob(name="test-funding", version="1"),
+            effective_at=THURSDAY_3PM,
+            entries=[
+                NewEntry(account=source, currency="USD", amount=amount),
+                NewEntry(account=customer, currency="USD", amount=-amount),
+            ],
+        )
+    )
+
+
+def steps(stack: Stack, auction_id: str, seller: str) -> list[str]:
+    return [s["step"] for s in stack.payout(auction_id, seller)["steps"]]
+
+
+def reservation(stack: Stack, auction_id: str, seller: str) -> Any:
+    [hold_id] = [s["hold_id"] for s in stack.payout(auction_id, seller)["steps"] if s["hold_id"]]
+    return stack.journal.hold(hold_id)
+
+
+@pytest.fixture
+def bram_sells_then_buys(stack: Stack) -> tuple[str, str, str]:
+    """Zoe (funded) buys Bram's lot; Bram is owed 22,500 and will buy Yuki's lot for 4,000
+    without ever funding it. Returns (bram, yuki, zoe)."""
+    bram, yuki, zoe = stack.customer(), stack.customer(), stack.customer()
+    fund_now(stack, zoe, 25_000)
+    stack.clock.set(THURSDAY_5PM)
+    return bram, yuki, zoe
+
+
+def test_an_instant_payout_not_yet_booked_does_not_fund_its_sellers_purchases(
+    stack: Stack, bram_sells_then_buys: tuple[str, str, str]
+) -> None:
+    """(a) Bram's Instant Payout is decided and sent, but RTP hasn't reported it settled."""
+    bram, yuki, zoe = bram_sells_then_buys
+    sold = stack.close([(zoe, bram, 25_000)], instant_payouts=[bram])
+    assert stack.payout(sold["auction_id"], bram)["speed"] == "instant"
+    assert stack.balances(bram) == {"posted": 22_500, "pending": 0, "available": 0}
+
+    bought = stack.close([(bram, yuki, 4_000)])
+    stack.marketplace.release_payouts()  # no Provider Event yet: the RTP isn't booked
+
+    assert stack.balances(bram)["available"] == -4_000
+    assert steps(stack, bought["auction_id"], yuki) == ["reserved", "standard"]
+    assert stack.payout(bought["auction_id"], yuki)["waiting_for"] == [bram]
+
+    stack.tick()  # RTP settles: the Transaction paying Bram captures the reservation
+    assert reservation(stack, sold["auction_id"], bram).ended.outcome == "captured"
+    assert stack.balances(bram) == {"posted": -4_000, "pending": 0, "available": -4_000}
+    assert steps(stack, bought["auction_id"], yuki) == ["reserved", "standard"]
+
+
+def test_a_declined_instant_payout_does_not_fund_its_sellers_purchases(
+    stack: Stack, bram_sells_then_buys: tuple[str, str, str]
+) -> None:
+    """(b) RTP declined Bram's Instant Payout; the release job hasn't run since."""
+    bram, yuki, zoe = bram_sells_then_buys
+    request = auction([(zoe, bram, 25_000)], instant_payouts=[bram])
+    stack.simulator.plan(
+        PaymentPlan(
+            idempotency_key=f"auction:{request['auction_id']}:payout:{bram}:rtp",
+            rail="rtp",
+            outcome="decline",
+        )
+    )
+    assert stack.ledger.post("/auction-closes", json=request).status_code == 201
+    bought = stack.close([(bram, yuki, 4_000)])
+
+    stack.simulator.tick()  # the decline is applied; the release job hasn't run
+    assert stack.balances(bram)["available"] == -4_000  # the reservation stays
+
+    stack.marketplace.release_payouts()
+    assert steps(stack, request["auction_id"], bram) == ["reserved", "instant", "standard"]
+    assert steps(stack, bought["auction_id"], yuki) == ["reserved", "standard"]
+    # Bram now waits on himself: he owes for Yuki's lot.
+    assert stack.payout(request["auction_id"], bram)["waiting_for"] == [bram]
+
+
+def test_a_released_payout_not_yet_submitted_does_not_fund_its_sellers_purchases(
+    stack: Stack, bram_sells_then_buys: tuple[str, str, str]
+) -> None:
+    """(c) Bram's Standard Payout is released and its ACH push created, but the Provider
+    hasn't reported it submitted (and might not for a long time)."""
+    bram, yuki, zoe = bram_sells_then_buys
+    sold = stack.close([(zoe, bram, 25_000)])
+    stack.marketplace.release_payouts()  # Zoe's money is Available: released
+    assert steps(stack, sold["auction_id"], bram) == ["reserved", "standard", "released"]
+
+    bought = stack.close([(bram, yuki, 4_000)])
+    stack.marketplace.release_payouts()
+
+    assert stack.balances(bram)["available"] == -4_000
+    assert steps(stack, bought["auction_id"], yuki) == ["reserved", "standard"]
+    stack.tick()  # submitted: the pending outflow captures the reservation
+    assert reservation(stack, sold["auction_id"], bram).ended.outcome == "captured"
+    assert stack.balances(bram) == {"posted": 18_500, "pending": -22_500, "available": -4_000}
+    assert steps(stack, bought["auction_id"], yuki) == ["reserved", "standard"]
+
+
+@pytest.mark.parametrize("speed", ["standard", "instant"])
+def test_a_seller_who_owes_for_their_own_purchases_is_not_paid_out(
+    stack: Stack, speed: str
+) -> None:
+    """Bram buys a lot he never funds and sells one to a buyer who has: he isn't paid until
+    he's paid for his own, Instant Payout or not."""
+    bram, yuki, zoe = stack.customer(), stack.customer(), stack.customer()
+    fund_now(stack, zoe, 25_000)
+    stack.clock.set(THURSDAY_5PM)
+    instant = [bram] if speed == "instant" else []
+
+    closed = stack.close([(zoe, bram, 25_000), (bram, yuki, 4_000)], instant_payouts=instant)
+    stack.at(WEDNESDAY_START)
+
+    payout = stack.payout(closed["auction_id"], bram)
+    assert payout["speed"] == "standard"
+    if speed == "instant":
+        assert "owe" in payout["steps"][1]["detail"]
+    assert payout["payments"] == []
+    assert payout["waiting_for"] == [bram]
+    assert stack.balances(bram) == {"posted": 18_500, "pending": 0, "available": -4_000}
+
+    fund_now(stack, bram, 4_000)  # he pays for Yuki's lot: both are paid out
+    stack.tick()
+    assert "released" in steps(stack, closed["auction_id"], bram)
+    assert "released" in steps(stack, closed["auction_id"], yuki)
+
+
+@pytest.mark.parametrize(
+    ("faults", "detail"),
+    [
+        pytest.param((), "reversed", id="declined after submission: the pending outflow reversed"),
+        pytest.param(
+            ({"id": "swap", "kind": "out_of_order", "event": "submitted", "after": "declined"},),
+            "reservation released",
+            id="declined before the Ledger heard it submitted: the reservation released",
+        ),
+    ],
+)
+def test_a_declined_standard_payout_leaves_the_money_with_the_seller(
+    stack: Stack, faults: tuple[dict[str, Any], ...], detail: str
+) -> None:
+    seller, buyer = stack.customer(), stack.customer()
+    fund_now(stack, buyer, 25_000)
+    stack.clock.set(THURSDAY_5PM)
+    request = auction([(buyer, seller, 25_000)])
+    stack.simulator.plan(
+        PaymentPlan.model_validate(
+            {
+                "idempotency_key": f"auction:{request['auction_id']}:payout:{seller}:ach",
+                "outcome": "decline",
+                "faults": list(faults),
+            }
+        )
+    )
+    assert stack.ledger.post("/auction-closes", json=request).status_code == 201
+    stack.tick()  # released and sent
+
+    # Sent after Thursday's Cutoff, the ACH push counts toward Friday and would settle on
+    # Tuesday, after Labor Day: it's declined then instead.
+    stack.at(datetime(2026, 9, 8, 12, 30, tzinfo=UTC))
+    stack.tick()
+
+    payout = stack.payout(request["auction_id"], seller)
+    assert [s["step"] for s in payout["steps"]] == ["reserved", "standard", "released", "returned"]
+    assert detail in payout["steps"][-1]["detail"]
+    assert stack.balances(seller) == {"posted": 22_500, "pending": 0, "available": 22_500}
+
+
+def test_two_auctions_closing_at_once_cannot_both_spend_a_sellers_limit(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each Instant Payout of 27,000 fits the 50,000 limit alone, but not both: whichever
+    auction closes second sees the first's exposure, however close together they are."""
+    seller = stack.customer()
+    buyers = [stack.customer(), stack.customer()]
+    stack.clock.set(THURSDAY_5PM)
+    barrier = Barrier(2)
+    measure = Marketplace._instant_exposure
+
+    def slowly(self: Marketplace, connection: Any, customer: str) -> int:
+        found = measure(self, connection, customer)
+        with suppress(BrokenBarrierError):  # the other close is waiting on the seller's lock
+            barrier.wait(timeout=1)
+        return found
+
+    monkeypatch.setattr(Marketplace, "_instant_exposure", slowly)
+    requests = [
+        NewAuctionClose.model_validate(auction([(buyer, seller, 30_000)], instant_payouts=[seller]))
+        for buyer in buyers
+    ]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        closed = list(pool.map(stack.marketplace.close, requests))
+
+    speeds = sorted(
+        next(p["speed"] for p in c.auction_close.model_dump()["payouts"]) for c in closed
+    )
+    assert speeds == ["instant", "standard"]

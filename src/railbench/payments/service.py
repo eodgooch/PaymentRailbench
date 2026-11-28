@@ -29,16 +29,18 @@ Actor. An ACH pull:
 An ACH push (a Payout) is the mirror image, and is never made Available:
 
 - submitted: a pending Transaction, Customer Balance debit, Clearing Account credit, so the
-  money is an unsettled outflow: still Posted, no longer Available.
+  money is an unsettled outflow: still Posted, no longer Available. If the push names the
+  Hold reserving its amount, this Transaction captures it.
 - settled: its Settlement, and a posted Transaction from Bank Cash to the Clearing Account
-  (Clearing nets to zero; Bank Cash goes down).
+  (the Clearing Account nets to zero; Bank Cash goes down).
 - canceled or declined before settlement: a pending Reversal, so the money is Available in
   the Customer Balance again.
 
 An RTP push is instant and final, `created → settled` or `declined`:
 
-- settled: a posted Transaction, Customer Balance debit, RTP Clearing Account credit, and a
-  posted Transaction from Bank Cash to that Clearing Account, which nets to zero at once.
+- settled: a posted Transaction, Customer Balance debit, RTP Clearing Account credit (it
+  captures the push's reserving Hold, if any), and a posted Transaction from Bank Cash to
+  that Clearing Account, which nets to zero at once.
 - declined: nothing, since nothing was booked.
 
 Applying one event is one database transaction: the Journal runs as a unit of work on the
@@ -50,21 +52,23 @@ Each Journal write still has an Idempotency Key derived from the Payment and the
 
 import logging
 import re
-from collections.abc import Mapping
-from contextlib import suppress
+from collections.abc import Collection, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Connection, Engine, Row, func, insert, select
+from sqlalchemy import Connection, Engine, Row, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from railbench.common.calendar import add_banking_days, banking_day_starts, new_york_date
 from railbench.common.clock import Clock
 from railbench.common.fingerprint import fingerprint as payload_fingerprint
+from railbench.common.locks import LockSpace, lock
 from railbench.ledger.journal import (
     AccountNotFound,
     DuplicateAccount,
+    HoldNotFound,
     Journal,
     LedgerError,
 )
@@ -87,6 +91,7 @@ from railbench.payments.model import (
     Payment,
     PaymentCreated,
     PaymentException,
+    PaymentRef,
     Receipt,
     Transition,
 )
@@ -107,9 +112,6 @@ log = logging.getLogger(__name__)
 ORIGINATION_JOB = SystemJob(name="payment-origination", version="1.0.0")
 AVAILABILITY_JOB = SystemJob(name="ach-availability", version="1.0.0")
 AVAILABLE_AFTER_BANKING_DAYS = 2
-# Payments' advisory locks use the two-key form, a separate space from the Journal's
-# one-key locks on Transaction ids.
-LOCK_SPACE = 4
 
 
 class PaymentsError(Exception):
@@ -130,6 +132,10 @@ class NotACustomerBalance(PaymentsError):
 
 class UnknownProvider(PaymentsError):
     pass
+
+
+class HoldMismatch(PaymentsError):
+    """A push named a Hold that doesn't reserve its amount on its Customer Balance."""
 
 
 class PaymentNotYetKnown(PaymentsError):
@@ -203,6 +209,8 @@ class Payments:
             raise NotACustomerBalance(
                 f"{new.customer_account} is not a {new.currency} Customer Balance"
             )
+        if new.hold_id is not None:
+            self._check_reservation(new)
         self._ensure_account(clearing_account(provider.name, new.rail, new.currency), new)
         self._ensure_account(bank_cash_account(new.currency), new)
 
@@ -232,6 +240,7 @@ class Payments:
                     amount=new.amount,
                     description=new.description,
                     recorded_at=now,
+                    hold_id=new.hold_id,
                 )
                 .on_conflict_do_nothing(index_elements=[payments.c.idempotency_key])
                 .returning(payments.c.id)
@@ -280,6 +289,7 @@ class Payments:
             amount=row.amount,
             description=row.description,
             recorded_at=row.recorded_at,
+            hold_id=row.hold_id,
             state=_current(states),
             available_at=None
             if settled is None or row.direction != "pull"
@@ -301,6 +311,45 @@ class Payments:
                 for e in exceptions
             ],
         )
+
+    def by_keys(
+        self, keys: Collection[str], connection: Connection | None = None
+    ) -> dict[str, PaymentRef]:
+        """The Payments recorded under these Idempotency Keys, by key (a key with no Payment
+        is left out), read on `connection` if given."""
+        if not keys:
+            return {}
+        with self._reading(connection) as reading:
+            rows = reading.execute(
+                select(
+                    payments.c.id, payments.c.idempotency_key, payments.c.rail, payments.c.direction
+                ).where(payments.c.idempotency_key.in_(list(keys)))
+            ).all()
+            states: dict[int, list[PaymentState]] = {}
+            for payment_id, state in reading.execute(
+                select(transitions.c.payment_id, transitions.c.state).where(
+                    transitions.c.payment_id.in_([row.id for row in rows])
+                )
+            ):
+                states.setdefault(payment_id, []).append(PaymentState(state))
+        return {
+            row.idempotency_key: PaymentRef(
+                id=row.id,
+                idempotency_key=row.idempotency_key,
+                rail=row.rail,
+                direction=row.direction,
+                state=_current(states[row.id]),
+            )
+            for row in rows
+        }
+
+    @contextmanager
+    def _reading(self, connection: Connection | None) -> Iterator[Connection]:
+        if connection is not None:
+            yield connection
+        else:
+            with self._engine.connect() as fresh:
+                yield fresh
 
     # The Inbox
 
@@ -433,14 +482,23 @@ class Payments:
         kind = f"{payment.rail.upper()} {payment.direction} {payment.provider_payment_id}"
         bank_cash = bank_cash_account(payment.currency)
         pull = payment.direction == "pull"
-        # Money in: Clearing → Customer Balance, then Bank Cash ← Clearing. Money out (a
-        # Payout): Customer Balance → Clearing, then Clearing ← Bank Cash.
+        # Money in: Clearing Account → Customer Balance, then Clearing Account → Bank Cash.
+        # Money out (a Payout): Customer Balance → Clearing Account, then Bank Cash →
+        # Clearing Account.
         into_customer = legs(clearing, customer) if pull else legs(customer, clearing)
         into_bank_cash = legs(bank_cash, clearing) if pull else legs(clearing, bank_cash)
 
+        def move(new: NewTransaction) -> _Booked:
+            """Post the Transaction that moves the money between the Customer Balance and
+            the Clearing Account. A push's reserving Hold, if any, is captured by it."""
+            if payment.hold_id is None:
+                return _Booked(transaction_id=journal.post(new).transaction.id)
+            captured = journal.capture_hold(payment.hold_id, new).transaction
+            return _Booked(transaction_id=captured.id, hold_id=payment.hold_id)
+
         match (payment.rail, state):
             case ("ach", PaymentState.SUBMITTED):
-                pending = journal.post(
+                return move(
                     NewTransaction(
                         idempotency_key=ledger_key(payment.id, "pending"),
                         actor=actor,
@@ -449,8 +507,7 @@ class Payments:
                         status=TransactionStatus.PENDING,
                         entries=into_customer,
                     )
-                ).transaction
-                return _Booked(transaction_id=pending.id)
+                )
             case ("ach", PaymentState.SETTLED):
                 pending_id = _booked_by(connection, payment.id, PaymentState.SUBMITTED)
                 assert pending_id is not None
@@ -493,7 +550,7 @@ class Payments:
                 ).transaction
                 return _Booked(transaction_id=reversal.id)
             case ("rtp", PaymentState.SETTLED):
-                paid = journal.post(
+                paid = move(
                     NewTransaction(
                         idempotency_key=ledger_key(payment.id, "settled"),
                         actor=actor,
@@ -501,9 +558,9 @@ class Payments:
                         description=f"{kind} settled",
                         entries=into_customer,
                     )
-                ).transaction
+                )
                 self._sweep(journal, payment, actor, event, kind, into_bank_cash)
-                return _Booked(transaction_id=paid.id)
+                return paid
             case ("rtp", PaymentState.DECLINED):
                 return _Booked()  # nothing was booked, so nothing to undo
         raise AssertionError(f"a Provider Event can't book {state}")
@@ -609,6 +666,21 @@ class Payments:
             raise PaymentConflict(f"Idempotency Key {key!r} was used for a different Payment")
         return self.payment(original.id)
 
+    def _check_reservation(self, new: NewPayment) -> None:
+        assert new.hold_id is not None
+        try:
+            hold = self._journal.hold(new.hold_id)
+        except HoldNotFound as error:
+            raise HoldMismatch(f"no Hold {new.hold_id}") from error
+        if (hold.account, hold.currency, hold.amount) != (
+            new.customer_account,
+            new.currency,
+            new.amount,
+        ):
+            raise HoldMismatch(
+                f"Hold {new.hold_id} doesn't reserve {new.amount} on {new.customer_account}"
+            )
+
     def _ensure_account(self, code: str, new: NewPayment) -> None:
         try:
             self._journal.account(code)
@@ -701,4 +773,4 @@ def _append_transition(
 def _lock(connection: Connection, payment_id: int) -> None:
     """Serialise applying events to one Payment until this commit ends (an advisory lock:
     the app role has no UPDATE, so no row locks)."""
-    connection.execute(select(func.pg_advisory_xact_lock(LOCK_SPACE, payment_id % 2_147_483_647)))
+    lock(connection, LockSpace.PAYMENT, payment_id)
