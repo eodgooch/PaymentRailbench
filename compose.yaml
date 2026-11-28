@@ -5,7 +5,12 @@ x-railbench: &railbench
   environment:
     DATABASE_URL: postgresql+psycopg://railbench:railbench@postgres:5432/railbench
     SIMULATOR_URL: http://simulator:8100
+    LEDGER_WEBHOOK_URL: http://ledger:8000/providers/simulator/events
     WEBHOOK_SIGNING_SECRET: ${WEBHOOK_SIGNING_SECRET:-change-me}
+    # On the wall clock: the Simulator settles and delivers every second, and the Ledger
+    # checks every few seconds for ACH funds due to become Available.
+    SIMULATOR_TICK_SECONDS: ${SIMULATOR_TICK_SECONDS:-1}
+    LEDGER_TICK_SECONDS: ${LEDGER_TICK_SECONDS:-5}
     LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
 services:

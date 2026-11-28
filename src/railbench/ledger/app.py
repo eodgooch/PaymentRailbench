@@ -8,17 +8,30 @@ Reversal, Settlement, release or capture of the same thing is a 409.
 
 Balances are read at an Effective Time, as known at a Recorded Time (default now): both are
 query parameters and must carry a UTC offset.
+
+Payments (`railbench.payments`) are served here too: `POST /payments` asks a Provider for an
+ACH pull, `GET /payments/{id}` reads one, and `POST /providers/{provider}/events` is the
+webhook receiver for Provider Events. The receiver answers 401 to a webhook whose signature
+doesn't verify, 400 to a verified body it can't read, and 503 (retry later) to an event for a
+Payment it hasn't recorded yet.
 """
 
+import logging
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Query, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import AwareDatetime
 from sqlalchemy import Engine
 
 from railbench.common.clock import Clock
 from railbench.common.service import create_service_app
+from railbench.common.settings import Settings
+from railbench.common.signing import BadSignature
+from railbench.common.ticker import ticking
 from railbench.ledger.journal import Conflict, Journal, LedgerError, NotFound, Rejected
 from railbench.ledger.model import (
     Account,
@@ -33,8 +46,14 @@ from railbench.ledger.model import (
     SettlementRequest,
     Transaction,
 )
+from railbench.payments.model import NewPayment, Payment, Receipt
+from railbench.payments.provider import MalformedEvent, Provider, ProviderError, SimulatorProvider
+from railbench.payments.service import PaymentNotYetKnown, Payments
+
+log = logging.getLogger(__name__)
 
 ERROR_STATUS = {
+    PaymentNotYetKnown: status.HTTP_503_SERVICE_UNAVAILABLE,
     NotFound: status.HTTP_404_NOT_FOUND,
     Conflict: status.HTTP_409_CONFLICT,
     Rejected: status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -58,13 +77,47 @@ def get_journal(request: Request) -> Journal:
 JournalDep = Annotated[Journal, Depends(get_journal)]
 
 
-def create_app(engine: Engine, clock: Clock) -> FastAPI:
-    app = create_service_app("ledger", engine, clock)
-    app.state.journal = Journal(engine, clock)
+def get_payments(request: Request) -> Payments:
+    payments: Payments = request.app.state.payments
+    return payments
+
+
+PaymentsDep = Annotated[Payments, Depends(get_payments)]
+
+
+def create_app(
+    engine: Engine,
+    clock: Clock,
+    settings: Settings | None = None,
+    providers: Mapping[str, Provider] | None = None,
+) -> FastAPI:
+    """The Ledger API. `providers` defaults to the Simulator at SIMULATOR_URL."""
+    settings = settings or Settings()
+    if providers is None:
+        simulator = SimulatorProvider(
+            settings.simulator_url, settings.webhook_signing_secret.get_secret_value()
+        )
+        providers = {simulator.name: simulator}
+    journal = Journal(engine, clock)
+    payments = Payments(engine, clock, journal, providers)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        with ticking("ach-availability", payments.make_available, settings.ledger_tick_seconds):
+            yield
+
+    app = create_service_app("ledger", engine, clock, lifespan=lifespan)
+    app.state.journal = journal
+    app.state.payments = payments
+    app.state.providers = providers
 
     @app.exception_handler(LedgerError)
     def ledger_error(_request: Request, error: LedgerError) -> JSONResponse:
         return JSONResponse(status_code=error_status(error), content={"detail": str(error)})
+
+    @app.exception_handler(ProviderError)
+    def provider_error(_request: Request, error: ProviderError) -> JSONResponse:
+        return JSONResponse(status_code=status.HTTP_502_BAD_GATEWAY, content={"detail": str(error)})
 
     @app.post("/accounts", status_code=status.HTTP_201_CREATED)
     def open_account(new: NewAccount, journal: JournalDep) -> Account:
@@ -153,6 +206,35 @@ def create_app(engine: Engine, clock: Clock) -> FastAPI:
         hold_id: int, new: NewTransaction, journal: JournalDep, response: Response
     ) -> Transaction:
         return _respond_posted(journal.capture_hold(hold_id, new), response)
+
+    @app.post(
+        "/payments",
+        status_code=status.HTTP_201_CREATED,
+        responses={200: {"description": "A retry: the original Payment", "model": Payment}},
+    )
+    def create_payment(new: NewPayment, payments: PaymentsDep, response: Response) -> Payment:
+        created = payments.originate(new)
+        return _respond(
+            created.replayed,
+            created.payment,
+            response,
+            location=f"/payments/{created.payment.id}",
+        )
+
+    @app.get("/payments/{payment_id}")
+    def get_payment(payment_id: int, payments: PaymentsDep) -> Payment:
+        return payments.payment(payment_id)
+
+    @app.post("/providers/{provider}/events", responses={401: {}, 400: {}, 503: {}})
+    async def receive_event(provider: str, request: Request, payments: PaymentsDep) -> Receipt:
+        body = await request.body()
+        try:
+            return await run_in_threadpool(payments.receive, provider, body, dict(request.headers))
+        except BadSignature as error:
+            log.warning("refused an unsigned webhook", extra={"provider": provider})
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(error)) from error
+        except MalformedEvent as error:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(error)) from error
 
     return app
 
