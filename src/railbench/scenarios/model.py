@@ -15,9 +15,20 @@ the Simulator gets a plan for each Payment the Payout could make (`<payout>:rtp`
 `<payout>:ach`), under the Idempotency Keys the Ledger will use, and a Fault lands on every
 one of them that emits its event.
 
-Fault kinds are a discriminated union on `kind`, shared with the Simulator. A new kind
-(Cutoff and Settlement Report Faults, #8) is one more variant in that union plus the
-Simulator's case for injecting it; the rest of the Scenario file stays as it is.
+Fault kinds are a discriminated union on `kind`. Adding one takes four edits: its plan
+model in the Simulator's `FaultPlan` union (`railbench.simulator.model`), the Simulator's
+case for injecting it, a Scenario subclass here that adds the Payment it names (joined to
+`ScenarioFault`), and its case in `_plain`; any checks it needs against other Faults or the
+Payment's size go in `PaymentPlan`'s validators.
+
+Settlement Report Faults (`missing_report_line`, `wrong_report_amount`,
+`settlement_after_cutoff`, `provider_adjustment`, `orphan_adjustment`; ADR 0014) name a
+Payment or Payout that settles and act on its line in the Provider's Settlement Report
+(an orphan adjustment adds a line for a Payment the Provider never made), never on a
+Provider Event.
+Their sizes are checked against what the Payment moves (a Payout's is its seller's proceeds
+less Mintwharf's fee): a wrong amount stays above zero, an adjustment claws back at most what
+settled, and only a Payout is recalled.
 
 A `return` Fault returns an ACH pull with a NACHA return code, `at` after it settles
 (ADR 0013). The Scenario knows when each pull settles (the Ledger originates it at `at` after
@@ -37,21 +48,29 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validato
 
 from railbench.ledger.model import BIGINT_MAX
 from railbench.marketplace.model import payout_key
-from railbench.payments.service import customer_balance_account
+from railbench.marketplace.service import seller_fee
+from railbench.payments.accounts import customer_balance_account
 from railbench.simulator.model import (
     DelayedDelivery,
     DuplicateDelivery,
     EventName,
     FaultPlan,
+    MissingReportLine,
+    OrphanAdjustment,
     Outcome,
     OutOfOrderDelivery,
     PaymentPlan,
+    PlannedAdjustment,
     PlannedReturn,
+    SettlementAfterCutoff,
+    WrongReportAmount,
     events_for,
 )
 from railbench.simulator.provider import ach_settles_at
 
 Slug = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,39}$")]
+# The Ledger's seller fee when a Scenario doesn't set one (Settings.seller_fee_bps).
+DEFAULT_SELLER_FEE_BPS = 1_000
 RANDOM_PREFIX = "random-"
 
 
@@ -143,7 +162,38 @@ class Return(PlannedReturn, _OnPayment):
     pass
 
 
-ScenarioFault = Annotated[Duplicate | Delay | OutOfOrder | Return, Field(discriminator="kind")]
+class MissingLine(MissingReportLine, _OnPayment):
+    pass
+
+
+class WrongAmount(WrongReportAmount, _OnPayment):
+    pass
+
+
+class AfterCutoff(SettlementAfterCutoff, _OnPayment):
+    pass
+
+
+class Adjustment(PlannedAdjustment, _OnPayment):
+    pass
+
+
+class Orphan(OrphanAdjustment, _OnPayment):
+    """An orphan adjustment, on the report of the Banking Day `after` the named Payment's."""
+
+
+ScenarioFault = Annotated[
+    Duplicate
+    | Delay
+    | OutOfOrder
+    | Return
+    | MissingLine
+    | WrongAmount
+    | AfterCutoff
+    | Adjustment
+    | Orphan,
+    Field(discriminator="kind"),
+]
 FaultKind = Literal["duplicate", "delay", "out_of_order"]
 
 
@@ -210,8 +260,24 @@ class Scenario(_Strict):
                 raise ValueError(f"Fault ids starting {RANDOM_PREFIX!r} are kept for random ones")
             if isinstance(fault, Return):
                 self._check_return(fault)
-        self.plans(self.seed)  # every Fault fits the Payment it's on
+        self._check_sizes(self.plans(self.seed))  # every Fault fits the Payment it's on
         return self
+
+    def _check_sizes(self, plans: dict[str, PaymentPlan]) -> None:
+        moves = {p.id: ("pull", p.amount) for p in self.payments}
+        fee_bps = DEFAULT_SELLER_FEE_BPS if self.seller_fee_bps is None else self.seller_fee_bps
+        for close in self.auction_closes:
+            for payout in close.payouts:
+                owed = sum(
+                    lot.hammer_price - seller_fee(lot.hammer_price, fee_bps)
+                    for lot in close.lots
+                    if lot.seller == payout.seller
+                )
+                for rail in payout.rails():
+                    moves[f"{payout.id}:{rail}"] = ("push", owed)
+        for name, plan in plans.items():
+            direction, amount = moves[name]
+            plan.check_against(direction, amount)
 
     def _check_return(self, fault: "Return") -> None:
         pull = next((p for p in self.payments if p.id == fault.payment), None)
@@ -349,6 +415,16 @@ def _plain(fault: ScenarioFault) -> FaultPlan:
             return OutOfOrderDelivery(**data)
         case Return():
             return PlannedReturn(**data)
+        case MissingLine():
+            return MissingReportLine(**data)
+        case WrongAmount():
+            return WrongReportAmount(**data)
+        case AfterCutoff():
+            return SettlementAfterCutoff(**data)
+        case Adjustment():
+            return PlannedAdjustment(**data)
+        case Orphan():
+            return OrphanAdjustment(**data)
 
 
 def load(path: Path | str) -> Scenario:

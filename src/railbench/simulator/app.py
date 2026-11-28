@@ -8,11 +8,15 @@ returns a settled ACH pull now with a NACHA return code (201; 409 if it can't be
 422 outside the code's Return Window or for an unknown code): a control endpoint for tests
 and demos, as a Provider's sandbox would have. Provider Events go out as signed
 webhooks to LEDGER_WEBHOOK_URL whenever `Simulator.tick()` runs: every
-SIMULATOR_TICK_SECONDS in a running service, by hand in tests.
+SIMULATOR_TICK_SECONDS in a running service, by hand in tests. The same loop publishes each
+Banking Day's Settlement Report when it's due; `GET /settlement-reports/{provider}/{date}`
+serves one as `text/csv`, signed like a webhook (the `Railbench-Signature` header over the
+body), or 404 if it isn't published (ADR 0014).
 """
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import date
 
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from sqlalchemy import Engine
@@ -21,12 +25,14 @@ from railbench.common.clock import Clock
 from railbench.common.returns import UnknownReturnCode
 from railbench.common.service import create_service_app
 from railbench.common.settings import Settings
+from railbench.common.signing import SIGNATURE_HEADER
 from railbench.common.ticker import ticking
 from railbench.simulator.model import PaymentRequest, ReturnRequest, SimulatedPayment
 from railbench.simulator.provider import (
     IdempotencyConflict,
     PaymentNotFound,
     PlanMismatch,
+    ReportNotFound,
     ReturnOutsideWindow,
     ReturnRefused,
     Simulator,
@@ -53,9 +59,13 @@ def create_app(
         signing_secret=settings.webhook_signing_secret.get_secret_value(),
     )
 
+    def tick() -> None:
+        simulator.tick()
+        simulator.publish_reports()
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        with ticking("simulator", simulator.tick, settings.simulator_tick_seconds):
+        with ticking("simulator", tick, settings.simulator_tick_seconds):
             yield
 
     app = create_service_app("simulator", engine, clock, lifespan=lifespan)
@@ -101,5 +111,21 @@ def create_app(
             raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
         except (ReturnOutsideWindow, UnknownReturnCode) as error:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(error)) from error
+
+    @app.get(
+        "/settlement-reports/{provider}/{report_date}",
+        response_class=Response,
+        responses={200: {"content": {"text/csv": {}}}, 404: {}},
+    )
+    def get_settlement_report(provider: str, report_date: date) -> Response:
+        try:
+            body = simulator.settlement_report(provider, report_date)
+        except ReportNotFound as error:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(error)) from error
+        return Response(
+            content=body,
+            media_type="text/csv",
+            headers={SIGNATURE_HEADER: simulator.sign(body)},
+        )
 
     return app

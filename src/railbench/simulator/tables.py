@@ -1,7 +1,17 @@
-"""SQLAlchemy Core views of the Simulator's tables (migrations 0005-0008 are the source of
+"""SQLAlchemy Core views of the Simulator's tables (migrations 0005-0009 are the source of
 truth)."""
 
-from sqlalchemy import BigInteger, Column, DateTime, Integer, MetaData, Table, Text
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    Date,
+    DateTime,
+    Integer,
+    LargeBinary,
+    MetaData,
+    Table,
+    Text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 
 from railbench.common.db import SIMULATOR_SCHEMA
@@ -77,4 +87,14 @@ faults = Table(
     _time("injected_at", nullable=False),
     Column("cause_code", Text, nullable=False),
     Column("root_cause", Text, nullable=False),
+)
+
+settlement_reports = Table(
+    "settlement_reports",
+    metadata,
+    Column("id", BigInteger, primary_key=True),
+    Column("provider", Text, nullable=False),
+    Column("report_date", Date, nullable=False),
+    _time("published_at", nullable=False),
+    Column("body", LargeBinary, nullable=False),
 )

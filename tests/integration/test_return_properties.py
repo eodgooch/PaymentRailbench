@@ -24,9 +24,10 @@ from railbench.common.db import LEDGER_APP_ROLE, make_engine
 from railbench.common.signing import SIGNATURE_HEADER, sign
 from railbench.ledger.journal import AccountNotFound, Journal
 from railbench.ledger.model import AccountType, NewAccount, NewEntry, NewTransaction, SystemJob
+from railbench.payments.accounts import recovery_receivable_account
 from railbench.payments.model import NewPayment
 from railbench.payments.provider import SimulatorProvider
-from railbench.payments.service import Payments, recovery_receivable_account
+from railbench.payments.service import Payments
 from railbench.scenarios.runner import fresh_database
 from tests.integration.helpers import END_OF_TIME
 

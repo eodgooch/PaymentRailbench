@@ -199,7 +199,8 @@ named by their Customer Balance) and the sellers asking for an Instant Payout:
 
 A Payout's steps, each at most once, are `reserved`, then `instant` or `standard`, then
 `released` (sent over ACH) and, if its ACH Payment ended without moving money, `returned`.
-The Ledger's ticker (`LEDGER_TICK_SECONDS`) runs ACH availability and then Payout release.
+The Ledger's ticker (`LEDGER_TICK_SECONDS`) runs ACH availability, then Payout release, then
+Settlement Report ingest.
 `SELLER_FEE_BPS` extends SPEC §13. Auction Closes, lots, Payouts and Payout steps are
 append-only in the `marketplace` schema (migration `0007`).
 
@@ -241,6 +242,53 @@ every Clearing Account at zero, and an Inbox replay that reproduces the Ledger (
 `scenarios/duplicate-settlement-after-return.yaml` redelivers a settlement after its Return:
 the Inbox recognises it and nothing changes.
 
+## Settlement Reports and Provider Adjustments
+
+The Simulator publishes one **Settlement Report** per Provider per Banking Day, as CSV, at
+20:00 New York, listing what settled and any **Provider Adjustments** (SPEC §4.5, §6,
+ADR 0014). The format and Cutoffs are a shared contract (`railbench.common.settlement_reports`):
+
+```csv
+report_date,provider,line_id,type,provider_payment_id,idempotency_key,rail,direction,currency,amount,settled_at,original_line_id,reason
+2026-09-04,simulator,simline_…,settlement,simpay_…,scenario:…:wren-funding,ach,pull,USD,59500,2026-09-04T12:30:00Z,,
+2026-09-04,simulator,simline_…,adjustment,simpay_…,auction:…:rtp,rtp,push,USD,2000,2026-09-04T16:00:00Z,simline_…,payout_recall
+```
+
+`amount` is signed integer Minor Units, + into Mintwharf's account at the Provider and -
+out. A settlement counts toward its Banking Day if it happened before the Provider's
+**Cutoff** for its Rail (ACH 16:00, RTP 18:00 New York, fictional), otherwise toward the next
+Banking Day, so weekend and holiday RTP lands on the next one. A day with nothing settled
+still gets a header-only report. `GET /settlement-reports/{provider}/{date}` on the Simulator
+serves one, signed with the webhook signature header; the same Scenario and seed give
+byte-identical reports (tested).
+
+Report Faults, in Scenarios and the Fault Manifest like the others:
+
+```yaml
+faults:
+  - {id: short, kind: wrong_report_amount, payment: wren-funding, by: -500}
+  - {id: gone, kind: missing_report_line, payment: pax-funding}
+  - {id: late, kind: settlement_after_cutoff, payment: jules-funding}
+  - {id: fee, kind: provider_adjustment, payment: wren-funding, amount: 150, reason: fee_correction, after: 2}
+  - {id: recall, kind: provider_adjustment, payment: ottoline-payout, amount: 2000, reason: payout_recall}
+  - {id: stranger, kind: orphan_adjustment, payment: pax-funding, amount: 450}
+```
+
+The Ledger's `settlement-report-ingest` job fetches each due report through the Provider
+interface, verifies the signature, and stores it raw and as lines, once per report (the same
+bytes again do nothing; a different report for an ingested day is kept as a `conflict`, an
+unreadable one as `malformed`). Lines change no balance: a missing, wrong or late line is
+evidence for Reconciliation. A Provider Adjustment is booked against the original Payment,
+through its Clearing Account: a fee correction from Bank Cash to Provider Fees (Mintwharf
+bears it), a Payout recall pulled back from the recipient into Bank Cash and credited to
+the seller's Customer Balance (Mintwharf owes them that part again). One for a Payment the
+Ledger hasn't heard settled yet is kept `pending` and decided again on every run of the job;
+one with no matching Payment (an `orphan_adjustment` Fault makes one), contradicting it, or
+for a Payment that ended without settling is stored `unmatched`, never booked.
+`GET /settlement-reports/{provider}/{date}` on the Ledger lists what it received, and
+`GET /payments/{id}` shows a Payment's adjustments. `scenarios/settlement-report-faults.yaml`
+has every report Fault; replaying it reproduces the Ledger, adjustments included (tested).
+
 ## Scenarios and delivery Faults
 
 A **Scenario** is a named, seeded YAML file of Customers, ACH pulls, Auction Closes and
@@ -266,8 +314,10 @@ and, per seller, a Payout's `speed` and how its RTP and ACH Payments end
 on whichever of its Payments emits the event. Random Faults are drawn from the seed before
 the run (for pulls only); Payment and event IDs are derived from
 Idempotency Keys, and the runner jumps the ManualClock from one due moment to the next, so a
-Scenario and seed replay exactly (tested: two runs, one in a database already holding another
-run, give the same manifest, ticks and Ledger; another seed gives other Faults). A webhook
+Scenario and seed replay exactly in a fresh database (tested: two runs give the same manifest,
+ticks, Settlement Reports and Ledger; another seed gives other Faults). The runner refuses a
+database that isn't fresh: a Settlement Report covers every Payment settled that day, so a
+second run in one database would find its reports already published (ADR 0014). A webhook
 that fails or times out (60 s) fails the run rather than being retried off course.
 
 ```sh
@@ -304,7 +354,7 @@ recorded), reproduces the Ledger exactly, Recorded Times included.
 - `src/railbench/marketplace`: Auction Closes, Payouts and the Payout release job; served by
   the Ledger API
 - `src/railbench/simulator`: the Simulator, a separate service (ADR 0005), with ACH and RTP,
-  scripted endings and delivery Faults
+  scripted endings, delivery Faults, and Settlement Reports with their Faults
 - `src/railbench/scenarios`: Scenario files, the runner and CLI, the Fault Manifest, the
   Inbox replay and the Ledger summary they're compared by
 - `scenarios/`: the committed Scenario files
@@ -313,7 +363,8 @@ recorded), reproduces the Ledger exactly, Recorded Times included.
   and the `railbench_app` role; `0003` adds Transaction status, Settlements and Holds;
   `0004` adds Payments, the Inbox and state changes; `0005` the Simulator's state; `0006`
   its plans, delivery Faults and the Fault Manifest; `0007` pushes and RTP, and the
-  `marketplace` schema; `0008` Returns and return exceptions.
+  `marketplace` schema; `0008` Returns and return exceptions; `0009` Settlement Reports,
+  their lines and Provider Adjustments.
 
 Nothing reads the system time directly: code takes a `Clock` (`WallClock` by default,
 `ManualClock` in tests and Scenarios), and a ruff rule bans `datetime.now()` and friends

@@ -40,22 +40,39 @@ can be returned: RTP has no Returns, and a Payout's Return isn't simulated. A Re
 Fault in the manifest: cause `late_return` once the 2-Banking-Day window (and so the
 Ledger's availability) has passed, `ach_return` inside it. Delivery Faults act on the
 `payment.returned` event like any other.
+
+Settlement Reports (ADR 0014): `publish_reports()` publishes, for every Banking Day from the
+first a Payment was created on, the Provider's Settlement Report once it's due (20:00 New
+York on that day, `railbench.common.settlement_reports`), built from what settled
+(`railbench.simulator.reports`) and frozen as published, with its report Faults written to
+the Fault Manifest. `next_report_due()` says when the next report with anything on it is
+due, so a Scenario run ticks then and goes quiet afterwards. `settlement_report()` reads a
+published one; the API serves it signed like a webhook.
 """
 
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from itertools import takewhile
 from typing import Any
 
 import httpx
 from sqlalchemy import Connection, Engine, Row, and_, exists, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from railbench.common.calendar import at_new_york, is_banking_day, new_york_date, next_banking_day
+from railbench.common.calendar import (
+    at_new_york,
+    banking_day_on_or_after,
+    banking_days_from,
+    is_banking_day,
+    new_york_date,
+    next_banking_day,
+)
 from railbench.common.clock import Clock
 from railbench.common.fingerprint import fingerprint as payload_fingerprint
 from railbench.common.returns import ReturnCode, is_late, return_code
+from railbench.common.settlement_reports import cutoff, report_published_at
 from railbench.common.signing import SIGNATURE_HEADER, sign
 from railbench.simulator.model import (
     FINAL_EVENT,
@@ -71,11 +88,15 @@ from railbench.simulator.model import (
     PaymentRequest,
     PaymentStatus,
     PlannedReturn,
+    ReportFault,
     SimulatedPayment,
 )
-from railbench.simulator.tables import events, faults, payments, plans
+from railbench.simulator.reports import Settled, build_report, content_days
+from railbench.simulator.tables import events, faults, payments, plans, settlement_reports
 
-ACH_CUTOFF = time(16, 0)
+# The one Provider the Simulator plays today: its name in Settlement Reports.
+PROVIDER = "simulator"
+ACH_CUTOFF = cutoff(PROVIDER, "ach")
 ACH_SETTLEMENT_TIME = time(8, 30)
 FIRST_RETRY = timedelta(seconds=30)
 LONGEST_RETRY = timedelta(hours=1)
@@ -113,6 +134,10 @@ class ReturnRefused(Exception):
 
 class ReturnOutsideWindow(ValueError):
     """A Return outside its code's Return Window."""
+
+
+class ReportNotFound(LookupError):
+    """No Settlement Report published for that Provider and Banking Day (yet)."""
 
 
 # The manifest's id for a Return injected by hand through `return_payment()`.
@@ -206,6 +231,11 @@ class Simulator:
                     f"{request.idempotency_key!r} was planned as {plan.rail}, not {request.rail}"
                 )
             planned_return = None if plan is None else plan.planned_return
+            if plan is not None:
+                try:
+                    plan.check_against(request.direction, request.amount)
+                except ValueError as error:
+                    raise PlanMismatch(f"{request.idempotency_key!r}: {error}") from error
             if planned_return is not None and request.direction != "pull":
                 raise PlanMismatch(
                     f"{request.idempotency_key!r} plans a Return: only an ACH pull is returned"
@@ -375,6 +405,119 @@ class Simulator:
             self._return(connection, row.id, code, now, by_hand=True)
         return self.payment(public_id)
 
+    # Settlement Reports
+
+    def publish_reports(self) -> None:
+        """Publish every Banking Day's Settlement Report that's due by the Clock and not
+        published yet, from the first Banking Day a Payment was created on: empty reports
+        too, so a missing report is never mistaken for a quiet day."""
+        now = self._clock.now()
+        with self._engine.begin() as connection:
+            first = self._first_report_day(connection)
+            if first is None:
+                return
+            published = self._published_days(connection)
+            due = takewhile(lambda d: report_published_at(d) <= now, banking_days_from(first))
+            missing = [d for d in due if d not in published]
+            if not missing:
+                return
+            settled = _settled(connection)
+            for day in missing:
+                self._publish(connection, day, settled)
+
+    def next_report_due(self) -> datetime | None:
+        """When the next Settlement Report that lists anything (or shows a report Fault) is
+        due, if one is still to publish. None when every such report has been published."""
+        with self._engine.connect() as connection:
+            first = self._first_report_day(connection)
+            if first is None:
+                return None
+            published = self._published_days(connection)
+            last = max(
+                (day for p in _settled(connection) for day in content_days(PROVIDER, p)),
+                default=None,
+            )
+        if last is None:
+            return None
+        for day in banking_days_from(first, until=last):
+            if day not in published:
+                return report_published_at(day)
+        return None
+
+    def settlement_report(self, provider: str, day: date) -> bytes:
+        """A published Settlement Report's CSV, as published. Raises ReportNotFound."""
+        with self._engine.connect() as connection:
+            body = connection.scalar(
+                select(settlement_reports.c.body).where(
+                    settlement_reports.c.provider == provider,
+                    settlement_reports.c.report_date == day,
+                )
+            )
+        if body is None:
+            raise ReportNotFound(f"no {provider} Settlement Report for {day.isoformat()}")
+        return bytes(body)
+
+    def published_reports(self, provider: str) -> dict[date, bytes]:
+        """Every Settlement Report published for the Provider, by Banking Day."""
+        with self._engine.connect() as connection:
+            rows = connection.execute(
+                select(settlement_reports.c.report_date, settlement_reports.c.body)
+                .where(settlement_reports.c.provider == provider)
+                .order_by(settlement_reports.c.report_date)
+            ).all()
+        return {row.report_date: bytes(row.body) for row in rows}
+
+    def sign(self, body: bytes) -> str:
+        """The signature header value for a response body, signed now (ADR 0010)."""
+        return sign(self._secret, body, self._clock.now())
+
+    def _publish(self, connection: Connection, day: date, settled: list[Settled]) -> None:
+        built = build_report(PROVIDER, day, settled)
+        published_at = report_published_at(day)
+        inserted = connection.scalar(
+            pg_insert(settlement_reports)
+            .values(provider=PROVIDER, report_date=day, published_at=published_at, body=built.body)
+            .on_conflict_do_nothing(
+                index_elements=[settlement_reports.c.provider, settlement_reports.c.report_date]
+            )
+            .returning(settlement_reports.c.id)
+        )
+        if inserted is None:  # a concurrent tick published it first
+            return
+        for found in built.injected:
+            connection.execute(
+                pg_insert(faults)
+                .values(
+                    fault_id=found.fault.id,
+                    kind=found.fault.kind,
+                    payment_id=found.payment.id,
+                    event_id=found.line_id,
+                    event_type=found.event_type,
+                    params=found.params,
+                    injected_at=published_at,
+                    cause_code=found.cause_code,
+                    root_cause=found.root_cause,
+                )
+                .on_conflict_do_nothing(index_elements=[faults.c.payment_id, faults.c.fault_id])
+            )
+
+    @staticmethod
+    def _first_report_day(connection: Connection) -> date | None:
+        created = connection.scalar(select(func.min(payments.c.created_at)))
+        if created is None:
+            return None
+        return banking_day_on_or_after(new_york_date(created))
+
+    @staticmethod
+    def _published_days(connection: Connection) -> set[date]:
+        return set(
+            connection.scalars(
+                select(settlement_reports.c.report_date).where(
+                    settlement_reports.c.provider == PROVIDER
+                )
+            )
+        )
+
     def tick(self) -> None:
         """Do what's due by the Clock: settle ACH Payments, return the ones planned to be,
         then deliver webhooks."""
@@ -476,7 +619,11 @@ class Simulator:
         copies: list[DuplicateDelivery] = []
         injected: list[_Injected] = []
         held_by: str | None = None
-        planned = self._faults_for(connection, row.idempotency_key, type_)
+        planned = [
+            fault
+            for fault in self._faults_for(connection, row.idempotency_key, type_)
+            if not isinstance(fault, ReportFault)  # those act on the report, not the event
+        ]
         if by_hand:
             assert returned is not None
             planned = [f for f in planned if not isinstance(f, PlannedReturn)]
@@ -617,6 +764,33 @@ def _stored_plan(connection: Connection, idempotency_key: str) -> PaymentPlan | 
             "faults": stored.faults,
         }
     )
+
+
+def _settled(connection: Connection) -> list[Settled]:
+    """Every Payment the Simulator settled (a returned one too), with its planned Faults."""
+    rows = connection.execute(
+        select(payments, plans.c.faults)
+        .outerjoin(plans, plans.c.idempotency_key == payments.c.idempotency_key)
+        .where(payments.c.settled_at.is_not(None))
+        .order_by(payments.c.id)
+    ).all()
+    found = []
+    for row in rows:
+        plan = None if row.faults is None else _stored_plan(connection, row.idempotency_key)
+        found.append(
+            Settled(
+                id=row.id,
+                public_id=row.public_id,
+                idempotency_key=row.idempotency_key,
+                rail=row.rail,
+                direction=row.direction,
+                currency=row.currency,
+                amount=row.amount,
+                settled_at=row.settled_at,
+                faults=() if plan is None else plan.report_faults,
+            )
+        )
+    return found
 
 
 def _planned_return(planned: PlannedReturn, settles_at: datetime) -> dict[str, Any]:

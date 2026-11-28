@@ -13,12 +13,16 @@ row by something stable instead:
 - Payments by Idempotency Key;
 - a Provider Event Actor by the Provider event ID instead of its Inbox row ID;
 - Auction Closes by auction ID, their lots by lot ID and their Payouts by seller, each lot's
-  Transaction and each Payout step's Hold by Idempotency Key.
+  Transaction and each Payout step's Hold by Idempotency Key;
+- Settlement Reports by `<provider>:<report date>`, every version received in order, with
+  its lines as stated and every decision about each Provider Adjustment (pending, booked,
+  unmatched) with its Payment (by Idempotency Key) and Transaction (by its key).
 
 `accounts` narrows the summary to the Payments funding those Customer Balances and the
 Ledger rows that touch them or belong to those Payments, for databases shared with other
-work (the property tests), and to the Auction Closes whose lots touch them. Without it, the
-whole Ledger is summarised.
+work (the property tests), and to the Auction Closes whose lots touch them, and leaves
+Settlement Reports out (a report covers every Payment). Without it, the whole Ledger is
+summarised.
 """
 
 from collections.abc import Collection
@@ -29,12 +33,16 @@ from sqlalchemy import Connection, Engine, select
 
 from railbench.ledger.tables import accounts, entries, hold_ends, holds, settlements, transactions
 from railbench.marketplace.tables import auction_closes, lots, payout_steps, payouts
-from railbench.payments.service import parse_ledger_key
+from railbench.payments.accounts import parse_ledger_key
+from railbench.payments.reports import LINE_FIELDS
 from railbench.payments.tables import (
     inbox,
     inbox_outcomes,
     payments,
+    provider_adjustments,
     return_exceptions,
+    settlement_report_lines,
+    settlement_reports,
     transitions,
 )
 
@@ -103,6 +111,60 @@ class _Summariser:
             "transactions": dict(sorted(found_transactions.items())),
             "holds": self._holds(),
             "auction_closes": self._auction_closes(),
+            "settlement_reports": self._settlement_reports(),
+        }
+
+    def _settlement_reports(self) -> dict[str, Any]:
+        if self._scope is not None:
+            return {}
+        line_rows = self._c.execute(
+            select(settlement_report_lines).order_by(
+                settlement_report_lines.c.report_id, settlement_report_lines.c.position
+            )
+        ).all()
+        decisions: dict[int, list[Any]] = {}
+        for row in self._c.execute(
+            select(provider_adjustments).order_by(provider_adjustments.c.id)
+        ):
+            decisions.setdefault(row.line_id, []).append(row)
+        keys = {row.id: row.idempotency_key for row in self._c.execute(select(payments))}
+        found: dict[str, list[Any]] = {}
+        reports = self._c.execute(select(settlement_reports).order_by(settlement_reports.c.id))
+        for report in reports:
+            found.setdefault(f"{report.provider}:{report.report_date.isoformat()}", []).append(
+                {
+                    "body_sha256": report.body_sha256,
+                    "outcome": report.outcome,
+                    "detail": report.detail,
+                    "received_at": _time(report.received_at),
+                    "lines": [
+                        {
+                            "position": line.position,
+                            **{
+                                name: _time(value) if isinstance(value, datetime) else value
+                                for name in LINE_FIELDS
+                                for value in (getattr(line, name),)
+                            },
+                            "adjustments": [
+                                self._adjustment(row, keys) for row in decisions.get(line.id, [])
+                            ],
+                        }
+                        for line in line_rows
+                        if line.report_id == report.id
+                    ],
+                }
+            )
+        return dict(sorted(found.items()))
+
+    def _adjustment(self, row: Any, keys: dict[int, str]) -> dict[str, Any]:
+        return {
+            "outcome": row.outcome,
+            "payment": None if row.payment_id is None else keys[row.payment_id],
+            "transaction": None
+            if row.transaction_id is None
+            else self._key(self._transaction_key(row.transaction_id)),
+            "detail": row.detail,
+            "recorded_at": _time(row.recorded_at),
         }
 
     def _auction_closes(self) -> dict[str, Any]:

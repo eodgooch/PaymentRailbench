@@ -1,13 +1,15 @@
 """What the Payments API accepts and returns. Money is a strict integer in Minor Units."""
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Annotated, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from railbench.common.returns import NachaReturnCode
+from railbench.common.settlement_reports import AdjustmentReason
 from railbench.ledger.model import BIGINT_MAX, AccountCode, Currency, IdempotencyKey
+from railbench.payments.provider import LineType
 from railbench.payments.state_machine import Direction, PaymentState, Rail
 
 
@@ -85,6 +87,29 @@ class ReturnException(_Value):
     recorded_at: datetime
 
 
+class AdjustmentOutcome(StrEnum):
+    # Its Payment is known and agrees, but hasn't settled in the Ledger yet: tried again on
+    # every run of the ingest job until it's booked or unmatched.
+    PENDING = "pending"
+    BOOKED = "booked"  # booked against the original Payment
+    UNMATCHED = "unmatched"  # stored, never booked: evidence for Reconciliation
+
+
+class ProviderAdjustment(_Value):
+    """What the Ledger did with one Provider Adjustment line of a Settlement Report."""
+
+    report_date: date
+    line_id: str
+    reason: AdjustmentReason
+    amount: int  # signed, as reported: + into Mintwharf's account, - out of it
+    effective_at: datetime
+    outcome: AdjustmentOutcome
+    payment_id: int | None
+    transaction_id: int | None
+    detail: str
+    recorded_at: datetime
+
+
 class Payment(_Value):
     id: int
     idempotency_key: str
@@ -105,6 +130,8 @@ class Payment(_Value):
     transitions: list[Transition]
     exceptions: list[PaymentException]
     return_exceptions: list[ReturnException]
+    # Provider Adjustments reported against it, each as last decided (ADR 0014).
+    adjustments: list[ProviderAdjustment] = []
 
 
 class PaymentRef(_Value):
@@ -130,3 +157,48 @@ class Receipt(_Value):
     duplicate: bool  # this event ID was already in the Inbox
     outcome: Outcome
     detail: str = ""
+
+
+class ReportOutcome(StrEnum):
+    INGESTED = "ingested"  # its lines stored, its Provider Adjustments booked or not
+    CONFLICT = "conflict"  # differs from the report already ingested for the day: kept raw
+    MALFORMED = "malformed"  # not a report the Provider adapter can read: kept raw
+
+
+class ReportLineView(_Value):
+    """A Settlement Report line as the Provider stated it, and for an adjustment line what
+    the Ledger did with it."""
+
+    position: int
+    line_id: str
+    type: LineType
+    provider_payment_id: str
+    idempotency_key: str
+    rail: Rail
+    direction: Direction
+    currency: str
+    amount: int
+    settled_at: datetime
+    original_line_id: str | None
+    reason: AdjustmentReason | None
+    # What the Ledger last decided about an adjustment line (pending, booked or unmatched).
+    adjustment: ProviderAdjustment | None
+
+
+class SettlementReportView(_Value):
+    id: int
+    provider: str
+    report_date: date
+    body_sha256: str
+    received_at: datetime
+    outcome: ReportOutcome
+    detail: str
+    lines: list[ReportLineView]
+
+
+class ReportReceipt(_Value):
+    """What receiving one Settlement Report did. `duplicate`: these exact bytes were
+    already stored for the day, so nothing was done."""
+
+    report: SettlementReportView
+    duplicate: bool

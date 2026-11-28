@@ -2,12 +2,15 @@
 observance rules (checked against federalreserve.gov/aboutthefed/k8.htm, 2026-2030)."""
 
 from datetime import UTC, date, datetime
+from itertools import islice
 
 import pytest
 
 from railbench.common.calendar import (
     add_banking_days,
+    banking_day_on_or_after,
     banking_day_starts,
+    banking_days_from,
     fed_holidays,
     is_banking_day,
     next_banking_day,
@@ -108,3 +111,14 @@ def test_a_banking_day_starts_at_midnight_in_new_york() -> None:
     # Eastern Daylight Time in September (UTC-4), Eastern Standard Time in January (UTC-5).
     assert banking_day_starts(date(2026, 9, 9)) == datetime(2026, 9, 9, 4, 0, tzinfo=UTC)
     assert banking_day_starts(date(2027, 1, 4)) == datetime(2027, 1, 4, 5, 0, tzinfo=UTC)
+
+
+def test_banking_days_walk_from_the_first_on_or_after_a_day() -> None:
+    saturday = date(2026, 9, 5)  # Monday 7 September is Labor Day
+    assert banking_day_on_or_after(saturday) == date(2026, 9, 8)
+    assert banking_day_on_or_after(date(2026, 9, 4)) == date(2026, 9, 4)
+    assert list(islice(banking_days_from(saturday), 2)) == [date(2026, 9, 8), date(2026, 9, 9)]
+    assert list(banking_days_from(date(2026, 9, 4), until=date(2026, 9, 8))) == [
+        date(2026, 9, 4),
+        date(2026, 9, 8),
+    ]

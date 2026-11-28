@@ -13,8 +13,12 @@ from railbench.scenarios.model import Scenario, load
 from railbench.simulator.model import (
     DelayedDelivery,
     DuplicateDelivery,
+    MissingReportLine,
     OutOfOrderDelivery,
+    PlannedAdjustment,
     PlannedReturn,
+    SettlementAfterCutoff,
+    WrongReportAmount,
 )
 
 SCENARIOS = Path(__file__).parents[2] / "scenarios"
@@ -304,3 +308,92 @@ def test_a_return_that_cannot_happen_is_refused(faults: list[dict[str, Any]]) ->
 def test_a_payout_is_never_returned() -> None:
     with pytest.raises(ValidationError, match="pull"):
         with_auction(faults=[a_return("R03", "PT1H", payment="bram-payout")])
+
+
+# Settlement Report Faults in a Scenario (ADR 0014). BASE's first pull is 25,000; in AUCTION,
+# with the default 10% fee, Bram is owed 22,500 and Cleo 3,600.
+
+
+def test_report_faults_are_planned_for_the_payment_they_name() -> None:
+    found = with_auction(
+        faults=[
+            {"id": "gone", "kind": "missing_report_line", "payment": "first"},
+            {
+                "id": "fee",
+                "kind": "provider_adjustment",
+                "payment": "first",
+                "amount": 300,
+                "reason": "fee_correction",
+                "after": 2,
+            },
+            {
+                "id": "recall",
+                "kind": "provider_adjustment",
+                "payment": "cleo-payout",
+                "amount": 3_600,
+                "reason": "payout_recall",
+            },
+            {"id": "late", "kind": "settlement_after_cutoff", "payment": "bram-payout"},
+            {"id": "off", "kind": "wrong_report_amount", "payment": "cleo-payout", "by": -3_599},
+        ]
+    )
+
+    plans = found.plans(7)
+
+    assert plans["first"].faults == (
+        MissingReportLine(id="gone"),
+        PlannedAdjustment(id="fee", amount=300, reason="fee_correction", after=2),
+    )
+    assert plans["bram-payout:ach"].faults == (SettlementAfterCutoff(id="late"),)
+    # Cleo's RTP is declined, so only the ACH fall-back settles and is reported.
+    assert plans["cleo-payout:rtp"].faults == ()
+    assert [f.id for f in plans["cleo-payout:ach"].faults] == ["recall", "off"]
+    assert plans["cleo-payout:ach"].faults[1] == WrongReportAmount(id="off", by=-3_599)
+
+
+@pytest.mark.parametrize(
+    ("fault", "why"),
+    [
+        pytest.param(
+            {"kind": "missing_report_line", "payment": "second"}, "settles", id="a declined pull"
+        ),
+        pytest.param(
+            {"kind": "wrong_report_amount", "payment": "first", "by": -25_000},
+            "above 0",
+            id="an amount down to zero",
+        ),
+        pytest.param({"kind": "wrong_report_amount", "payment": "first", "by": 0}, "differ"),
+        pytest.param(
+            {"kind": "provider_adjustment", "payment": "bram-payout", "amount": 22_501},
+            "claw back",
+            id="more than the Payout",
+        ),
+        pytest.param(
+            {
+                "kind": "provider_adjustment",
+                "payment": "first",
+                "amount": 1,
+                "reason": "payout_recall",
+            },
+            "only a Payout",
+            id="a pull recalled",
+        ),
+    ],
+)
+def test_a_report_fault_that_cannot_happen_is_refused(fault: dict[str, Any], why: str) -> None:
+    fault = {"id": "f", "reason": "fee_correction", **fault}
+    if fault["kind"] != "provider_adjustment":
+        fault.pop("reason")
+
+    with pytest.raises(ValidationError, match=why):
+        with_auction(faults=[fault])
+
+
+def test_a_report_line_is_missing_wrong_or_late_but_only_one_of_them() -> None:
+    with pytest.raises(ValidationError, match="only one"):
+        scenario(
+            faults=[
+                {"id": "a", "kind": "missing_report_line", "payment": "first"},
+                {"id": "b", "kind": "settlement_after_cutoff", "payment": "first"},
+            ]
+        )
