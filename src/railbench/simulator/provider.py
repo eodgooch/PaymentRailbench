@@ -12,25 +12,48 @@ Nothing happens on its own: `tick()` settles what's due by the Clock and deliver
 events. A delivery that doesn't get a 2xx (or doesn't connect, or times out) is retried
 after 30 s, then 60 s, doubling to at most an hour, and abandoned after MAX_ATTEMPTS.
 Events go out in the order they were emitted, claimed briefly and POSTed outside any
-database transaction, so a slow receiver holds no locks. Faults (duplicates, reordering, delays) and
-Returns join in later issues.
+database transaction, so a slow receiver holds no locks.
+
+A Scenario scripts a Payment before creating it (`plan()`, ADR 0011): how it ends (settles,
+or is declined or canceled at the time it would have settled) and which delivery Faults to
+inject. The Faults act on the outbox when the event is emitted: a duplicate adds more
+delivery rows with the same event ID and body; a delay pushes the first attempt out; an
+out-of-order Fault holds the event until a later event of the same Payment has been
+delivered. Each injected Fault is written to the fault manifest (`faults()`) with its true
+root cause. Event IDs are derived from the Payment's Idempotency Key and the event type, so
+a Scenario run names its events the same way every time. Returns join in #7.
 """
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
 
 import httpx
-from sqlalchemy import Connection, Engine, Row, insert, select, update
+from sqlalchemy import Connection, Engine, Row, and_, exists, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from railbench.common.calendar import at_new_york, is_banking_day, new_york_date, next_banking_day
 from railbench.common.clock import Clock
 from railbench.common.fingerprint import fingerprint as payload_fingerprint
 from railbench.common.signing import SIGNATURE_HEADER, sign
-from railbench.simulator.model import EventType, PaymentRequest, PaymentStatus, SimulatedPayment
-from railbench.simulator.tables import events, payments
+from railbench.simulator.model import (
+    FINAL_EVENT,
+    STATUS_FOR_OUTCOME,
+    DelayedDelivery,
+    DuplicateDelivery,
+    EventName,
+    EventType,
+    FaultPlan,
+    InjectedFault,
+    OutOfOrderDelivery,
+    PaymentPlan,
+    PaymentRequest,
+    PaymentStatus,
+    SimulatedPayment,
+)
+from railbench.simulator.tables import events, faults, payments, plans
 
 ACH_CUTOFF = time(16, 0)
 ACH_SETTLEMENT_TIME = time(8, 30)
@@ -49,6 +72,10 @@ class IdempotencyConflict(Exception):
     """The Idempotency Key was already used with a different payload."""
 
 
+class PlanConflict(Exception):
+    """A different plan was already made for this Idempotency Key."""
+
+
 @dataclass(frozen=True)
 class Delivery:
     event_id: str
@@ -65,6 +92,17 @@ def ach_settles_at(submitted_at: datetime) -> datetime:
     if not is_banking_day(day) or at_new_york(day, ACH_CUTOFF) <= submitted_at:
         day = next_banking_day(day)
     return at_new_york(next_banking_day(day), ACH_SETTLEMENT_TIME)
+
+
+def event_id_for(idempotency_key: str, type_: EventType) -> str:
+    """The Provider event ID of a Payment's event of this type: one per (Payment, type), the
+    same in every run of a Scenario, whatever the database's sequences say."""
+    digest = hashlib.sha256(f"{idempotency_key}\x00{type_}".encode()).hexdigest()
+    return f"simevt_{digest[:24]}"
+
+
+def _event_type(name: EventName) -> EventType:
+    return EventType(f"payment.{name}")
 
 
 def retry_delay(attempts: int) -> timedelta:
@@ -93,6 +131,9 @@ class Simulator:
         fingerprint = payload_fingerprint(request.model_dump(exclude={"idempotency_key"}))
         now = self._clock.now()
         with self._engine.begin() as connection:
+            outcome = connection.scalar(
+                select(plans.c.outcome).where(plans.c.idempotency_key == request.idempotency_key)
+            )
             payment_id = connection.scalar(
                 pg_insert(payments)
                 .values(
@@ -104,6 +145,7 @@ class Simulator:
                     amount=request.amount,
                     reference=request.reference,
                     status=PaymentStatus.SUBMITTED,
+                    outcome=outcome or "settle",
                     created_at=now,
                     submitted_at=now,
                     settles_at=ach_settles_at(now),
@@ -122,6 +164,67 @@ class Simulator:
                 f"Idempotency Key {request.idempotency_key!r} was used with another payload"
             )
         return _payment(row), payment_id is None
+
+    def plan(self, plan: PaymentPlan) -> None:
+        """Script the Payment that will be created under `plan.idempotency_key`. Planning
+        the same thing twice is fine; a different plan for the same key is a PlanConflict.
+        A Payment created without a plan settles, with no Faults."""
+        faults_json = [fault.model_dump(mode="json") for fault in plan.faults]
+        with self._engine.begin() as connection:
+            connection.execute(
+                pg_insert(plans)
+                .values(
+                    idempotency_key=plan.idempotency_key, outcome=plan.outcome, faults=faults_json
+                )
+                .on_conflict_do_nothing(index_elements=[plans.c.idempotency_key])
+            )
+            stored = connection.execute(
+                select(plans.c.outcome, plans.c.faults).where(
+                    plans.c.idempotency_key == plan.idempotency_key
+                )
+            ).one()
+        if (stored.outcome, stored.faults) != (plan.outcome, faults_json):
+            raise PlanConflict(f"{plan.idempotency_key!r} already has a different plan")
+
+    def faults(self) -> list[InjectedFault]:
+        """The fault manifest: every Fault injected so far, in the order it was injected."""
+        with self._engine.connect() as connection:
+            rows = connection.execute(
+                select(faults, payments.c.idempotency_key)
+                .join(payments, payments.c.id == faults.c.payment_id)
+                .order_by(faults.c.id)
+            ).all()
+        return [
+            InjectedFault(
+                fault_id=row.fault_id,
+                kind=row.kind,
+                payment_id=_public_id(row.payment_id),
+                idempotency_key=row.idempotency_key,
+                event_id=row.event_id,
+                event_type=row.event_type,
+                params=row.params,
+                injected_at=row.injected_at,
+                cause_code=row.cause_code,
+                root_cause=row.root_cause,
+            )
+            for row in rows
+        ]
+
+    def next_due(self) -> datetime | None:
+        """When `tick()` next has something to do: a Payment to settle or end, or a webhook
+        to deliver. None when nothing is waiting. An event held for out-of-order delivery
+        isn't due until the event it waits for has gone."""
+        with self._engine.connect() as connection:
+            settling = connection.scalar(
+                select(func.min(payments.c.settles_at)).where(
+                    payments.c.status == PaymentStatus.SUBMITTED
+                )
+            )
+            delivering = connection.scalar(
+                select(func.min(events.c.next_attempt_at)).where(_deliverable())
+            )
+        due = [moment for moment in (settling, delivering) if moment is not None]
+        return min(due) if due else None
 
     def payment(self, public_id: str) -> SimulatedPayment:
         with self._engine.connect() as connection:
@@ -142,7 +245,7 @@ class Simulator:
             ).all()
         return [
             Delivery(
-                event_id=_event_id(row.id),
+                event_id=row.event_id,
                 type=row.type,
                 attempts=row.attempts,
                 delivered=row.delivered_at is not None,
@@ -158,48 +261,115 @@ class Simulator:
         self._deliver_due()
 
     def _settle_due(self) -> None:
+        """Settle, or decline or cancel as planned, every submitted Payment that's due: the
+        planned ending happens at the time the Payment would have settled."""
         now = self._clock.now()
         with self._engine.begin() as connection:
             due = connection.execute(
-                select(payments.c.id, payments.c.settles_at)
+                select(payments.c.id, payments.c.settles_at, payments.c.outcome)
                 .where(payments.c.status == PaymentStatus.SUBMITTED, payments.c.settles_at <= now)
                 .order_by(payments.c.id)
                 .with_for_update(skip_locked=True)
             ).all()
-            for payment_id, settles_at in due:
+            for payment_id, settles_at, outcome in due:
+                status = STATUS_FOR_OUTCOME[outcome]
+                ended = (
+                    {"settled_at": settles_at} if outcome == "settle" else {"ended_at": settles_at}
+                )
                 connection.execute(
                     update(payments)
                     .where(payments.c.id == payment_id)
-                    .values(status=PaymentStatus.SETTLED, settled_at=settles_at)
+                    .values(status=status, **ended)
                 )
-                self._emit(connection, payment_id, EventType.SETTLED, settles_at)
+                self._emit(connection, payment_id, _event_type(FINAL_EVENT[outcome]), settles_at)
 
     def _emit(
         self, connection: Connection, payment_id: int, type_: EventType, occurred_at: datetime
     ) -> None:
+        """Freeze a Provider Event into the outbox, with any Faults planned for it."""
         row = connection.execute(select(payments).where(payments.c.id == payment_id)).one()
-        event_id = connection.scalar(
-            insert(events)
-            .values(
-                payment_id=payment_id,
-                type=type_,
-                occurred_at=occurred_at,
-                body="",
-                next_attempt_at=self._clock.now(),
-            )
-            .returning(events.c.id)
+        now = self._clock.now()
+        event_id = event_id_for(row.idempotency_key, type_)
+        body = json.dumps(
+            {
+                "event_id": event_id,
+                "type": type_,
+                "occurred_at": occurred_at,
+                "payment": _payment(row).model_dump(mode="json"),
+            },
+            default=_iso,
+            separators=(",", ":"),
         )
-        body = {
-            "event_id": _event_id(event_id),
+        delivery: dict[str, Any] = {
+            "payment_id": payment_id,
+            "event_id": event_id,
             "type": type_,
             "occurred_at": occurred_at,
-            "payment": _payment(row).model_dump(mode="json"),
+            "body": body,
+            "next_attempt_at": now,
         }
-        connection.execute(
-            update(events)
-            .where(events.c.id == event_id)
-            .values(body=json.dumps(body, default=_iso, separators=(",", ":")))
+        copies: list[DuplicateDelivery] = []
+        injected: list[tuple[FaultPlan, str, str]] = []
+        for fault in self._faults_for(connection, row.idempotency_key, type_):
+            match fault:
+                case DelayedDelivery(by=by):
+                    delivery["next_attempt_at"] += by
+                    cause = (
+                        f"The Simulator held Provider Event {event_id} ({type_}) back for {by} "
+                        "past when it was due (a delayed webhook)."
+                    )
+                    injected.append((fault, "delayed_delivery", cause))
+                case OutOfOrderDelivery(after=after):
+                    later = _event_type(after)
+                    delivery["after_event_id"] = event_id_for(row.idempotency_key, later)
+                    cause = (
+                        f"The Simulator held Provider Event {event_id} ({type_}) until "
+                        f"{delivery['after_event_id']} ({later}) had been delivered, so the "
+                        "Ledger heard of the later state first (out-of-order webhooks)."
+                    )
+                    injected.append((fault, "out_of_order_delivery", cause))
+                case DuplicateDelivery(times=times):
+                    copies.append(fault)
+                    cause = (
+                        f"The Simulator delivered Provider Event {event_id} ({type_}) "
+                        f"{times + 1} times with the same event ID and body (a duplicate "
+                        "webhook)."
+                    )
+                    injected.append((fault, "duplicate_delivery", cause))
+        held_by = next((f.id for f, _, _ in injected if not isinstance(f, DuplicateDelivery)), None)
+        connection.execute(insert(events).values(**delivery, fault_id=held_by))
+        for copy in copies:
+            connection.execute(insert(events), [{**delivery, "fault_id": copy.id}] * copy.times)
+        for fault, cause_code, root_cause in injected:
+            connection.execute(
+                insert(faults).values(
+                    fault_id=fault.id,
+                    kind=fault.kind,
+                    payment_id=payment_id,
+                    event_id=event_id,
+                    event_type=type_,
+                    params=fault.model_dump(mode="json", exclude={"id", "kind", "event"}),
+                    injected_at=now,
+                    cause_code=cause_code,
+                    root_cause=root_cause,
+                )
+            )
+
+    @staticmethod
+    def _faults_for(
+        connection: Connection, idempotency_key: str, type_: EventType
+    ) -> list[FaultPlan]:
+        stored = connection.execute(
+            select(plans.c.outcome, plans.c.faults).where(
+                plans.c.idempotency_key == idempotency_key
+            )
+        ).one_or_none()
+        if stored is None:
+            return []
+        plan = PaymentPlan.model_validate(
+            {"idempotency_key": idempotency_key, "outcome": stored.outcome, "faults": stored.faults}
         )
+        return [f for f in plan.faults if _event_type(f.event) == type_]
 
     def _deliver_due(self) -> None:
         """Claim the due events in one short commit, POST each outside any transaction, and
@@ -211,11 +381,7 @@ class Simulator:
         with self._engine.begin() as connection:
             claimed = connection.execute(
                 select(events.c.id, events.c.body, events.c.attempts)
-                .where(
-                    events.c.delivered_at.is_(None),
-                    events.c.abandoned_at.is_(None),
-                    events.c.next_attempt_at <= now,
-                )
+                .where(_deliverable(), events.c.next_attempt_at <= now)
                 .order_by(events.c.id)
                 .with_for_update(skip_locked=True)
             ).all()
@@ -259,9 +425,29 @@ class Simulator:
         return f"HTTP {response.status_code}"
 
 
+def _deliverable() -> Any:
+    """An outbox row still to deliver, and not held back for an event yet to go."""
+    sent = events.alias("sent")
+    return and_(
+        events.c.delivered_at.is_(None),
+        events.c.abandoned_at.is_(None),
+        or_(
+            events.c.after_event_id.is_(None),
+            exists().where(
+                sent.c.event_id == events.c.after_event_id,
+                or_(sent.c.delivered_at.is_not(None), sent.c.abandoned_at.is_not(None)),
+            ),
+        ),
+    )
+
+
+def _public_id(internal: int) -> str:
+    return f"simpay_{internal}"
+
+
 def _payment(row: Row[Any]) -> SimulatedPayment:
     return SimulatedPayment(
-        id=f"simpay_{row.id}",
+        id=_public_id(row.id),
         idempotency_key=row.idempotency_key,
         rail=row.rail,
         direction=row.direction,
@@ -272,6 +458,7 @@ def _payment(row: Row[Any]) -> SimulatedPayment:
         created_at=row.created_at,
         submitted_at=row.submitted_at,
         settled_at=row.settled_at,
+        ended_at=row.ended_at,
     )
 
 
@@ -280,10 +467,6 @@ def _internal_id(public_id: str) -> int:
     if prefix != "simpay" or not number.isdigit():
         raise PaymentNotFound(public_id)
     return int(number)
-
-
-def _event_id(internal: int) -> str:
-    return f"simevt_{internal}"
 
 
 def _iso(value: object) -> str:

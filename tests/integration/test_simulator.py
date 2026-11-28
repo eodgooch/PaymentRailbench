@@ -17,7 +17,8 @@ from railbench.common.clock import ManualClock
 from railbench.common.settings import Settings
 from railbench.common.signing import SIGNATURE_HEADER, verify
 from railbench.simulator.app import create_app
-from railbench.simulator.provider import Simulator
+from railbench.simulator.model import EventType, PaymentPlan
+from railbench.simulator.provider import PlanConflict, Simulator, event_id_for
 from tests.integration.helpers import unique
 from tests.integration.servers import serving
 
@@ -239,3 +240,164 @@ def test_an_unreachable_webhook_url_is_retried(
     delivery = simulator(client).deliveries(payment["id"])
     assert [(d.attempts, d.delivered) for d in delivery] == [(1, False)]
     assert delivery[0].last_error != ""
+
+
+# Scripted outcomes and delivery Faults (SPEC §6, ADR 0011)
+
+
+def planned(client: TestClient, outcome: str = "settle", *faults: dict[str, Any]) -> str:
+    """Plan a Payment at the Simulator and create it; returns its Simulator ID."""
+    key = unique("scripted")
+    simulator(client).plan(
+        PaymentPlan.model_validate(
+            {"idempotency_key": key, "outcome": outcome, "faults": list(faults)}
+        )
+    )
+    found: str = create(client, ach_pull(key))["id"]
+    return found
+
+
+def received(receiver: Receiver, payment_id: str) -> list[tuple[str, str]]:
+    return [(event["type"], event["event_id"]) for event in events_for(receiver, payment_id)]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "status", "event"),
+    [("decline", "declined", "payment.declined"), ("cancel", "canceled", "payment.canceled")],
+)
+def test_a_planned_decline_or_cancellation_ends_the_payment_instead_of_settling(
+    client: TestClient,
+    clock: ManualClock,
+    receiver: Receiver,
+    outcome: str,
+    status: str,
+    event: str,
+) -> None:
+    payment_id = planned(client, outcome)
+
+    clock.set(FRIDAY_SETTLEMENT)
+    simulator(client).tick()
+
+    found = client.get(f"/payments/{payment_id}").json()
+    assert (found["status"], found["settled_at"]) == (status, None)
+    assert found["ended_at"] == "2026-09-04T12:30:00Z"
+    assert [type_ for type_, _ in received(receiver, payment_id)] == ["payment.submitted", event]
+
+
+def test_an_event_id_is_derived_from_the_idempotency_key_and_the_event_type(
+    client: TestClient, receiver: Receiver
+) -> None:
+    payment = create(client, ach_pull("pull-with-a-known-key-" + unique("k")))
+    simulator(client).tick()
+
+    [(_, event_id)] = received(receiver, payment["id"])
+    assert event_id == event_id_for(payment["idempotency_key"], EventType.SUBMITTED)
+    assert event_id_for("a", EventType.SUBMITTED) != event_id_for("a", EventType.SETTLED)
+    assert event_id_for("a", EventType.SUBMITTED) == event_id_for("a", EventType.SUBMITTED)
+
+
+def test_a_duplicate_fault_delivers_the_same_event_again(
+    client: TestClient, receiver: Receiver
+) -> None:
+    payment_id = planned(
+        client, "settle", {"id": "dup", "kind": "duplicate", "event": "submitted", "times": 2}
+    )
+    simulator(client).tick()
+
+    bodies = [raw for raw, _ in receiver.received if json.loads(raw)["payment"]["id"] == payment_id]
+    assert len(bodies) == 3
+    assert len(set(bodies)) == 1  # the same event ID and the same bytes
+
+
+def test_a_delay_fault_holds_the_event_back_on_the_clock(
+    client: TestClient, clock: ManualClock, receiver: Receiver
+) -> None:
+    payment_id = planned(
+        client, "settle", {"id": "late", "kind": "delay", "event": "submitted", "by": "PT2H"}
+    )
+
+    simulator(client).tick()
+    clock.advance(timedelta(hours=2) - timedelta(seconds=1))
+    simulator(client).tick()
+    assert received(receiver, payment_id) == []
+    assert simulator(client).next_due() == THURSDAY_AFTERNOON + timedelta(hours=2)
+
+    clock.advance(timedelta(seconds=1))
+    simulator(client).tick()
+    assert [type_ for type_, _ in received(receiver, payment_id)] == ["payment.submitted"]
+
+
+def test_an_out_of_order_fault_delivers_the_later_event_first(
+    client: TestClient, clock: ManualClock, receiver: Receiver
+) -> None:
+    payment_id = planned(
+        client,
+        "settle",
+        {"id": "swap", "kind": "out_of_order", "event": "submitted", "after": "settled"},
+    )
+
+    simulator(client).tick()
+    assert received(receiver, payment_id) == []
+    # Held, so it isn't due: the next thing due is the settlement.
+    assert simulator(client).next_due() == FRIDAY_SETTLEMENT
+
+    clock.set(FRIDAY_SETTLEMENT)
+    simulator(client).tick()
+    simulator(client).tick()
+    assert [type_ for type_, _ in received(receiver, payment_id)] == [
+        "payment.settled",
+        "payment.submitted",
+    ]
+
+
+def test_every_injected_fault_is_in_the_manifest_with_its_root_cause(
+    client: TestClient, clock: ManualClock
+) -> None:
+    payment_id = planned(
+        client,
+        "decline",
+        {"id": "dup", "kind": "duplicate", "event": "declined"},
+        {"id": "swap", "kind": "out_of_order", "event": "submitted", "after": "declined"},
+    )
+    clock.set(FRIDAY_SETTLEMENT)
+    simulator(client).tick()
+
+    manifest = [f for f in simulator(client).faults() if f.payment_id == payment_id]
+    assert [(f.fault_id, f.kind, f.event_type, f.cause_code) for f in manifest] == [
+        ("swap", "out_of_order", "payment.submitted", "out_of_order_delivery"),
+        ("dup", "duplicate", "payment.declined", "duplicate_delivery"),
+    ]
+    swap, dup = manifest
+    assert swap.injected_at == THURSDAY_AFTERNOON
+    assert dup.injected_at == FRIDAY_SETTLEMENT
+    assert swap.event_id in swap.root_cause and "payment.declined" in swap.root_cause
+    assert dup.params == {"times": 1}
+
+
+def test_a_plan_cannot_fault_an_event_its_payment_never_emits() -> None:
+    with pytest.raises(ValueError, match="never emits"):
+        PaymentPlan.model_validate(
+            {
+                "idempotency_key": "k",
+                "outcome": "decline",
+                "faults": [{"id": "d", "kind": "duplicate", "event": "settled"}],
+            }
+        )
+    with pytest.raises(ValueError, match="not emitted after"):
+        PaymentPlan.model_validate(
+            {
+                "idempotency_key": "k",
+                "faults": [
+                    {"id": "o", "kind": "out_of_order", "event": "settled", "after": "submitted"}
+                ],
+            }
+        )
+
+
+def test_a_payment_is_planned_once(client: TestClient) -> None:
+    plan = PaymentPlan(idempotency_key=unique("once"), outcome="decline")
+    simulator(client).plan(plan)
+    simulator(client).plan(plan)  # the same plan again is fine
+
+    with pytest.raises(PlanConflict):
+        simulator(client).plan(plan.model_copy(update={"outcome": "cancel"}))
