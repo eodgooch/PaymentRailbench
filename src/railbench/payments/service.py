@@ -62,7 +62,6 @@ Each Journal write still has an Idempotency Key derived from the Payment and the
 """
 
 import logging
-import re
 from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -97,20 +96,25 @@ from railbench.ledger.model import (
     SystemJob,
     TransactionStatus,
 )
+from railbench.payments.accounts import (
+    bank_cash_account,
+    clearing_account,
+    ledger_key,
+    recovery_receivable_account,
+)
 from railbench.payments.model import (
-    AdjustmentOutcome,
     NewPayment,
     Outcome,
     Payment,
     PaymentCreated,
     PaymentException,
     PaymentRef,
-    ProviderAdjustment,
     Receipt,
     ReturnException,
     Transition,
 )
 from railbench.payments.provider import PaymentOrder, Provider, ProviderEvent
+from railbench.payments.reports import payment_adjustments
 from railbench.payments.state_machine import (
     ENDS_BEFORE_SETTLEMENT,
     MAIN_PATH,
@@ -124,10 +128,7 @@ from railbench.payments.tables import (
     inbox,
     inbox_outcomes,
     payments,
-    provider_adjustments,
     return_exceptions,
-    settlement_report_lines,
-    settlement_reports,
     transitions,
 )
 
@@ -164,41 +165,6 @@ class HoldMismatch(PaymentsError):
 
 class PaymentNotYetKnown(PaymentsError):
     """A Provider Event for a Payment the Ledger hasn't recorded yet. Retry later."""
-
-
-def clearing_account(provider: str, rail: str, currency: str) -> str:
-    """The Clearing Account for one Provider, Rail and currency (SPEC §3.1)."""
-    return f"clearing:{provider}:{rail}:{currency.lower()}"
-
-
-def customer_balance_account(customer_id: str, currency: str) -> str:
-    """The Customer Balance of one Customer in one currency (SPEC §3.1)."""
-    return f"customer:{customer_id}:{currency.lower()}"
-
-
-_LEDGER_KEY = re.compile(r"^payment:(\d+):(.+)$")
-
-
-def ledger_key(payment_id: int, step: str) -> str:
-    """The Idempotency Key of the Ledger row a Payment's step books, e.g. its pending
-    Transaction or its availability Hold."""
-    return f"payment:{payment_id}:{step}"
-
-
-def parse_ledger_key(key: str) -> tuple[int, str] | None:
-    """The Payment id and step in a `ledger_key`, or None for any other key."""
-    match = _LEDGER_KEY.match(key)
-    return None if match is None else (int(match.group(1)), match.group(2))
-
-
-def recovery_receivable_account(customer_account: str) -> str:
-    """The Recovery Receivable for one Customer Balance (one Customer, one currency): what
-    that Customer owes Mintwharf after a Return left their balance short (SPEC §3.1)."""
-    return f"recovery-receivable:{customer_account}"
-
-
-def bank_cash_account(currency: str) -> str:
-    return f"bank-cash:{currency.lower()}"
 
 
 def available_at(settled_at: datetime) -> datetime:
@@ -315,12 +281,7 @@ class Payments:
                 .order_by(inbox_outcomes.c.id)
             ).all()
             raised = _return_exceptions(connection, return_exceptions.c.payment_id == payment_id)
-            adjusted = [
-                adjustment_view(row)
-                for row in connection.execute(
-                    adjustments_query().where(provider_adjustments.c.payment_id == payment_id)
-                )
-            ]
+            adjusted = payment_adjustments(connection, payment_id)
         states = [PaymentState(step.state) for step in steps]
         settled = next((s for s in steps if s.state == PaymentState.SETTLED), None)
         return Payment(
@@ -966,41 +927,6 @@ def _record_return_exception(
     log.warning(
         "Return left a Customer Balance short",
         extra={"payment_id": payment.id, "exposure": moved.amount, "return_code": code.code},
-    )
-
-
-def adjustments_query() -> Any:
-    """Provider Adjustment outcomes with the line and report they came from."""
-    return (
-        select(
-            provider_adjustments,
-            settlement_report_lines.c.line_id.label("report_line_id"),
-            settlement_report_lines.c.reason,
-            settlement_report_lines.c.amount,
-            settlement_report_lines.c.settled_at,
-            settlement_reports.c.report_date,
-        )
-        .join(
-            settlement_report_lines,
-            settlement_report_lines.c.id == provider_adjustments.c.line_id,
-        )
-        .join(settlement_reports, settlement_reports.c.id == settlement_report_lines.c.report_id)
-        .order_by(provider_adjustments.c.id)
-    )
-
-
-def adjustment_view(row: Row[Any]) -> ProviderAdjustment:
-    return ProviderAdjustment(
-        report_date=row.report_date,
-        line_id=row.report_line_id,
-        reason=row.reason,
-        amount=row.amount,
-        effective_at=row.settled_at,
-        outcome=AdjustmentOutcome(row.outcome),
-        payment_id=row.payment_id,
-        transaction_id=row.transaction_id,
-        detail=row.detail,
-        recorded_at=row.recorded_at,
     )
 
 

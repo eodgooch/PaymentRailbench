@@ -14,6 +14,7 @@ observance follow the Fed's published schedule (federalreserve.gov/aboutthefed/k
 Banking Days are dates in New York time, where the Fed keeps its hours.
 """
 
+from collections.abc import Iterator
 from datetime import UTC, date, datetime, time, timedelta
 from functools import cache
 from zoneinfo import ZoneInfo
@@ -66,6 +67,19 @@ def next_banking_day(day: date) -> date:
     while not is_banking_day(day):
         day += timedelta(days=1)
     return day
+
+
+def banking_day_on_or_after(day: date) -> date:
+    """`day` if it's a Banking Day, otherwise the next one."""
+    return day if is_banking_day(day) else next_banking_day(day)
+
+
+def banking_days_from(day: date, until: date | None = None) -> Iterator[date]:
+    """Every Banking Day from `day` on, in order: to `until` inclusive, or without end."""
+    day = banking_day_on_or_after(day)
+    while until is None or day <= until:
+        yield day
+        day = next_banking_day(day)
 
 
 def add_banking_days(day: date, count: int) -> date:

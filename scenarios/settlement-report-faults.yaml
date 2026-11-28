@@ -1,5 +1,6 @@
-# Every Settlement Report Fault (SPEC §4.5, §6, ADR 0014). Three buyers fund by ACH pull on
-# Thursday afternoon; their pulls settle Friday 08:30 New York. Wren buys Ottoline's card at
+# Every Settlement Report Fault (SPEC §4.5, §6, ADR 0014). Four buyers fund by ACH pull on
+# Thursday afternoon; their pulls settle Friday 08:30 New York, but Rosa's settlement
+# webhook is delivered five days late. Wren buys Ottoline's card at
 # the 17:00 Auction Close for 300.00, and Ottoline's Instant Payout of 270.00 (less
 # Mintwharf's fictional 10% fee) goes out over RTP at once, before the 18:00 RTP Cutoff.
 # Expected Settlement Reports (one per Banking Day; Monday 7 September is Labor Day):
@@ -7,8 +8,11 @@
 # - Friday 4: Wren's pull reported as 59500, 500 short of what settled (wrong amount); Pax's
 #   pull left off (missing line); a Provider Adjustment at noon recalling 20.00 of
 #   Ottoline's Payout, +2000;
+# - Friday 4 also lists Rosa's pull, 5000;
 # - Tuesday 8: Jules's pull, booked at Friday's 16:00 ACH Cutoff, so on the next Banking
-#   Day's report after a Fed holiday (settlement after Cutoff);
+#   Day's report after a Fed holiday (settlement after Cutoff); a fee correction of 1.00
+#   against Rosa's pull; and a fee correction of 4.50 against a Payment the Provider never
+#   made for Mintwharf (an orphan adjustment);
 # - Wednesday 9: a fee correction of 1.50 against Wren's pull, -150.
 # Expected Ledger:
 # - the missing, wrong and late lines change no balance: every pull is booked as its
@@ -16,8 +20,11 @@
 # - the recall is booked against Ottoline's Payout: Bank Cash +2000, her Customer Balance
 #   +2000 (Mintwharf owes her that part again);
 # - the fee correction is booked against Wren's pull: Bank Cash -150, Provider Fees +150;
-# - Bank Cash ends at 54850; every Clearing Account nets to zero;
-# - the Fault Manifest names all five report Faults; replaying reproduces the Ledger.
+# - Rosa's fee correction arrives before the Ledger has heard her pull settled: it's kept
+#   pending, then booked once the late webhook lands on Wednesday 9 at 08:30 New York;
+# - the orphan adjustment is stored unmatched and books nothing;
+# - Bank Cash ends at 59750, Provider Fees at 250; every Clearing Account nets to zero;
+# - the Fault Manifest names every report Fault; replaying reproduces the Ledger.
 name: settlement-report-faults
 description: A missing line, a wrong amount, a settlement after Cutoff and two Provider Adjustments.
 seed: 8
@@ -33,6 +40,8 @@ customers:
     name: Jules Marrow
   - id: c-ottoline
     name: Ottoline Vance
+  - id: c-rosa
+    name: Rosa Kettleby
 payments:
   - id: wren-funding
     customer: c-wren
@@ -45,6 +54,10 @@ payments:
   - id: jules-funding
     customer: c-jules
     amount: 8000
+    description: Buyer funds their Customer Balance
+  - id: rosa-funding
+    customer: c-rosa
+    amount: 5000
     description: Buyer funds their Customer Balance
 auction_closes:
   - id: thursday-evening
@@ -75,3 +88,17 @@ faults:
     amount: 150
     reason: fee_correction
     after: 2
+  - id: rosa-settled-late
+    kind: delay
+    payment: rosa-funding
+    event: settled
+    by: P5D
+  - id: rosa-fee-corrected
+    kind: provider_adjustment
+    payment: rosa-funding
+    amount: 100
+    reason: fee_correction
+  - id: stranger-fee-corrected
+    kind: orphan_adjustment
+    payment: pax-funding
+    amount: 450

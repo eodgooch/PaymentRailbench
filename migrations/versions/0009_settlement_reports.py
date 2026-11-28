@@ -11,9 +11,11 @@ In the `payments` schema, append-only like the Inbox:
 - `settlement_report_lines`: an ingested report's lines as the Provider stated them,
   structured, in file order: settlements and Provider Adjustments. They are evidence for
   Reconciliation; ingesting one changes no balance.
-- `provider_adjustments`: what the Ledger did with each Provider Adjustment line, once per
-  line: `booked` against the original Payment by the named Transaction, or `unmatched`
-  (no such Payment, or one it can't be booked against) with why.
+- `provider_adjustments`: what the Ledger did with each Provider Adjustment line, appended:
+  `pending` (its Payment is known and agrees with the line but hasn't settled in the Ledger
+  yet; at most once per line), then at most one decision, `booked` against the original
+  Payment by the named Transaction, or `unmatched` (no such Payment, one that contradicts
+  the line, or one that ended without settling) with why.
 
 In the `simulator` schema, `settlement_reports`: each report the Simulator published, frozen
 as published, one per (provider, Banking Day).
@@ -81,17 +83,23 @@ CREATE TABLE payments.settlement_report_lines (
 
 CREATE TABLE payments.provider_adjustments (
     id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    line_id        BIGINT NOT NULL UNIQUE REFERENCES payments.settlement_report_lines (id),
-    outcome        TEXT NOT NULL CHECK (outcome IN ('booked', 'unmatched')),
+    line_id        BIGINT NOT NULL REFERENCES payments.settlement_report_lines (id),
+    outcome        TEXT NOT NULL CHECK (outcome IN ('pending', 'booked', 'unmatched')),
     payment_id     BIGINT REFERENCES payments.payments (id),
     transaction_id BIGINT UNIQUE REFERENCES ledger.transactions (id),
     detail         TEXT NOT NULL DEFAULT '',
     recorded_at    TIMESTAMPTZ NOT NULL,
     CHECK (
         (outcome = 'booked') = (payment_id IS NOT NULL AND transaction_id IS NOT NULL)
-        AND (outcome = 'unmatched') = (transaction_id IS NULL AND detail <> '')
+        AND (outcome = 'booked' OR (transaction_id IS NULL AND detail <> ''))
+        AND (outcome <> 'pending' OR payment_id IS NOT NULL)
     )
 );
+-- At most one `pending` row per line, and at most one final one (`booked` or `unmatched`).
+CREATE UNIQUE INDEX provider_adjustments_pending_once
+    ON payments.provider_adjustments (line_id) WHERE outcome = 'pending';
+CREATE UNIQUE INDEX provider_adjustments_decided_once
+    ON payments.provider_adjustments (line_id) WHERE outcome <> 'pending';
 
 CREATE TABLE simulator.settlement_reports (
     id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

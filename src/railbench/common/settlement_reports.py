@@ -18,6 +18,7 @@ This module imports nothing from either service.
 """
 
 from datetime import date, datetime, time
+from enum import StrEnum
 
 from railbench.common.calendar import at_new_york, is_banking_day, new_york_date, next_banking_day
 
@@ -43,8 +44,21 @@ COLUMNS = (
     "original_line_id",
     "reason",
 )
-LINE_TYPES = ("settlement", "adjustment")
-ADJUSTMENT_REASONS = ("fee_correction", "payout_recall")
+
+
+class AdjustmentReason(StrEnum):
+    """Why a Provider Adjustment was made, and so which way its money moves (ADR 0014)."""
+
+    # The Provider corrects its fee: money leaves Mintwharf's account (-). Mintwharf bears it.
+    FEE_CORRECTION = "fee_correction"
+    # The Provider recalls part of a Payout from the recipient: that part comes back into
+    # Mintwharf's account (+), and Mintwharf owes it to the seller again. Pushes only.
+    PAYOUT_RECALL = "payout_recall"
+
+    @property
+    def sign(self) -> int:
+        """The sign of the line's amount: which way the money moves."""
+        return -1 if self is AdjustmentReason.FEE_CORRECTION else 1
 
 
 def cutoff(provider: str, rail: str) -> time:

@@ -14,8 +14,10 @@ the Cutoff rule are the shared contract in `railbench.common.settlement_reports`
   day it should have counted toward, so the line, stamped with that time, lands on the
   next Banking Day's report.
 - `provider_adjustment`: `after` Banking Days after the settlement's report day, an
-  adjustment line at noon New York claws back `amount`: - for a fee correction, + for a
-  recalled part of a Payout. It names the original line and Payment.
+  adjustment line at noon New York for `amount`, signed by its reason (- for a fee
+  correction, + for a recalled part of a Payout). It names the original line and Payment.
+- `orphan_adjustment`: the same, but naming a Payment ID and line the Provider never made
+  for Mintwharf, with no Idempotency Key: an adjustment nothing in the Ledger expects.
 
 Lines are ordered by `settled_at`, then line ID. Each Fault is injected on the one report
 where it shows, and named there, for the Fault Manifest.
@@ -25,16 +27,17 @@ import csv
 import hashlib
 import io
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time
 from typing import Any
 
 from railbench.common.calendar import add_banking_days, at_new_york
-from railbench.common.settlement_reports import COLUMNS, cutoff, report_day
+from railbench.common.settlement_reports import COLUMNS, AdjustmentReason, cutoff, report_day
 from railbench.simulator.model import (
     FaultPlan,
     MissingReportLine,
-    ProviderAdjustment,
+    OrphanAdjustment,
+    PlannedAdjustment,
     SettlementAfterCutoff,
     WrongReportAmount,
 )
@@ -85,100 +88,131 @@ class BuiltReport:
 
 
 @dataclass(frozen=True)
+class Placement:
+    """Where a Payment's settlement line goes: the Banking Day the settlement counts toward
+    (`proper`), the day its line lands on (`lands`, None when it's left off), and the time
+    the line says it settled (`booked`)."""
+
+    proper: date
+    lands: date | None
+    booked: datetime
+
+
+@dataclass(frozen=True)
 class _Line:
     line_id: str
     type: str
-    payment: Settled
+    provider_payment_id: str
+    idempotency_key: str
+    rail: str
+    direction: str
+    currency: str
     amount: int
     settled_at: datetime
     original_line_id: str = ""
     reason: str = ""
 
 
+@dataclass
+class _Found:
+    lines: list[_Line] = field(default_factory=list)
+    injected: list[InjectedReportFault] = field(default_factory=list)
+
+
+def _digest(*parts: str) -> str:
+    return hashlib.sha256("\x00".join(parts).encode()).hexdigest()[:24]
+
+
 def settlement_line_id(idempotency_key: str) -> str:
     """The line ID of a Payment's settlement line: the same in every run of a Scenario."""
-    digest = hashlib.sha256(f"line\x00{idempotency_key}\x00settlement".encode()).hexdigest()
-    return f"simline_{digest[:24]}"
+    return f"simline_{_digest('line', idempotency_key, 'settlement')}"
 
 
 def adjustment_line_id(idempotency_key: str, fault_id: str) -> str:
-    digest = hashlib.sha256(f"line\x00{idempotency_key}\x00adjustment\x00{fault_id}".encode())
-    return f"simline_{digest.hexdigest()[:24]}"
+    return f"simline_{_digest('line', idempotency_key, 'adjustment', fault_id)}"
+
+
+def orphan_payment_id(idempotency_key: str, fault_id: str) -> str:
+    """The Payment ID an orphan adjustment names: one the Provider never made."""
+    return f"simpay_{_digest('orphan', idempotency_key, fault_id)}"
 
 
 def _instant(moment: datetime) -> str:
     return moment.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _placement(provider: str, payment: Settled) -> tuple[date, date | None, datetime]:
-    """The Banking Day the settlement counts toward, the day its line lands on (None when
-    it's left off), and the time the line says it settled."""
+def placement(provider: str, payment: Settled) -> Placement:
     proper = report_day(provider, payment.rail, payment.settled_at)
     if any(isinstance(f, MissingReportLine) for f in payment.faults):
-        return proper, None, payment.settled_at
+        return Placement(proper, None, payment.settled_at)
     if any(isinstance(f, SettlementAfterCutoff) for f in payment.faults):
         booked = at_new_york(proper, cutoff(provider, payment.rail))
-        return proper, report_day(provider, payment.rail, booked), booked
-    return proper, proper, payment.settled_at
+        return Placement(proper, report_day(provider, payment.rail, booked), booked)
+    return Placement(proper, proper, payment.settled_at)
 
 
-def _adjustments(provider: str, payment: Settled) -> list[tuple[date, ProviderAdjustment]]:
+def _adjustments(
+    provider: str, payment: Settled
+) -> list[tuple[date, PlannedAdjustment | OrphanAdjustment]]:
     proper = report_day(provider, payment.rail, payment.settled_at)
     return [
         (add_banking_days(proper, fault.after), fault)
         for fault in payment.faults
-        if isinstance(fault, ProviderAdjustment)
+        if isinstance(fault, PlannedAdjustment | OrphanAdjustment)
     ]
 
 
 def content_days(provider: str, payment: Settled) -> set[date]:
     """Every Banking Day whose report this Payment (or a Fault on it) shows on."""
-    proper, lands, _ = _placement(provider, payment)
+    where = placement(provider, payment)
     return {
-        proper,
-        *([lands] if lands else []),
+        where.proper,
+        *([where.lands] if where.lands else []),
         *(day for day, _ in _adjustments(provider, payment)),
     }
 
 
 def build_report(provider: str, day: date, settled: Iterable[Settled]) -> BuiltReport:
     """The Settlement Report `provider` publishes for Banking Day `day`."""
-    lines: list[_Line] = []
-    injected: list[InjectedReportFault] = []
+    found = _Found()
     for payment in settled:
-        proper, lands, booked = _placement(provider, payment)
-        line_id = settlement_line_id(payment.idempotency_key)
-        found = _payment_lines(provider, day, payment, proper, lands, booked, line_id)
-        lines.extend(found[0])
-        injected.extend(found[1])
-    lines.sort(key=lambda line: (line.settled_at, line.line_id))
-    injected.sort(key=lambda found: (found.line_id, found.fault.id))
+        _payment_lines(provider, day, payment, placement(provider, payment), found)
+    lines = sorted(found.lines, key=lambda line: (line.settled_at, line.line_id))
+    injected = sorted(found.injected, key=lambda f: (f.line_id, f.fault.id))
     return BuiltReport(provider, day, _csv(provider, day, lines), tuple(injected))
 
 
 def _payment_lines(
-    provider: str,
-    day: date,
-    payment: Settled,
-    proper: date,
-    lands: date | None,
-    booked: datetime,
-    line_id: str,
-) -> tuple[list[_Line], list[InjectedReportFault]]:
-    lines: list[_Line] = []
-    injected: list[InjectedReportFault] = []
-    where = f"{provider}'s Settlement Report for {day.isoformat()}"
+    provider: str, day: date, payment: Settled, where: Placement, found: _Found
+) -> None:
+    line_id = settlement_line_id(payment.idempotency_key)
+    report = f"{provider}'s Settlement Report for {day.isoformat()}"
     who = f"{payment.rail.upper()} {payment.direction} {payment.public_id}"
+    on_day = {"report_date": day.isoformat()}
 
     def inject(
         fault: FaultPlan, event: str, params: dict[str, Any], cause: str, line: str = line_id
     ) -> None:
         base = fault.model_dump(mode="json", exclude={"id", "kind", "event"})
-        injected.append(
+        found.injected.append(
             InjectedReportFault(payment, fault, line, event, {**base, **params}, fault.kind, cause)
         )
 
-    if lands == day:
+    def line(line_id: str, type_: str, amount: int, at: datetime, **more: str) -> _Line:
+        return _Line(
+            line_id=line_id,
+            type=type_,
+            provider_payment_id=more.pop("provider_payment_id", payment.public_id),
+            idempotency_key=more.pop("idempotency_key", payment.idempotency_key),
+            rail=payment.rail,
+            direction=payment.direction,
+            currency=payment.currency,
+            amount=amount,
+            settled_at=at,
+            **more,
+        )
+
+    if where.lands == day:
         amount = payment.signed_amount
         for fault in payment.faults:
             if isinstance(fault, WrongReportAmount):
@@ -187,8 +221,8 @@ def _payment_lines(
                 inject(
                     fault,
                     LINE_EVENT,
-                    {"report_date": day.isoformat()},
-                    f"The Simulator reported {who} on {where} as {size} {payment.currency} "
+                    on_day,
+                    f"The Simulator reported {who} on {report} as {size} {payment.currency} "
                     f"Minor Units, {fault.by:+d} off the {payment.amount} that settled "
                     f"(line {line_id}).",
                 )
@@ -196,54 +230,80 @@ def _payment_lines(
                 inject(
                     fault,
                     LINE_EVENT,
-                    {"report_date": day.isoformat(), "banking_day": proper.isoformat()},
+                    {**on_day, "banking_day": where.proper.isoformat()},
                     f"The Simulator booked {who}, which its Provider Event said settled at "
                     f"{_instant(payment.settled_at)}, at its {payment.rail.upper()} Cutoff "
-                    f"({_instant(booked)}), so its line {line_id} landed on {where} instead "
-                    f"of {proper.isoformat()}'s (settlement after Cutoff).",
+                    f"({_instant(where.booked)}), so its line {line_id} landed on {report} "
+                    f"instead of {where.proper.isoformat()}'s (settlement after Cutoff).",
                 )
-        lines.append(_Line(line_id, "settlement", payment, amount, booked))
-    if lands is None and proper == day:
+        found.lines.append(line(line_id, "settlement", amount, where.booked))
+    if where.lands is None and where.proper == day:
         for fault in payment.faults:
             if isinstance(fault, MissingReportLine):
                 inject(
                     fault,
                     LINE_EVENT,
-                    {"report_date": day.isoformat()},
-                    f"The Simulator left {who}, settled at {_instant(payment.settled_at)}, off "
-                    f"{where} (missing report line {line_id}).",
+                    on_day,
+                    f"The Simulator left {who}, settled at {_instant(payment.settled_at)}, "
+                    f"off {report} (missing report line {line_id}).",
                 )
     for adjusted_on, fault in _adjustments(provider, payment):
         if adjusted_on != day:
             continue
         adjustment_id = adjustment_line_id(payment.idempotency_key, fault.id)
-        recall = fault.reason == "payout_recall"
-        lines.append(
-            _Line(
+        at = at_new_york(day, ADJUSTMENT_TIME)
+        if isinstance(fault, OrphanAdjustment):
+            orphan = orphan_payment_id(payment.idempotency_key, fault.id)
+            reason = AdjustmentReason.FEE_CORRECTION
+            found.lines.append(
+                line(
+                    adjustment_id,
+                    "adjustment",
+                    reason.sign * fault.amount,
+                    at,
+                    provider_payment_id=orphan,
+                    idempotency_key="",
+                    original_line_id=settlement_line_id(orphan),
+                    reason=reason.value,
+                )
+            )
+            inject(
+                fault,
+                ADJUSTMENT_EVENT,
+                on_day,
+                f"The Simulator reported a fee correction of {fault.amount} "
+                f"{payment.currency} Minor Units against {orphan}, a Payment it never made "
+                f"for Mintwharf, as line {adjustment_id} on {report}: an adjustment with no "
+                "matching expectation in the Ledger (orphan adjustment).",
+                line=adjustment_id,
+            )
+            continue
+        found.lines.append(
+            line(
                 adjustment_id,
                 "adjustment",
-                payment,
-                fault.amount if recall else -fault.amount,
-                at_new_york(day, ADJUSTMENT_TIME),
+                fault.reason.sign * fault.amount,
+                at,
                 original_line_id=line_id,
-                reason=fault.reason,
+                reason=fault.reason.value,
             )
         )
         what = (
-            "recalled part of the Payout, crediting it back"
-            if recall
-            else "corrected its fee, debiting Mintwharf"
+            "recalled part of the Payout from its recipient, paying it back into "
+            "Mintwharf's account"
+            if fault.reason is AdjustmentReason.PAYOUT_RECALL
+            else "corrected its fee, debiting Mintwharf's account"
         )
         inject(
             fault,
             ADJUSTMENT_EVENT,
-            {"report_date": day.isoformat()},
+            on_day,
             f"The Simulator {what}: a Provider Adjustment of {fault.amount} "
-            f"{payment.currency} Minor Units against {who} (settled {proper.isoformat()}, "
-            f"line {line_id}), reported as line {adjustment_id} on {where}.",
+            f"{payment.currency} Minor Units against {who} (settled "
+            f"{where.proper.isoformat()}, line {line_id}), reported as line {adjustment_id} "
+            f"on {report}.",
             line=adjustment_id,
         )
-    return lines, injected
 
 
 def _csv(provider: str, day: date, lines: list[_Line]) -> bytes:
@@ -251,18 +311,17 @@ def _csv(provider: str, day: date, lines: list[_Line]) -> bytes:
     writer = csv.writer(out, lineterminator="\n")
     writer.writerow(COLUMNS)
     for line in lines:
-        payment = line.payment
         writer.writerow(
             (
                 day.isoformat(),
                 provider,
                 line.line_id,
                 line.type,
-                payment.public_id,
-                payment.idempotency_key,
-                payment.rail,
-                payment.direction,
-                payment.currency,
+                line.provider_payment_id,
+                line.idempotency_key,
+                line.rail,
+                line.direction,
+                line.currency,
                 str(line.amount),
                 _instant(line.settled_at),
                 line.original_line_id,

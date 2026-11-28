@@ -15,8 +15,8 @@ from railbench.simulator.model import (
     DuplicateDelivery,
     MissingReportLine,
     OutOfOrderDelivery,
+    PlannedAdjustment,
     PlannedReturn,
-    ProviderAdjustment,
     SettlementAfterCutoff,
     WrongReportAmount,
 )
@@ -342,7 +342,7 @@ def test_report_faults_are_planned_for_the_payment_they_name() -> None:
 
     assert plans["first"].faults == (
         MissingReportLine(id="gone"),
-        ProviderAdjustment(id="fee", amount=300, reason="fee_correction", after=2),
+        PlannedAdjustment(id="fee", amount=300, reason="fee_correction", after=2),
     )
     assert plans["bram-payout:ach"].faults == (SettlementAfterCutoff(id="late"),)
     # Cleo's RTP is declined, so only the ACH fall-back settles and is reported.

@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 import pytest
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, text
 
 from railbench.common.clock import ManualClock
 from railbench.common.db import LEDGER_APP_ROLE, make_engine
@@ -42,6 +42,10 @@ FRIDAY_REPORT = datetime(2026, 9, 5, 0, 0, tzinfo=UTC)  # 20:00 New York
 TUESDAY_REPORT = datetime(2026, 9, 9, 0, 0, tzinfo=UTC)  # after Labor Day
 WEDNESDAY_REPORT = datetime(2026, 9, 10, 0, 0, tzinfo=UTC)
 CUSTOMER = "customer:c-quinn:usd"
+HEADER = (
+    "report_date,provider,line_id,type,provider_payment_id,idempotency_key,rail,direction,"
+    "currency,amount,settled_at,original_line_id,reason\n"
+)
 CLEARING, BANK_CASH, FEES = "clearing:simulator:ach:usd", "bank-cash:usd", "provider-fees:usd"
 
 
@@ -63,8 +67,12 @@ class Stack:
         self.payments.make_available()
         self.reports.ingest_due()
 
-    def pull(self, key: str, amount: int, *faults: dict[str, Any]) -> int:
-        self.simulator.plan(PaymentPlan.model_validate({"idempotency_key": key, "faults": faults}))
+    def pull(self, key: str, amount: int, *faults: dict[str, Any], outcome: str = "settle") -> int:
+        self.simulator.plan(
+            PaymentPlan.model_validate(
+                {"idempotency_key": key, "outcome": outcome, "faults": faults}
+            )
+        )
         response = self.ledger.post(
             "/payments",
             json={
@@ -283,7 +291,7 @@ def adjustment_line(line_id: str, **changes: str) -> bytes:
 UNMATCHABLE = {
     "no such Payment": ({}, "no Payment simpay_nobody"),
     "another key": ({"idempotency_key": "other"}, "the line describes"),
-    "a fee correction paying in": ({"amount": "100"}, "takes money out"),
+    "a fee correction paying in": ({"amount": "100"}, "moves money out, not the other way"),
     "a pull recalled": ({"amount": "100", "reason": "payout_recall"}, "back in"),
     "too much": ({"amount": "-10001"}, "more than the 10000 settled"),
 }
@@ -296,8 +304,7 @@ def test_an_adjustment_the_ledger_cannot_match_is_stored_not_booked(stack: Stack
         "provider_payment_id": stack.payments.payment(payment_id).provider_payment_id,
         "idempotency_key": "plain",
     }
-    header = stack.simulator.settlement_report("simulator", FRIDAY).split(b"\n")[0] + b"\n"
-    body = header + b"".join(
+    body = HEADER.encode() + b"".join(
         adjustment_line(f"adj-{n}", **({} if not changes else {**ours, **changes}))
         for n, (changes, _) in enumerate(UNMATCHABLE.values())
     )
@@ -312,3 +319,70 @@ def test_an_adjustment_the_ledger_cannot_match_is_stored_not_booked(stack: Stack
     assert stack.balance(BANK_CASH) == 10_000
     reported = stack.payments.payment(payment_id).adjustments
     assert [a.outcome for a in reported] == ["unmatched"] * 4  # all but the unknown Payment's
+
+
+FEE = {"id": "fee", "kind": "provider_adjustment", "amount": 300, "reason": "fee_correction"}
+WEDNESDAY_0830 = datetime(2026, 9, 9, 12, 30, tzinfo=UTC)
+
+
+def decisions(stack: Stack, payment_id: int) -> list[tuple[str, str]]:
+    """Every decision about the Payment's adjustments, in order: (outcome, recorded_at)."""
+    with stack.owner.connect() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT outcome, recorded_at FROM payments.provider_adjustments"
+                " WHERE payment_id = :id ORDER BY id"
+            ),
+            {"id": payment_id},
+        ).all()
+    return [(row.outcome, row.recorded_at.isoformat()) for row in rows]
+
+
+def test_an_adjustment_ahead_of_its_settlement_waits_then_books_once(stack: Stack) -> None:
+    # The settlement webhook is held five days: the Tuesday report's fee correction
+    # arrives before the Ledger has heard the pull settled.
+    late = {"id": "late", "kind": "delay", "event": "settled", "by": "P5D"}
+    payment_id = stack.pull("waits", 10_000, FEE, late)
+    stack.at(datetime(2026, 9, 4, 12, 30, tzinfo=UTC))
+    stack.at(TUESDAY_REPORT)
+
+    [line] = stack.reports_for("2026-09-08")[0]["lines"]
+    assert line["adjustment"]["outcome"] == "pending"
+    assert "waiting for the Ledger" in line["adjustment"]["detail"]
+    assert stack.balance(BANK_CASH) == 0  # nothing settled in the Ledger, nothing adjusted
+
+    stack.at(WEDNESDAY_0830)  # the webhook lands, and the next ingest run books it
+    stack.at(WEDNESDAY_0830 + timedelta(hours=1))
+    stack.at(WEDNESDAY_REPORT + timedelta(days=1))
+
+    assert decisions(stack, payment_id) == [
+        ("pending", "2026-09-09T00:00:00+00:00"),
+        ("booked", "2026-09-09T12:30:00+00:00"),
+    ]
+    [line] = stack.reports_for("2026-09-08")[0]["lines"]
+    assert line["adjustment"]["outcome"] == "booked"
+    assert (stack.balance(FEES), stack.balance(BANK_CASH), stack.balance(CLEARING)) == (
+        300,
+        9_700,
+        0,
+    )
+
+
+def test_an_adjustment_whose_payment_ends_without_settling_is_unmatched(stack: Stack) -> None:
+    payment_id = stack.pull("declines", 10_000, outcome="decline")
+    provider_id = stack.payments.payment(payment_id).provider_payment_id
+    body = HEADER.encode() + adjustment_line(
+        "adj-1", provider_payment_id=provider_id, idempotency_key="declines", amount="-50"
+    )
+    stack.at(THURSDAY_3PM + timedelta(minutes=1))  # submitted, not yet declined
+    received = stack.reports.replay("simulator", date(2026, 9, 10), body, {})
+    [line] = received.report.lines
+    assert line.adjustment is not None and line.adjustment.outcome == "pending"
+
+    stack.at(datetime(2026, 9, 4, 12, 30, tzinfo=UTC))  # declined; the retry decides it
+
+    assert [outcome for outcome, _ in decisions(stack, payment_id)] == ["pending", "unmatched"]
+    [line] = stack.reports.reports("simulator", date(2026, 9, 10))[0].lines
+    assert line.adjustment is not None
+    assert "declined without settling" in line.adjustment.detail
+    assert stack.balance(BANK_CASH) == 0

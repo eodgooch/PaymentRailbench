@@ -11,11 +11,10 @@ import pytest
 from sqlalchemy import Engine, create_engine, select
 
 from railbench.common.db import LEDGER_APP_ROLE, make_engine
-from railbench.common.settlement_reports import report_published_at
 from railbench.payments.tables import inbox
 from railbench.scenarios.model import Scenario, load
 from railbench.scenarios.replay import availability_job_runs, replay_inbox
-from railbench.scenarios.runner import Run, fresh_database, run
+from railbench.scenarios.runner import DatabaseNotFresh, Run, fresh_database, run
 from railbench.scenarios.summary import ledger_summary
 
 pytestmark = pytest.mark.integration
@@ -177,38 +176,26 @@ def test_the_same_scenario_and_seed_replay_exactly(database_url: str, manifests:
 
     first = run_in_fresh_database(database_url, manifests, scenario)
     second = run_in_fresh_database(database_url, manifests, scenario)
-    # A database that already holds another Scenario's run: different sequences, same names.
-    with fresh_database(database_url) as url:
-        run(load(SCENARIOS / "ach-pull-duplicates.yaml"), url, manifest_path=manifests / "d.json")
-        crowded = run(scenario, url, manifest_path=manifests / "crowded.json")
     other_seed = run_in_fresh_database(database_url, manifests, scenario, seed=scenario.seed + 1)
 
     assert first.manifest.faults  # the seed drew some Faults
-    assert first.manifest == second.manifest == crowded.manifest
+    assert first.manifest == second.manifest
     assert first.ticks == second.ticks
-    # A Settlement Report covers every Payment the Provider settled that day, so when reports
-    # are published depends on the whole database; every other moment doesn't.
-    published = {
-        report_published_at(day) for found in (first, crowded) for day in found.settlement_reports
-    }
-    assert [t for t in first.ticks if t not in published] == [
-        t for t in crowded.ticks if t not in published
-    ]
-    assert first.settlement_reports == second.settlement_reports
+    assert first.settlement_reports and first.settlement_reports == second.settlement_reports
     assert first.summary == second.summary
-    assert only(scenario.name, first.summary) == only(scenario.name, crowded.summary)
     assert other_seed.manifest.faults != first.manifest.faults
 
 
-def only(name: str, summary: dict[str, Any]) -> dict[str, Any]:
-    """The part of a Ledger summary belonging to one Scenario's Payments. Settlement Reports
-    are left out: one report lists every Scenario's settlements that day."""
-    prefix = f"scenario:{name}:"
-    return {
-        section: {key: value for key, value in rows.items() if key.startswith(prefix)}
-        for section, rows in summary.items()
-        if section != "settlement_reports"
-    }
+def test_a_scenario_refuses_a_database_that_is_not_fresh(
+    database_url: str, manifests: Path
+) -> None:
+    """A Settlement Report covers every Payment its Provider settled that day and is frozen
+    once published, so a second run in one database would find its days' reports published
+    without its settlements. Determinism holds per fresh database (ADR 0011, ADR 0014)."""
+    with fresh_database(database_url) as url:
+        run(load(SCENARIOS / "ach-pull-duplicates.yaml"), url, manifest_path=manifests / "d.json")
+        with pytest.raises(DatabaseNotFresh, match=r"simulator\.settlement_reports"):
+            run(load(SCENARIOS / "ach-pull-random-faults.yaml"), url, manifest_path=manifests / "x")
 
 
 ALL_FAULTS = Scenario.model_validate(
@@ -476,12 +463,26 @@ def report_lines(found: Run, day: str) -> list[tuple[str, str, int, str]]:
     ]
 
 
+def adjustment_decisions(found: Run, day: str) -> dict[str, list[tuple[str, str | None]]]:
+    """Each adjustment line's decisions on that day's report, by the Scenario's name for
+    its Payment ("" for one the Ledger never made): (outcome, the Payment it names)."""
+    [report] = found.summary["settlement_reports"][f"simulator:{day}"]
+    return {
+        line["idempotency_key"].split(":")[-1]: [
+            (decision["outcome"], decision["payment"]) for decision in line["adjustments"]
+        ]
+        for line in report["lines"]
+        if line["type"] == "adjustment"
+    }
+
+
 def test_every_settlement_report_fault_shows_on_its_report_and_in_the_manifest(
     database_url: str, manifests: Path
 ) -> None:
     found = run_in_fresh_database(
         database_url, manifests, load(SCENARIOS / "settlement-report-faults.yaml")
     )
+    key = "scenario:settlement-report-faults:8:{}".format
 
     reports = found.summary["settlement_reports"]
     assert list(reports) == [
@@ -493,12 +494,15 @@ def test_every_settlement_report_fault_shows_on_its_report_and_in_the_manifest(
     assert report_lines(found, "2026-09-03") == [
         ("settlement", "rtp", -27_000, "2026-09-03T21:00:00+00:00")
     ]
-    assert report_lines(found, "2026-09-04") == [
-        ("settlement", "wren-funding", 59_500, "2026-09-04T12:30:00+00:00"),
+    assert sorted(report_lines(found, "2026-09-04")) == [
         ("adjustment", "rtp", 2_000, "2026-09-04T16:00:00+00:00"),
+        ("settlement", "rosa-funding", 5_000, "2026-09-04T12:30:00+00:00"),
+        ("settlement", "wren-funding", 59_500, "2026-09-04T12:30:00+00:00"),
     ]
-    assert report_lines(found, "2026-09-08") == [
-        ("settlement", "jules-funding", 8_000, "2026-09-04T20:00:00+00:00")
+    assert sorted(report_lines(found, "2026-09-08")) == [
+        ("adjustment", "", -450, "2026-09-08T16:00:00+00:00"),
+        ("adjustment", "rosa-funding", -100, "2026-09-08T16:00:00+00:00"),
+        ("settlement", "jules-funding", 8_000, "2026-09-04T20:00:00+00:00"),
     ]
     assert report_lines(found, "2026-09-09") == [
         ("adjustment", "wren-funding", -150, "2026-09-09T16:00:00+00:00")
@@ -509,22 +513,39 @@ def test_every_settlement_report_fault_shows_on_its_report_and_in_the_manifest(
         ("jules-after-cutoff", "jules-funding", "settlement_after_cutoff"),
         ("ottoline-payout-recalled", "ottoline-payout:rtp", "provider_adjustment"),
         ("wren-fee-corrected", "wren-funding", "provider_adjustment"),
+        ("rosa-settled-late", "rosa-funding", "delayed_delivery"),
+        ("rosa-fee-corrected", "rosa-funding", "provider_adjustment"),
+        ("stranger-fee-corrected", "pax-funding", "orphan_adjustment"),
     }
 
+    # Rosa's fee correction waited for her late settlement, then was booked, once; the
+    # orphan was never booked.
+    assert adjustment_decisions(found, "2026-09-08") == {
+        "rosa-funding": [("pending", key("rosa-funding")), ("booked", key("rosa-funding"))],
+        "": [("unmatched", None)],
+    }
+    [report] = reports["simulator:2026-09-08"]
+    rosa = next(line for line in report["lines"] if line["idempotency_key"] == key("rosa-funding"))
+    assert [d["recorded_at"] for d in rosa["adjustments"]] == [
+        "2026-09-09T00:00:00+00:00",  # the report, Tuesday 20:00 New York
+        "2026-09-09T12:30:00+00:00",  # the late webhook, Wednesday 08:30 New York
+    ]
+    assert adjustment_decisions(found, "2026-09-09") == {
+        "wren-funding": [("booked", key("wren-funding"))]
+    }
+    payout = (
+        "auction:settlement-report-faults:8:thursday-evening:payout:customer:c-ottoline:usd:rtp"
+    )
+    assert adjustment_decisions(found, "2026-09-04") == {"rtp": [("booked", payout)]}
+
     totals = account_totals(found.summary)
-    assert totals["bank-cash:usd"] == 54_850
-    assert totals["provider-fees:usd"] == 150
+    assert totals["bank-cash:usd"] == 59_750
+    assert totals["provider-fees:usd"] == 250
     assert totals["customer:c-ottoline:usd"] == -2_000  # owed again: a liability in credit
     assert totals["customer:c-pax:usd"] == -12_000  # funded in full, line or no line
     assert totals["customer:c-jules:usd"] == -8_000
+    assert totals["customer:c-rosa:usd"] == -5_000  # the fee is Mintwharf's, not hers
     assert totals["clearing:simulator:ach:usd"] == totals["clearing:simulator:rtp:usd"] == 0
-    [booked] = [
-        line["adjustment"]
-        for line in reports["simulator:2026-09-09"][0]["lines"]
-        if line["adjustment"]
-    ]
-    assert booked["outcome"] == "booked"
-    assert booked["payment"] == "scenario:settlement-report-faults:8:wren-funding"
     assert no_exceptions(found)
 
 

@@ -1,8 +1,9 @@
 """Ingesting Settlement Reports and booking Provider Adjustments (SPEC §4.5, §6, ADR 0014).
 
-The `settlement-report-ingest` job runs on the Ledger's Clock. For every Banking Day from the
-first one this Provider was asked to make a Payment on, once that day's report is due
-(`report_published_at`), until one is ingested, it fetches the report through the Provider
+The `settlement-report-ingest` job runs on the Ledger's Clock. Each run first retries the
+Provider Adjustments still pending (step 4), then, for every Banking Day from the first one
+this Provider was asked to make a Payment on, once that day's report is due
+(`report_published_at`), until one is ingested, fetches the report through the Provider
 interface, verifies its signature (like a webhook; a bad one is logged and stored nowhere)
 and receives it. Receiving one report is one database transaction, under a lock on
 (Provider, report date):
@@ -15,40 +16,48 @@ and receives it. Receiving one report is one database transaction, under a lock 
 3. Otherwise it's `ingested`: every line is stored as the Provider stated it. Settlement
    lines change no balance, whatever they say: a missing, late or wrong line is evidence
    for Reconciliation, never a correction the Ledger makes on its own.
-4. Each Provider Adjustment line is booked against the original Payment, found by the
-   Provider's Payment ID, if the line agrees with it (Idempotency Key, Rail, direction,
-   currency), the Ledger has recorded it settled, the reason fits (a fee correction takes
-   money out; a Payout recall brings part of a push back in) and the adjustments booked
-   against it stay within what settled. Two posted Transactions, both at the line's
-   `settled_at`, with this job as Actor, through the Payment's Clearing Account, so it nets
-   to zero at once:
-   - fee correction (Mintwharf bears it): Provider Fees debit, Clearing Account credit;
-     then Clearing Account debit, Bank Cash credit;
-   - Payout recall (the seller wasn't paid that part, so Mintwharf owes it again): Clearing
-     Account debit, Customer Balance credit; then Bank Cash debit, Clearing Account credit.
-   Neither takes money from a Customer Balance, so neither can leave one short. Any other
-   adjustment line is stored `unmatched`, with why, and books nothing.
+4. Each Provider Adjustment line is decided against the original Payment, found by the
+   Provider's Payment ID, and the decision appended (`provider_adjustments`):
+   - `unmatched`, never booked, if there's no such Payment, the line contradicts it
+     (Idempotency Key, Rail, direction, currency, or a reason the money can't move that way
+     for it), the adjustments against it would exceed what settled, or it ended (declined
+     or canceled) without settling;
+   - `pending` if it agrees but the Ledger hasn't recorded it settled yet (its `settled`
+     Provider Event late or out of order). Each later run decides it again, under the
+     Payment's lock, until it's booked or unmatched; while the Payment neither settles nor
+     ends, it stays pending, which Reconciliation sees;
+   - otherwise `booked`: two posted Transactions at the line's `settled_at`, with this job
+     as Actor, through the Payment's Clearing Account, so it nets to zero at once:
+     - fee correction (money out of Mintwharf's account; Mintwharf bears it): Provider Fees
+       debit, Clearing Account credit; then Clearing Account debit, Bank Cash credit;
+     - Payout recall (part of a Payout pulled back from its recipient into Mintwharf's
+       account; Mintwharf owes the seller that part again): Clearing Account debit,
+       Customer Balance credit; then Bank Cash debit, Clearing Account credit.
+   Neither takes money from a Customer Balance, so neither can leave one short.
 """
 
 import hashlib
 import logging
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from contextlib import suppress
+from dataclasses import dataclass, fields
 from datetime import date
 from itertools import takewhile
 from typing import Any
 
-from sqlalchemy import Connection, Engine, Row, func, insert, select
+from sqlalchemy import Connection, Engine, Row, Select, func, insert, select
 
-from railbench.common.calendar import is_banking_day, new_york_date, next_banking_day
+from railbench.common.calendar import banking_days_from, new_york_date
 from railbench.common.clock import Clock
 from railbench.common.locks import LockSpace, lock, lock_name
-from railbench.common.settlement_reports import report_published_at
+from railbench.common.settlement_reports import AdjustmentReason, report_published_at
 from railbench.common.signing import BadSignature
 from railbench.ledger.journal import AccountNotFound, DuplicateAccount, Journal, LedgerError
 from railbench.ledger.model import AccountType, NewAccount, NewEntry, NewTransaction, SystemJob
+from railbench.payments.accounts import bank_cash_account, clearing_account, ledger_key
 from railbench.payments.model import (
     AdjustmentOutcome,
+    ProviderAdjustment,
     ReportLineView,
     ReportOutcome,
     ReportReceipt,
@@ -61,15 +70,7 @@ from railbench.payments.provider import (
     ReportLine,
     SettlementReport,
 )
-from railbench.payments.service import (
-    UnknownProvider,
-    adjustment_view,
-    adjustments_query,
-    bank_cash_account,
-    clearing_account,
-    ledger_key,
-)
-from railbench.payments.state_machine import PaymentState
+from railbench.payments.state_machine import ENDS_BEFORE_SETTLEMENT, PaymentState
 from railbench.payments.tables import (
     payments,
     provider_adjustments,
@@ -81,11 +82,21 @@ from railbench.payments.tables import (
 log = logging.getLogger(__name__)
 
 INGEST_JOB = SystemJob(name="settlement-report-ingest", version="1.0.0")
+# A report line's fields as the Provider stated them: the columns of
+# `settlement_report_lines` besides its keys and position, read and written by name.
+LINE_FIELDS = tuple(f.name for f in fields(ReportLine))
 
 
 def provider_fees_account(currency: str) -> str:
     """The expense Account for what Providers charge Mintwharf (extends SPEC §3.1)."""
     return f"provider-fees:{currency.lower()}"
+
+
+@dataclass(frozen=True)
+class _Decision:
+    outcome: AdjustmentOutcome
+    detail: str = ""
+    transaction_id: int | None = None
 
 
 class SettlementReports:
@@ -96,9 +107,11 @@ class SettlementReports:
         self._provider = provider
 
     def ingest_due(self) -> int:
-        """Fetch and receive every report that's due and not ingested yet. Returns how many
-        it received (duplicates included). A report not published, unreachable or badly
-        signed is tried again on the next run."""
+        """Retry the pending Provider Adjustments, then fetch and receive every report
+        that's due and not ingested yet. Returns how many reports it received (duplicates
+        included). A report not published, unreachable or badly signed is tried again on
+        the next run."""
+        self.retry_pending()
         now = self._clock.now()
         provider = self._provider
         with self._engine.connect() as connection:
@@ -116,8 +129,8 @@ class SettlementReports:
         if first is None:
             return 0
         received = 0
-        due = takewhile(lambda d: report_published_at(d) <= now, _banking_days(first))
-        for day in due:
+        days = banking_days_from(new_york_date(first))
+        for day in takewhile(lambda d: report_published_at(d) <= now, days):
             if day in ingested:
                 continue
             try:
@@ -135,13 +148,53 @@ class SettlementReports:
             received += 1
         return received
 
+    def retry_pending(self) -> int:
+        """Decide again every Provider Adjustment still pending, each in its own database
+        transaction under its Payment's lock. Returns how many were decided."""
+        decided = provider_adjustments.alias("decided")
+        with self._engine.connect() as connection:
+            waiting = connection.execute(
+                select(provider_adjustments.c.line_id, provider_adjustments.c.payment_id)
+                .where(
+                    provider_adjustments.c.outcome == AdjustmentOutcome.PENDING,
+                    ~select(decided.c.id)
+                    .where(
+                        decided.c.line_id == provider_adjustments.c.line_id,
+                        decided.c.outcome != AdjustmentOutcome.PENDING,
+                    )
+                    .exists(),
+                )
+                .order_by(provider_adjustments.c.id)
+            ).all()
+        count = 0
+        for line_pk, payment_id in waiting:
+            with self._engine.begin() as connection:
+                lock(connection, LockSpace.PAYMENT, payment_id)
+                if _latest(connection, line_pk) is not AdjustmentOutcome.PENDING:
+                    continue  # decided meanwhile
+                payment = connection.execute(
+                    select(payments).where(payments.c.id == payment_id)
+                ).one()
+                line = _line_from(
+                    connection.execute(
+                        select(settlement_report_lines).where(
+                            settlement_report_lines.c.id == line_pk
+                        )
+                    ).one()
+                )
+                decision = self._decide(connection, payment, line)
+                if decision.outcome is not AdjustmentOutcome.PENDING:
+                    self._record(connection, line_pk, payment_id, line, decision)
+                    count += 1
+        return count
+
     def replay(
         self, provider_name: str, day: date, body: bytes, headers: Mapping[str, str]
     ) -> ReportReceipt:
         """Receive a report body that was verified when it was first fetched, without
         verifying it again. In-process only (replaying the Ledger, ADR 0011)."""
         if provider_name != self._provider.name:
-            raise UnknownProvider(f"no Provider {provider_name}")
+            raise ValueError(f"no Provider {provider_name}")
         return self._receive(day, body, headers)
 
     def reports(self, provider_name: str, day: date) -> list[SettlementReportView]:
@@ -221,8 +274,7 @@ class SettlementReports:
             return ReportReceipt(report=_view(connection, report_id), duplicate=False)
 
     def _adjust(self, connection: Connection, line_pk: int, line: ReportLine) -> None:
-        """Book one Provider Adjustment line against its original Payment, or record why
-        it isn't booked."""
+        """Decide a newly received Provider Adjustment line, and record the decision."""
         provider = self._provider.name
         payment = connection.execute(
             select(payments).where(
@@ -230,30 +282,69 @@ class SettlementReports:
                 payments.c.provider_payment_id == line.provider_payment_id,
             )
         ).one_or_none()
-        transaction_id: int | None = None
         if payment is None:
-            detail = f"no Payment {line.provider_payment_id} at {provider} in the Ledger"
-        else:
-            lock(connection, LockSpace.PAYMENT, payment.id)
-            detail = _refusal(connection, payment, line)
-            if not detail:
-                try:
-                    with connection.begin_nested():
-                        transaction_id = self._book(connection, payment, line)
-                except LedgerError as error:
-                    detail = f"the Ledger refused it: {error}"
-        if detail:
+            decision = _Decision(
+                AdjustmentOutcome.UNMATCHED,
+                f"no Payment {line.provider_payment_id} at {provider} in the Ledger",
+            )
+            self._record(connection, line_pk, None, line, decision)
+            return
+        lock(connection, LockSpace.PAYMENT, payment.id)
+        self._record(connection, line_pk, payment.id, line, self._decide(connection, payment, line))
+
+    def _decide(self, connection: Connection, payment: Row[Any], line: ReportLine) -> _Decision:
+        refused = _contradiction(connection, payment, line)
+        if refused:
+            return _Decision(AdjustmentOutcome.UNMATCHED, refused)
+        states = set(
+            connection.scalars(
+                select(transitions.c.state).where(transitions.c.payment_id == payment.id)
+            )
+        )
+        if PaymentState.SETTLED not in states:
+            ended = [state for state in ENDS_BEFORE_SETTLEMENT if state in states]
+            if ended:
+                return _Decision(
+                    AdjustmentOutcome.UNMATCHED,
+                    f"Payment {payment.id} was {ended[0]} without settling",
+                )
+            return _Decision(
+                AdjustmentOutcome.PENDING,
+                f"waiting for the Ledger to record Payment {payment.id} settled",
+            )
+        try:
+            with connection.begin_nested():
+                return _Decision(
+                    AdjustmentOutcome.BOOKED,
+                    transaction_id=self._book(connection, payment, line),
+                )
+        except LedgerError as error:
+            return _Decision(AdjustmentOutcome.UNMATCHED, f"the Ledger refused it: {error}")
+
+    def _record(
+        self,
+        connection: Connection,
+        line_pk: int,
+        payment_id: int | None,
+        line: ReportLine,
+        decision: _Decision,
+    ) -> None:
+        if decision.outcome is not AdjustmentOutcome.BOOKED:
             log.warning(
                 "Provider Adjustment not booked",
-                extra={"line_id": line.line_id, "reason": detail},
+                extra={
+                    "line_id": line.line_id,
+                    "outcome": decision.outcome,
+                    "reason": decision.detail,
+                },
             )
         connection.execute(
             insert(provider_adjustments).values(
                 line_id=line_pk,
-                outcome=AdjustmentOutcome.UNMATCHED if detail else AdjustmentOutcome.BOOKED,
-                payment_id=None if payment is None else payment.id,
-                transaction_id=transaction_id,
-                detail=detail,
+                outcome=decision.outcome,
+                payment_id=payment_id,
+                transaction_id=decision.transaction_id,
+                detail=decision.detail,
                 recorded_at=self._clock.now(),
             )
         )
@@ -263,7 +354,7 @@ class SettlementReports:
         size = abs(line.amount)
         clearing = clearing_account(payment.provider, payment.rail, payment.currency)
         bank_cash = bank_cash_account(payment.currency)
-        if line.reason == "fee_correction":
+        if line.reason is AdjustmentReason.FEE_CORRECTION:
             fees = provider_fees_account(payment.currency)
             _ensure_account(journal, fees, AccountType.EXPENSE, payment.currency)
             booked, swept = (fees, clearing), (clearing, bank_cash)
@@ -295,35 +386,40 @@ class SettlementReports:
         return ids[0]
 
 
-def _refusal(connection: Connection, payment: Row[Any], line: ReportLine) -> str:
-    """Why this adjustment line can't be booked against `payment`, or "" if it can."""
+def _contradiction(connection: Connection, payment: Row[Any], line: ReportLine) -> str:
+    """Why this adjustment line can never be booked against `payment`, or ""."""
     stated = (line.idempotency_key, line.rail, line.direction, line.currency)
     recorded = (payment.idempotency_key, payment.rail, payment.direction, payment.currency)
     if stated != recorded:
         return f"the line describes {stated}, but Payment {payment.id} is {recorded}"
-    settled = connection.scalar(
-        select(transitions.c.id).where(
-            transitions.c.payment_id == payment.id, transitions.c.state == PaymentState.SETTLED
-        )
-    )
-    if settled is None:
-        return f"the Ledger hasn't recorded Payment {payment.id} settled"
-    if line.reason == "fee_correction" and line.amount > 0:
-        return "a fee correction takes money out of Mintwharf's account, not in"
-    if line.reason == "payout_recall" and (payment.direction != "push" or line.amount < 0):
-        return "a Payout recall brings part of a push back in"
-    booked = connection.execute(
+    reason = line.reason
+    assert reason is not None  # the adapter refuses an adjustment line without one
+    if (line.amount > 0) != (reason.sign > 0):
+        return f"a {reason} moves money {'in' if reason.sign > 0 else 'out'}, not the other way"
+    if reason is AdjustmentReason.PAYOUT_RECALL and payment.direction != "push":
+        return "a Payout recall brings part of a push back in, and this is a pull"
+    booked = connection.scalars(
         select(settlement_report_lines.c.amount)
         .join(provider_adjustments, provider_adjustments.c.line_id == settlement_report_lines.c.id)
         .where(
             provider_adjustments.c.payment_id == payment.id,
             provider_adjustments.c.outcome == AdjustmentOutcome.BOOKED,
         )
-    ).scalars()
+    )
     total = sum(abs(amount) for amount in booked) + abs(line.amount)
     if total > payment.amount:
         return f"adjustments of {total} would claw back more than the {payment.amount} settled"
     return ""
+
+
+def _latest(connection: Connection, line_pk: int) -> AdjustmentOutcome | None:
+    outcome = connection.scalar(
+        select(provider_adjustments.c.outcome)
+        .where(provider_adjustments.c.line_id == line_pk)
+        .order_by(provider_adjustments.c.id.desc())
+        .limit(1)
+    )
+    return None if outcome is None else AdjustmentOutcome(outcome)
 
 
 def _ensure_account(journal: Journal, code: str, type_: AccountType, currency: str) -> None:
@@ -334,29 +430,66 @@ def _ensure_account(journal: Journal, code: str, type_: AccountType, currency: s
             journal.open_account(NewAccount(code=code, type=type_, currency=currency))
 
 
-def _banking_days(since: Any) -> Iterator[date]:
-    day = new_york_date(since)
-    if not is_banking_day(day):
-        day = next_banking_day(day)
-    while True:
-        yield day
-        day = next_banking_day(day)
-
-
 def _line_columns(line: ReportLine) -> dict[str, Any]:
+    return {name: getattr(line, name) for name in LINE_FIELDS}
+
+
+def _line_from(row: Row[Any]) -> ReportLine:
+    found = {name: getattr(row, name) for name in LINE_FIELDS}
+    if found["reason"] is not None:
+        found["reason"] = AdjustmentReason(found["reason"])
+    return ReportLine(**found)
+
+
+def adjustments_query() -> Select[Any]:
+    """Every Provider Adjustment decision, oldest first, with the line and report it's
+    about."""
+    return (
+        select(
+            provider_adjustments,
+            settlement_report_lines.c.line_id.label("report_line_id"),
+            settlement_report_lines.c.reason,
+            settlement_report_lines.c.amount,
+            settlement_report_lines.c.settled_at,
+            settlement_reports.c.report_date,
+        )
+        .join(
+            settlement_report_lines,
+            settlement_report_lines.c.id == provider_adjustments.c.line_id,
+        )
+        .join(settlement_reports, settlement_reports.c.id == settlement_report_lines.c.report_id)
+        .order_by(provider_adjustments.c.id)
+    )
+
+
+def _adjustment_view(row: Row[Any]) -> ProviderAdjustment:
+    return ProviderAdjustment(
+        report_date=row.report_date,
+        line_id=row.report_line_id,
+        reason=AdjustmentReason(row.reason),
+        amount=row.amount,
+        effective_at=row.settled_at,
+        outcome=AdjustmentOutcome(row.outcome),
+        payment_id=row.payment_id,
+        transaction_id=row.transaction_id,
+        detail=row.detail,
+        recorded_at=row.recorded_at,
+    )
+
+
+def latest_adjustments(connection: Connection, where: Any) -> dict[int, ProviderAdjustment]:
+    """The last decision about each adjustment line matching `where`, by the line's row id."""
     return {
-        "line_id": line.line_id,
-        "type": line.type,
-        "provider_payment_id": line.provider_payment_id,
-        "idempotency_key": line.idempotency_key,
-        "rail": line.rail,
-        "direction": line.direction,
-        "currency": line.currency,
-        "amount": line.amount,
-        "settled_at": line.settled_at,
-        "original_line_id": line.original_line_id,
-        "reason": line.reason,
+        row.line_id: _adjustment_view(row)
+        for row in connection.execute(adjustments_query().where(where))
     }
+
+
+def payment_adjustments(connection: Connection, payment_id: int) -> list[ProviderAdjustment]:
+    """The Provider Adjustments reported against a Payment, each as last decided."""
+    return list(
+        latest_adjustments(connection, provider_adjustments.c.payment_id == payment_id).values()
+    )
 
 
 def _view(connection: Connection, report_id: int) -> SettlementReportView:
@@ -368,12 +501,7 @@ def _view(connection: Connection, report_id: int) -> SettlementReportView:
         .where(settlement_report_lines.c.report_id == report_id)
         .order_by(settlement_report_lines.c.position)
     ).all()
-    adjusted = {
-        row.line_id: adjustment_view(row)
-        for row in connection.execute(
-            adjustments_query().where(settlement_report_lines.c.report_id == report_id)
-        )
-    }
+    decided = latest_adjustments(connection, settlement_report_lines.c.report_id == report_id)
     return SettlementReportView(
         id=report.id,
         provider=report.provider,
@@ -385,18 +513,8 @@ def _view(connection: Connection, report_id: int) -> SettlementReportView:
         lines=[
             ReportLineView(
                 position=line.position,
-                line_id=line.line_id,
-                type=line.type,
-                provider_payment_id=line.provider_payment_id,
-                idempotency_key=line.idempotency_key,
-                rail=line.rail,
-                direction=line.direction,
-                currency=line.currency,
-                amount=line.amount,
-                settled_at=line.settled_at,
-                original_line_id=line.original_line_id,
-                reason=line.reason,
-                adjustment=adjusted.get(line.id),
+                **{name: getattr(line, name) for name in LINE_FIELDS},
+                adjustment=decided.get(line.id),
             )
             for line in lines
         ],

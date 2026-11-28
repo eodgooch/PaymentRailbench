@@ -11,6 +11,7 @@ from typing import Annotated, Any, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from railbench.common.returns import NachaReturnCode
+from railbench.common.settlement_reports import AdjustmentReason
 
 BIGINT_MAX = 2**63 - 1
 
@@ -209,22 +210,40 @@ class SettlementAfterCutoff(_ReportFault):
     kind: Literal["settlement_after_cutoff"] = "settlement_after_cutoff"
 
 
-AdjustmentReason = Literal["fee_correction", "payout_recall"]
+Amount = Annotated[int, Field(strict=True, gt=0, le=BIGINT_MAX)]
+AfterBankingDays = Annotated[int, Field(strict=True, ge=1, le=30)]
 
 
-class ProviderAdjustment(_ReportFault):
-    """`after` Banking Days after the settlement's report, the Provider claws back
-    `amount` of it: a fee correction (any Payment: the money leaves Mintwharf's account) or
-    a recalled part of a Payout (a push only: the money comes back in). Reported on that
-    Banking Day's Settlement Report, never as a Provider Event."""
+class PlannedAdjustment(_ReportFault):
+    """A Provider Adjustment: `after` Banking Days after the settlement's report, the
+    Provider adjusts `amount` of it (ADR 0014). A fee correction (any Payment) takes that
+    much out of Mintwharf's account; a Payout recall (a push only) pulls it back from the
+    recipient into Mintwharf's account. Reported on that Banking Day's Settlement Report,
+    never as a Provider Event."""
 
     kind: Literal["provider_adjustment"] = "provider_adjustment"
-    amount: Annotated[int, Field(strict=True, gt=0, le=BIGINT_MAX)]
+    amount: Amount
     reason: AdjustmentReason
-    after: Annotated[int, Field(strict=True, ge=1, le=30)] = 1
+    after: AfterBankingDays = 1
 
 
-ReportFault = MissingReportLine | WrongReportAmount | SettlementAfterCutoff | ProviderAdjustment
+class OrphanAdjustment(_ReportFault):
+    """An adjustment line, `after` Banking Days after this Payment's settlement report, on
+    that report, against a Payment ID the Provider never made for Mintwharf: a fee
+    correction of `amount` the Ledger has nothing to book against."""
+
+    kind: Literal["orphan_adjustment"] = "orphan_adjustment"
+    amount: Amount
+    after: AfterBankingDays = 1
+
+
+ReportFault = (
+    MissingReportLine
+    | WrongReportAmount
+    | SettlementAfterCutoff
+    | PlannedAdjustment
+    | OrphanAdjustment
+)
 LINE_FAULTS = (MissingReportLine, WrongReportAmount, SettlementAfterCutoff)
 
 # A discriminated union: a new kind is one more variant here.
@@ -236,7 +255,8 @@ FaultPlan = Annotated[
     | MissingReportLine
     | WrongReportAmount
     | SettlementAfterCutoff
-    | ProviderAdjustment,
+    | PlannedAdjustment
+    | OrphanAdjustment,
     Field(discriminator="kind"),
 ]
 
@@ -266,12 +286,12 @@ class PaymentPlan(BaseModel):
         for fault in self.report_faults:
             if isinstance(fault, WrongReportAmount) and amount + fault.by <= 0:
                 raise ValueError(f"fault {fault.id}: {amount} off by {fault.by} isn't above 0")
-            if isinstance(fault, ProviderAdjustment):
+            if isinstance(fault, PlannedAdjustment):
                 if fault.amount > amount:
                     raise ValueError(
                         f"fault {fault.id}: can't claw back {fault.amount} of {amount}"
                     )
-                if fault.reason == "payout_recall" and direction != "push":
+                if fault.reason is AdjustmentReason.PAYOUT_RECALL and direction != "push":
                     raise ValueError(f"fault {fault.id}: only a Payout (a push) is recalled")
 
     @model_validator(mode="after")
@@ -286,20 +306,20 @@ class PaymentPlan(BaseModel):
         line_faults = [f for f in self.faults if isinstance(f, LINE_FAULTS)]
         if len(line_faults) > 1:
             raise ValueError("a report line can be missing, wrong or late, but only one of them")
-        if sum(isinstance(f, ProviderAdjustment) for f in self.faults) > 1:
+        if sum(isinstance(f, PlannedAdjustment) for f in self.faults) > 1:
             raise ValueError("a Payment gets at most one Provider Adjustment")
         emitted = events_for(self.outcome, self.rail, returned=bool(returns))
         for fault in self.faults:
             later = (
                 fault.after if isinstance(fault, OutOfOrderDelivery | DuplicateDelivery) else None
             )
-            if fault.event not in emitted and isinstance(fault, ReportFault):
-                raise ValueError(f"fault {fault.id}: only a Payment that settles is on a report")
             if fault.event not in emitted:
-                raise ValueError(
-                    f"fault {fault.id}: a Payment that ends {self.outcome!r} never emits "
-                    f"{fault.event!r}"
+                why = (
+                    "only a Payment that settles is on a report"
+                    if isinstance(fault, ReportFault)
+                    else f"a Payment that ends {self.outcome!r} never emits {fault.event!r}"
                 )
+                raise ValueError(f"fault {fault.id}: {why}")
             if later is not None and (
                 later not in emitted or emitted.index(later) <= emitted.index(fault.event)
             ):

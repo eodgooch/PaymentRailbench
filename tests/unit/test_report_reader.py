@@ -5,6 +5,7 @@ from datetime import UTC, date, datetime
 
 import pytest
 
+from railbench.common.settlement_reports import AdjustmentReason
 from railbench.payments.provider import MalformedReport, ReportLine, read_report_csv
 
 HEADER = (
@@ -49,7 +50,7 @@ def test_a_report_reads_as_its_lines() -> None:
             amount=700,
             settled_at=datetime(2026, 9, 4, 16, 0, tzinfo=UTC),
             original_line_id="l0",
-            reason="payout_recall",
+            reason=AdjustmentReason.PAYOUT_RECALL,
         ),
     )
 

@@ -137,6 +137,14 @@ def get_marketplace(request: Request) -> Marketplace:
 
 MarketplaceDep = Annotated[Marketplace, Depends(get_marketplace)]
 
+
+def get_reports(request: Request) -> SettlementReports:
+    reports: SettlementReports = request.app.state.reports
+    return reports
+
+
+ReportsDep = Annotated[SettlementReports, Depends(get_reports)]
+
 MARKETPLACE_ERROR_STATUS = {
     AuctionCloseNotFound: status.HTTP_404_NOT_FOUND,
     AuctionCloseConflict: status.HTTP_409_CONFLICT,
@@ -346,10 +354,9 @@ def create_app(
 
     @app.get("/settlement-reports/{provider}/{report_date}")
     def get_settlement_reports(
-        provider: str, report_date: date, request: Request
+        provider: str, report_date: date, reports: ReportsDep
     ) -> list[SettlementReportView]:
-        found: SettlementReports = request.app.state.reports
-        return found.reports(provider, report_date)
+        return reports.reports(provider, report_date)
 
     @app.post("/providers/{provider}/events", responses={401: {}, 400: {}, 503: {}})
     async def receive_event(provider: str, request: Request, payments: PaymentsDep) -> Receipt:

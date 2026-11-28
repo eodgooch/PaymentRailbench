@@ -12,7 +12,8 @@ from railbench.common.settlement_reports import COLUMNS
 from railbench.simulator.model import (
     FaultPlan,
     MissingReportLine,
-    ProviderAdjustment,
+    OrphanAdjustment,
+    PlannedAdjustment,
     SettlementAfterCutoff,
     WrongReportAmount,
 )
@@ -147,7 +148,7 @@ def test_a_settlement_after_cutoff_lands_on_the_next_banking_days_report() -> No
 
 
 def test_a_provider_adjustment_claws_back_on_a_later_report() -> None:
-    fault = ProviderAdjustment(id="fee", amount=300, reason="fee_correction", after=2)
+    fault = PlannedAdjustment(id="fee", amount=300, reason="fee_correction", after=2)
     payment = settled("pull", fault)
 
     friday = rows(build_report("simulator", FRIDAY, [payment]).body)
@@ -178,7 +179,7 @@ def test_a_provider_adjustment_claws_back_on_a_later_report() -> None:
 
 
 def test_a_recalled_part_of_a_payout_comes_back_in() -> None:
-    fault = ProviderAdjustment(id="recall", amount=700, reason="payout_recall")
+    fault = PlannedAdjustment(id="recall", amount=700, reason="payout_recall")
     payout = settled("payout", fault, direction="push", amount=2_700)
 
     [adjustment] = rows(build_report("simulator", TUESDAY, [payout]).body)
@@ -193,3 +194,22 @@ def test_each_fault_is_injected_on_one_report_only(day: date) -> None:
     found = build_report("simulator", day, [payment]).injected
 
     assert len(found) == (1 if day == FRIDAY else 0)
+
+
+def test_an_orphan_adjustment_names_a_payment_the_provider_never_made() -> None:
+    fault = OrphanAdjustment(id="orphan", amount=450)
+    payment = settled("pull", fault)
+
+    [adjustment] = rows(build_report("simulator", TUESDAY, [payment]).body)
+    [injected] = build_report("simulator", TUESDAY, [payment]).injected
+
+    assert adjustment["provider_payment_id"].startswith("simpay_")
+    assert adjustment["provider_payment_id"] != "simpay_pull"
+    assert (adjustment["idempotency_key"], adjustment["amount"], adjustment["reason"]) == (
+        "",
+        "-450",
+        "fee_correction",
+    )
+    assert adjustment["original_line_id"].startswith("simline_")
+    assert (injected.cause_code, injected.line_id) == ("orphan_adjustment", adjustment["line_id"])
+    assert content_days("simulator", payment) == {FRIDAY, TUESDAY}

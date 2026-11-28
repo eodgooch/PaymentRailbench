@@ -178,7 +178,7 @@ The record raised when a Return leaves a Customer Balance short: the deficit mov
 _Avoid_: Break (Breaks come from Reconciliation)
 
 **Provider Adjustment**:
-A Provider clawing back part of an already settled amount after the fact (for example a fee correction or a partial recall of a Payout batch), reported on a later Settlement Report and booked against the original Payment.
+A Provider taking back part of an already settled amount after the fact, reported on a later Settlement Report and booked against the original Payment. A fee correction takes money out of Mintwharf's account, and Mintwharf bears it as Provider Fees. A Payout recall pulls part of a Payout back from its recipient into Mintwharf's account, and Mintwharf owes that part to the seller again. One with no matching Payment is kept unmatched, never booked.
 _Avoid_: Partial return (ACH Returns are all-or-nothing)
 
 **Cutoff**:

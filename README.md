@@ -271,6 +271,7 @@ faults:
   - {id: late, kind: settlement_after_cutoff, payment: jules-funding}
   - {id: fee, kind: provider_adjustment, payment: wren-funding, amount: 150, reason: fee_correction, after: 2}
   - {id: recall, kind: provider_adjustment, payment: ottoline-payout, amount: 2000, reason: payout_recall}
+  - {id: stranger, kind: orphan_adjustment, payment: pax-funding, amount: 450}
 ```
 
 The Ledger's `settlement-report-ingest` job fetches each due report through the Provider
@@ -279,8 +280,11 @@ bytes again do nothing; a different report for an ingested day is kept as a `con
 unreadable one as `malformed`). Lines change no balance: a missing, wrong or late line is
 evidence for Reconciliation. A Provider Adjustment is booked against the original Payment,
 through its Clearing Account: a fee correction from Bank Cash to Provider Fees (Mintwharf
-bears it), a Payout recall from Bank Cash back to the seller's Customer Balance. One the
-Ledger can't match to a settled Payment is stored `unmatched`, not booked.
+bears it), a Payout recall pulled back from the recipient into Bank Cash and credited to
+the seller's Customer Balance (Mintwharf owes them that part again). One for a Payment the
+Ledger hasn't heard settled yet is kept `pending` and decided again on every run of the job;
+one with no matching Payment (an `orphan_adjustment` Fault makes one), contradicting it, or
+for a Payment that ended without settling is stored `unmatched`, never booked.
 `GET /settlement-reports/{provider}/{date}` on the Ledger lists what it received, and
 `GET /payments/{id}` shows a Payment's adjustments. `scenarios/settlement-report-faults.yaml`
 has every report Fault; replaying it reproduces the Ledger, adjustments included (tested).
@@ -310,8 +314,10 @@ and, per seller, a Payout's `speed` and how its RTP and ACH Payments end
 on whichever of its Payments emits the event. Random Faults are drawn from the seed before
 the run (for pulls only); Payment and event IDs are derived from
 Idempotency Keys, and the runner jumps the ManualClock from one due moment to the next, so a
-Scenario and seed replay exactly (tested: two runs, one in a database already holding another
-run, give the same manifest, ticks and Ledger; another seed gives other Faults). A webhook
+Scenario and seed replay exactly in a fresh database (tested: two runs give the same manifest,
+ticks, Settlement Reports and Ledger; another seed gives other Faults). The runner refuses a
+database that isn't fresh: a Settlement Report covers every Payment settled that day, so a
+second run in one database would find its reports already published (ADR 0014). A webhook
 that fails or times out (60 s) fails the run rather than being retried off course.
 
 ```sh

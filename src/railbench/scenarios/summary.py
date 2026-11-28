@@ -15,8 +15,8 @@ row by something stable instead:
 - Auction Closes by auction ID, their lots by lot ID and their Payouts by seller, each lot's
   Transaction and each Payout step's Hold by Idempotency Key;
 - Settlement Reports by `<provider>:<report date>`, every version received in order, with
-  its lines as stated and each Provider Adjustment's outcome, Payment (by Idempotency Key)
-  and Transaction (by its key).
+  its lines as stated and every decision about each Provider Adjustment (pending, booked,
+  unmatched) with its Payment (by Idempotency Key) and Transaction (by its key).
 
 `accounts` narrows the summary to the Payments funding those Customer Balances and the
 Ledger rows that touch them or belong to those Payments, for databases shared with other
@@ -33,7 +33,8 @@ from sqlalchemy import Connection, Engine, select
 
 from railbench.ledger.tables import accounts, entries, hold_ends, holds, settlements, transactions
 from railbench.marketplace.tables import auction_closes, lots, payout_steps, payouts
-from railbench.payments.service import parse_ledger_key
+from railbench.payments.accounts import parse_ledger_key
+from railbench.payments.reports import LINE_FIELDS
 from railbench.payments.tables import (
     inbox,
     inbox_outcomes,
@@ -121,7 +122,11 @@ class _Summariser:
                 settlement_report_lines.c.report_id, settlement_report_lines.c.position
             )
         ).all()
-        adjusted = {row.line_id: row for row in self._c.execute(select(provider_adjustments))}
+        decisions: dict[int, list[Any]] = {}
+        for row in self._c.execute(
+            select(provider_adjustments).order_by(provider_adjustments.c.id)
+        ):
+            decisions.setdefault(row.line_id, []).append(row)
         keys = {row.id: row.idempotency_key for row in self._c.execute(select(payments))}
         found: dict[str, list[Any]] = {}
         reports = self._c.execute(select(settlement_reports).order_by(settlement_reports.c.id))
@@ -135,18 +140,14 @@ class _Summariser:
                     "lines": [
                         {
                             "position": line.position,
-                            "line_id": line.line_id,
-                            "type": line.type,
-                            "provider_payment_id": line.provider_payment_id,
-                            "idempotency_key": line.idempotency_key,
-                            "rail": line.rail,
-                            "direction": line.direction,
-                            "currency": line.currency,
-                            "amount": line.amount,
-                            "settled_at": _time(line.settled_at),
-                            "original_line_id": line.original_line_id,
-                            "reason": line.reason,
-                            "adjustment": self._adjustment(adjusted.get(line.id), keys),
+                            **{
+                                name: _time(value) if isinstance(value, datetime) else value
+                                for name in LINE_FIELDS
+                                for value in (getattr(line, name),)
+                            },
+                            "adjustments": [
+                                self._adjustment(row, keys) for row in decisions.get(line.id, [])
+                            ],
                         }
                         for line in line_rows
                         if line.report_id == report.id
@@ -155,9 +156,7 @@ class _Summariser:
             )
         return dict(sorted(found.items()))
 
-    def _adjustment(self, row: Any, keys: dict[int, str]) -> dict[str, Any] | None:
-        if row is None:
-            return None
+    def _adjustment(self, row: Any, keys: dict[int, str]) -> dict[str, Any]:
         return {
             "outcome": row.outcome,
             "payment": None if row.payment_id is None else keys[row.payment_id],

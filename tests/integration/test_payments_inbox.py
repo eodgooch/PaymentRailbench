@@ -30,9 +30,10 @@ from railbench.ledger.model import (
     SystemJob,
 )
 from railbench.ledger.tables import accounts, entries, transactions
+from railbench.payments.accounts import clearing_account
 from railbench.payments.model import NewPayment
 from railbench.payments.provider import SimulatorProvider
-from railbench.payments.service import HoldMismatch, Payments, clearing_account
+from railbench.payments.service import HoldMismatch, Payments
 from railbench.payments.tables import inbox
 from tests.integration.helpers import unique
 

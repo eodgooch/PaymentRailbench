@@ -52,7 +52,6 @@ published one; the API serves it signed like a webhook.
 
 import hashlib
 import json
-from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from itertools import takewhile
@@ -62,7 +61,14 @@ import httpx
 from sqlalchemy import Connection, Engine, Row, and_, exists, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from railbench.common.calendar import at_new_york, is_banking_day, new_york_date, next_banking_day
+from railbench.common.calendar import (
+    at_new_york,
+    banking_day_on_or_after,
+    banking_days_from,
+    is_banking_day,
+    new_york_date,
+    next_banking_day,
+)
 from railbench.common.clock import Clock
 from railbench.common.fingerprint import fingerprint as payload_fingerprint
 from railbench.common.returns import ReturnCode, is_late, return_code
@@ -411,7 +417,7 @@ class Simulator:
             if first is None:
                 return
             published = self._published_days(connection)
-            due = takewhile(lambda d: report_published_at(d) <= now, _banking_days(first))
+            due = takewhile(lambda d: report_published_at(d) <= now, banking_days_from(first))
             missing = [d for d in due if d not in published]
             if not missing:
                 return
@@ -433,7 +439,7 @@ class Simulator:
             )
         if last is None:
             return None
-        for day in _banking_days(first, until=last):
+        for day in banking_days_from(first, until=last):
             if day not in published:
                 return report_published_at(day)
         return None
@@ -500,8 +506,7 @@ class Simulator:
         created = connection.scalar(select(func.min(payments.c.created_at)))
         if created is None:
             return None
-        day = new_york_date(created)
-        return day if is_banking_day(day) else next_banking_day(day)
+        return banking_day_on_or_after(new_york_date(created))
 
     @staticmethod
     def _published_days(connection: Connection) -> set[date]:
@@ -759,14 +764,6 @@ def _stored_plan(connection: Connection, idempotency_key: str) -> PaymentPlan | 
             "faults": stored.faults,
         }
     )
-
-
-def _banking_days(first: date, until: date | None = None) -> Iterator[date]:
-    """Banking Days from `first` on (to `until` inclusive, or for as long as asked)."""
-    day = first if is_banking_day(first) else next_banking_day(first)
-    while until is None or day <= until:
-        yield day
-        day = next_banking_day(day)
 
 
 def _settled(connection: Connection) -> list[Settled]:

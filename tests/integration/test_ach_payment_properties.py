@@ -52,9 +52,10 @@ from railbench.common.signing import SIGNATURE_HEADER, sign
 from railbench.ledger.journal import Journal
 from railbench.ledger.model import AccountType, NewAccount
 from railbench.ledger.tables import entries, hold_ends, holds, settlements
+from railbench.payments.accounts import clearing_account, customer_balance_account
 from railbench.payments.model import NewPayment
 from railbench.payments.provider import SimulatorProvider
-from railbench.payments.service import Payments, clearing_account, customer_balance_account
+from railbench.payments.service import Payments
 from railbench.scenarios.replay import replay_inbox
 from railbench.scenarios.runner import fresh_database
 from railbench.scenarios.summary import Summary, ledger_summary

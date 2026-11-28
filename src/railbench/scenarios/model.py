@@ -15,13 +15,17 @@ the Simulator gets a plan for each Payment the Payout could make (`<payout>:rtp`
 `<payout>:ach`), under the Idempotency Keys the Ledger will use, and a Fault lands on every
 one of them that emits its event.
 
-Fault kinds are a discriminated union on `kind`, shared with the Simulator. A new kind
-(Cutoff and Settlement Report Faults, #8) is one more variant in that union plus the
-Simulator's case for injecting it; the rest of the Scenario file stays as it is.
+Fault kinds are a discriminated union on `kind`. Adding one takes four edits: its plan
+model in the Simulator's `FaultPlan` union (`railbench.simulator.model`), the Simulator's
+case for injecting it, a Scenario subclass here that adds the Payment it names (joined to
+`ScenarioFault`), and its case in `_plain`; any checks it needs against other Faults or the
+Payment's size go in `PaymentPlan`'s validators.
 
 Settlement Report Faults (`missing_report_line`, `wrong_report_amount`,
-`settlement_after_cutoff`, `provider_adjustment`; ADR 0014) name a Payment or Payout that
-settles and act on its line in the Provider's Settlement Report, never on a Provider Event.
+`settlement_after_cutoff`, `provider_adjustment`, `orphan_adjustment`; ADR 0014) name a
+Payment or Payout that settles and act on its line in the Provider's Settlement Report
+(an orphan adjustment adds a line for a Payment the Provider never made), never on a
+Provider Event.
 Their sizes are checked against what the Payment moves (a Payout's is its seller's proceeds
 less Mintwharf's fee): a wrong amount stays above zero, an adjustment claws back at most what
 settled, and only a Payout is recalled.
@@ -45,18 +49,19 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validato
 from railbench.ledger.model import BIGINT_MAX
 from railbench.marketplace.model import payout_key
 from railbench.marketplace.service import seller_fee
-from railbench.payments.service import customer_balance_account
+from railbench.payments.accounts import customer_balance_account
 from railbench.simulator.model import (
     DelayedDelivery,
     DuplicateDelivery,
     EventName,
     FaultPlan,
     MissingReportLine,
+    OrphanAdjustment,
     Outcome,
     OutOfOrderDelivery,
     PaymentPlan,
+    PlannedAdjustment,
     PlannedReturn,
-    ProviderAdjustment,
     SettlementAfterCutoff,
     WrongReportAmount,
     events_for,
@@ -169,12 +174,24 @@ class AfterCutoff(SettlementAfterCutoff, _OnPayment):
     pass
 
 
-class Adjustment(ProviderAdjustment, _OnPayment):
+class Adjustment(PlannedAdjustment, _OnPayment):
     pass
 
 
+class Orphan(OrphanAdjustment, _OnPayment):
+    """An orphan adjustment, on the report of the Banking Day `after` the named Payment's."""
+
+
 ScenarioFault = Annotated[
-    Duplicate | Delay | OutOfOrder | Return | MissingLine | WrongAmount | AfterCutoff | Adjustment,
+    Duplicate
+    | Delay
+    | OutOfOrder
+    | Return
+    | MissingLine
+    | WrongAmount
+    | AfterCutoff
+    | Adjustment
+    | Orphan,
     Field(discriminator="kind"),
 ]
 FaultKind = Literal["duplicate", "delay", "out_of_order"]
@@ -405,7 +422,9 @@ def _plain(fault: ScenarioFault) -> FaultPlan:
         case AfterCutoff():
             return SettlementAfterCutoff(**data)
         case Adjustment():
-            return ProviderAdjustment(**data)
+            return PlannedAdjustment(**data)
+        case Orphan():
+            return OrphanAdjustment(**data)
 
 
 def load(path: Path | str) -> Scenario:

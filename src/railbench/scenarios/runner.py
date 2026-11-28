@@ -21,8 +21,11 @@ No randomness is drawn here and no wall clock is read, so a Scenario and seed gi
 Ledger, Payment and event IDs, delivery order and Fault Manifest every run. The one
 dependency on wall time left is the webhook timeout (DELIVERY_TIMEOUT): a delivery that
 fails or times out fails the run (DeliveryFailed) rather than being retried off the seed's
-course. The database must be migrated and hold no other Scenario's Accounts
-(`fresh_database()` makes one).
+course. The database must be migrated and empty (`fresh_database()` makes one), and `run`
+refuses one that isn't (DatabaseNotFresh): a Settlement Report covers every Payment its
+Provider settled that day, and is frozen once published and ingested, so a run in a
+database that already holds another's would find its days' reports already published
+without its settlements (ADR 0011, ADR 0014). Determinism holds per fresh database.
 """
 
 import secrets
@@ -37,7 +40,7 @@ from uuid import uuid4
 import httpx
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, make_url, text
+from sqlalchemy import Engine, create_engine, make_url, text
 
 from railbench.common.clock import ManualClock
 from railbench.common.db import LEDGER_APP_ROLE, make_engine
@@ -65,6 +68,34 @@ class RunDidNotSettle(RuntimeError):
     pass
 
 
+class DatabaseNotFresh(RuntimeError):
+    """The database already holds Ledger or Simulator rows."""
+
+
+# A table per kind of thing a run writes; any row in any of them means the database is used.
+_FRESH_TABLES = (
+    "ledger.accounts",
+    "payments.payments",
+    "simulator.payments",
+    "simulator.settlement_reports",
+    "marketplace.auction_closes",
+)
+
+
+def check_fresh(engine: Engine) -> None:
+    """Raise DatabaseNotFresh unless a Scenario run would be the database's first."""
+    with engine.connect() as connection:
+        used = [
+            table
+            for table in _FRESH_TABLES
+            if connection.scalar(text(f"SELECT EXISTS (SELECT 1 FROM {table})"))
+        ]
+    if used:
+        raise DatabaseNotFresh(
+            f"a Scenario runs in a fresh database, and this one already has rows in {used}"
+        )
+
+
 @dataclass(frozen=True)
 class Run:
     scenario: Scenario
@@ -88,11 +119,16 @@ def run(
 ) -> Run:
     """Run `scenario` with `seed` (default: the Scenario's own) against the migrated, empty
     database at `database_url`, and write its Fault Manifest to `manifest_path` (default
-    reports/manifests/<scenario>-<seed>.json)."""
+    reports/manifests/<scenario>-<seed>.json). Raises DatabaseNotFresh for a used one."""
     seed = scenario.seed if seed is None else seed
     plans = scenario.plans(seed)
     clock = ManualClock(scenario.start)
     owner = create_engine(database_url)
+    try:
+        check_fresh(owner)
+    except DatabaseNotFresh:
+        owner.dispose()
+        raise
     app_engine = make_engine(database_url, role=LEDGER_APP_ROLE)
     ledger_port, simulator_port = free_port(), free_port()
     ledger_url = f"http://127.0.0.1:{ledger_port}"

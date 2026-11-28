@@ -22,12 +22,12 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast, get_args
 
 import httpx
 
 from railbench.common.returns import ReturnCode, return_code
-from railbench.common.settlement_reports import ADJUSTMENT_REASONS, COLUMNS, LINE_TYPES
+from railbench.common.settlement_reports import COLUMNS, AdjustmentReason
 from railbench.common.signing import SIGNATURE_HEADER, BadSignature, verify
 from railbench.payments.state_machine import Direction, PaymentState, Rail
 
@@ -79,7 +79,7 @@ class ReportLine:
     amount: int
     settled_at: datetime
     original_line_id: str | None = None
-    reason: str | None = None
+    reason: AdjustmentReason | None = None
 
 
 @dataclass(frozen=True)
@@ -270,9 +270,9 @@ def read_report_csv(provider: str, report_date: date, body: bytes) -> Settlement
 def _line(provider: str, report_date: date, row: dict[str, str]) -> ReportLine:
     if row["report_date"] != report_date.isoformat() or row["provider"] != provider:
         raise ValueError(f"a line for {row['provider']} {row['report_date']}")
-    if row["type"] not in LINE_TYPES:
+    if row["type"] not in get_args(LineType):
         raise ValueError(f"unknown line type {row['type']!r}")
-    if row["rail"] not in ("ach", "rtp") or row["direction"] not in ("pull", "push"):
+    if row["rail"] not in get_args(Rail) or row["direction"] not in get_args(Direction):
         raise ValueError(f"unknown Rail or direction {row['rail']!r} {row['direction']!r}")
     if not _AMOUNT.match(row["amount"]) or not _CURRENCY.match(row["currency"]):
         raise ValueError(f"not an amount in Minor Units: {row['amount']!r} {row['currency']!r}")
@@ -285,7 +285,7 @@ def _line(provider: str, report_date: date, row: dict[str, str]) -> ReportLine:
     adjustment = row["type"] == "adjustment"
     if adjustment != bool(row["original_line_id"]) or adjustment != bool(row["reason"]):
         raise ValueError("only an adjustment line, and every one, names its original and reason")
-    if adjustment and row["reason"] not in ADJUSTMENT_REASONS:
+    if adjustment and row["reason"] not in set(AdjustmentReason):
         raise ValueError(f"unknown adjustment reason {row['reason']!r}")
     return ReportLine(
         line_id=row["line_id"],
@@ -298,5 +298,5 @@ def _line(provider: str, report_date: date, row: dict[str, str]) -> ReportLine:
         amount=int(row["amount"]),
         settled_at=settled_at,
         original_line_id=row["original_line_id"] or None,
-        reason=row["reason"] or None,
+        reason=AdjustmentReason(row["reason"]) if adjustment else None,
     )

@@ -129,7 +129,7 @@ provider_adjustments = Table(
     "provider_adjustments",
     metadata,
     Column("id", BigInteger, primary_key=True),
-    Column("line_id", BigInteger, nullable=False, unique=True),
+    Column("line_id", BigInteger, nullable=False),
     Column("outcome", Text, nullable=False),
     Column("payment_id", BigInteger),
     Column("transaction_id", BigInteger),

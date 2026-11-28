@@ -7,7 +7,9 @@ from typing import Annotated, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from railbench.common.returns import NachaReturnCode
+from railbench.common.settlement_reports import AdjustmentReason
 from railbench.ledger.model import BIGINT_MAX, AccountCode, Currency, IdempotencyKey
+from railbench.payments.provider import LineType
 from railbench.payments.state_machine import Direction, PaymentState, Rail
 
 
@@ -86,8 +88,11 @@ class ReturnException(_Value):
 
 
 class AdjustmentOutcome(StrEnum):
+    # Its Payment is known and agrees, but hasn't settled in the Ledger yet: tried again on
+    # every run of the ingest job until it's booked or unmatched.
+    PENDING = "pending"
     BOOKED = "booked"  # booked against the original Payment
-    UNMATCHED = "unmatched"  # stored, not booked: evidence for Reconciliation
+    UNMATCHED = "unmatched"  # stored, never booked: evidence for Reconciliation
 
 
 class ProviderAdjustment(_Value):
@@ -95,7 +100,7 @@ class ProviderAdjustment(_Value):
 
     report_date: date
     line_id: str
-    reason: str
+    reason: AdjustmentReason
     amount: int  # signed, as reported: + into Mintwharf's account, - out of it
     effective_at: datetime
     outcome: AdjustmentOutcome
@@ -125,7 +130,7 @@ class Payment(_Value):
     transitions: list[Transition]
     exceptions: list[PaymentException]
     return_exceptions: list[ReturnException]
-    # Provider Adjustments reported against it, booked or not (ADR 0014).
+    # Provider Adjustments reported against it, each as last decided (ADR 0014).
     adjustments: list[ProviderAdjustment] = []
 
 
@@ -166,7 +171,7 @@ class ReportLineView(_Value):
 
     position: int
     line_id: str
-    type: str
+    type: LineType
     provider_payment_id: str
     idempotency_key: str
     rail: Rail
@@ -175,7 +180,8 @@ class ReportLineView(_Value):
     amount: int
     settled_at: datetime
     original_line_id: str | None
-    reason: str | None
+    reason: AdjustmentReason | None
+    # What the Ledger last decided about an adjustment line (pending, booked or unmatched).
     adjustment: ProviderAdjustment | None
 
 
