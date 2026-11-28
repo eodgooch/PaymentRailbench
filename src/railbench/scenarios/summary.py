@@ -1,7 +1,8 @@
 """A canonical picture of the Ledger, for comparing two databases (ADR 0011).
 
 Two Ledgers are the same when they hold the same Transactions, Entries, Settlements, Holds
-and Hold ends, and the same Payments with the same state changes and Inbox outcomes, with
+and Hold ends, and the same Payments with the same state changes, Inbox outcomes and return
+exceptions, with
 the same amounts, Accounts, Effective Times, Recorded Times and Actors. What differs between
 databases is only their surrogate keys (sequence-generated IDs), so the summary names every
 row by something stable instead:
@@ -29,7 +30,13 @@ from sqlalchemy import Connection, Engine, select
 from railbench.ledger.tables import accounts, entries, hold_ends, holds, settlements, transactions
 from railbench.marketplace.tables import auction_closes, lots, payout_steps, payouts
 from railbench.payments.service import parse_ledger_key
-from railbench.payments.tables import inbox, inbox_outcomes, payments, transitions
+from railbench.payments.tables import (
+    inbox,
+    inbox_outcomes,
+    payments,
+    return_exceptions,
+    transitions,
+)
 
 Summary = dict[str, Any]
 
@@ -154,6 +161,7 @@ class _Summariser:
     def _summarise_payments(self) -> dict[str, Any]:
         steps = self._c.execute(select(transitions).order_by(transitions.c.id)).all()
         outcomes = self._c.execute(select(inbox_outcomes).order_by(inbox_outcomes.c.id)).all()
+        raised = self._c.execute(select(return_exceptions).order_by(return_exceptions.c.id)).all()
         found = {}
         for row in self._payments.values():
             found[row.idempotency_key] = {
@@ -192,6 +200,25 @@ class _Summariser:
                     }
                     for o in outcomes
                     if o.payment_id == row.id
+                ],
+                "return_exceptions": [
+                    {
+                        "event_id": self._events[str(e.inbox_id)],
+                        "customer_account": e.customer_account,
+                        "recovery_account": e.recovery_account,
+                        "currency": e.currency,
+                        "return_code": e.return_code,
+                        "exposure": e.exposure,
+                        "late": e.late,
+                        "recovery_transaction": self._key(
+                            self._transaction_key(e.recovery_transaction_id)
+                        ),
+                        "detail": e.detail,
+                        "effective_at": _time(e.effective_at),
+                        "recorded_at": _time(e.recorded_at),
+                    }
+                    for e in raised
+                    if e.payment_id == row.id
                 ],
             }
         return dict(sorted(found.items()))

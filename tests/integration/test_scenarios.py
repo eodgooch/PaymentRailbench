@@ -350,3 +350,102 @@ def test_replaying_the_inbox_reproduces_a_ledger_with_payouts(
         assert ledger_summary(replayed) == original.summary
     finally:
         replayed.dispose()
+
+
+def account_totals(summary: dict[str, Any]) -> dict[str, int]:
+    """Every Account's Entries summed, signed debit-positive (a liability in credit reads
+    negative)."""
+    totals: dict[str, int] = {}
+    for transaction in summary["transactions"].values():
+        for account, _currency, amount, *_ in transaction["entries"]:
+            totals[account] = totals.get(account, 0) + amount
+    return totals
+
+
+def test_the_headline_late_r10_after_an_instant_payout_ends_in_recovery_receivable(
+    database_url: str, manifests: Path
+) -> None:
+    found = run_in_fresh_database(
+        database_url, manifests, load(SCENARIOS / "late-r10-after-instant-payout.yaml")
+    )
+
+    imogen, tobias = "customer:c-imogen:usd", "customer:c-tobias:usd"
+    totals = account_totals(found.summary)
+    assert totals[imogen] == 0
+    assert totals["recovery-receivable:customer:c-imogen:usd"] == 30_000
+    assert totals["bank-cash:usd"] == -27_000  # in 300.00, back out 300.00, paid out 270.00
+    assert totals["fee-revenue:usd"] == -3_000
+    assert totals[tobias] == 0  # paid in full, untouched by the Return
+    assert totals["clearing:simulator:ach:usd"] == totals["clearing:simulator:rtp:usd"] == 0
+
+    funding = payment(found, "imogen-funding")
+    assert states(found, "imogen-funding") == [
+        "created",
+        "submitted",
+        "settled",
+        "available",
+        "returned",
+    ]
+    assert outcomes(found, "imogen-funding") == ["applied", "applied", "applied"]
+    returned = funding["transitions"][-1]
+    assert returned["effective_at"] == "2026-10-06T12:30:00+00:00"
+    reversal = found.summary["transactions"][returned["transaction"]]
+    assert reversal["reverses"] == funding["transitions"][1]["transaction"]
+    [exception] = funding["return_exceptions"]
+    assert (exception["return_code"], exception["late"], exception["exposure"]) == (
+        "R10",
+        True,
+        30_000,
+    )
+    assert exception["recovery_account"] == "recovery-receivable:customer:c-imogen:usd"
+
+    [close] = found.summary["auction_closes"].values()
+    assert [s["step"] for s in close["payouts"][tobias]["steps"]] == ["reserved", "instant"]
+    assert [(f.fault_id, f.kind, f.cause_code) for f in found.manifest.faults] == [
+        ("imogen-r10", "return", "late_return"),
+        ("return-delivered-twice", "duplicate", "duplicate_delivery"),
+    ]
+    assert "R10" in found.manifest.faults[0].root_cause
+
+
+def test_a_settlement_redelivered_after_a_return_changes_nothing(
+    database_url: str, manifests: Path
+) -> None:
+    found = run_in_fresh_database(
+        database_url, manifests, load(SCENARIOS / "duplicate-settlement-after-return.yaml")
+    )
+
+    assert states(found, "kit-funding") == ["created", "submitted", "settled", "returned"]
+    # Three events, each applied once; the settlement's redelivery found its Inbox row.
+    assert outcomes(found, "kit-funding") == ["applied", "applied", "applied"]
+    assert {f.fault_id for f in found.manifest.faults} == {"kit-r01", "settlement-redelivered"}
+    totals = account_totals(found.summary)
+    assert totals["customer:c-kit:usd"] == totals["bank-cash:usd"] == 0
+    assert totals["clearing:simulator:ach:usd"] == 0
+    assert "recovery-receivable:customer:c-kit:usd" not in totals
+    [hold] = found.summary["holds"].values()
+    assert hold["end"]["effective_at"] == "2026-09-07T16:00:00+00:00"  # ended by the Return
+    assert payment(found, "kit-funding")["return_exceptions"] == []
+
+
+@pytest.mark.parametrize(
+    "name", ["late-r10-after-instant-payout", "duplicate-settlement-after-return"]
+)
+def test_replaying_the_inbox_reproduces_a_ledger_with_returns(
+    database_url: str, fresh: str, manifests: Path, name: str
+) -> None:
+    with fresh_database(database_url) as source:
+        original = run(load(SCENARIOS / f"{name}.yaml"), source, manifest_path=manifests / "r.json")
+        owner: Engine = create_engine(source)
+        target = make_engine(fresh, role=LEDGER_APP_ROLE)
+        try:
+            replay_inbox(owner, target)
+        finally:
+            owner.dispose()
+            target.dispose()
+
+    replayed = create_engine(fresh)
+    try:
+        assert ledger_summary(replayed) == original.summary
+    finally:
+        replayed.dispose()

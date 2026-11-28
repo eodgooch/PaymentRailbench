@@ -10,7 +10,12 @@ import yaml
 from pydantic import ValidationError
 
 from railbench.scenarios.model import Scenario, load
-from railbench.simulator.model import DelayedDelivery, DuplicateDelivery, OutOfOrderDelivery
+from railbench.simulator.model import (
+    DelayedDelivery,
+    DuplicateDelivery,
+    OutOfOrderDelivery,
+    PlannedReturn,
+)
 
 SCENARIOS = Path(__file__).parents[2] / "scenarios"
 
@@ -237,3 +242,65 @@ def test_a_fault_on_a_payout_must_hit_an_event_one_of_its_payments_emits() -> No
         with_auction(
             faults=[{"id": "f", "kind": "duplicate", "payment": "bram-payout", "event": "declined"}]
         )
+
+
+# Returns in a Scenario (ADR 0013). BASE starts Thursday 3 September 2026 before the Cutoff:
+# the first pull settles Friday 08:30 New York, so R01's window closes at the opening of
+# Wednesday 9 September (4 days 15.5 hours later) and R10's at the opening of 4 November.
+R01_LAST_MOMENT = timedelta(days=4, hours=15, minutes=30)
+
+
+def a_return(code: str, at: timedelta | str, payment: str = "first") -> dict[str, Any]:
+    return {"id": "back", "kind": "return", "payment": payment, "code": code, "at": at}
+
+
+def test_a_return_is_planned_for_its_pull() -> None:
+    found = scenario(
+        faults=[
+            a_return("R10", "P30D"),
+            {"id": "twice", "kind": "duplicate", "payment": "first", "event": "returned"},
+        ]
+    )
+
+    [planned, twice] = found.plans(7)["first"].faults
+    assert planned == PlannedReturn(id="back", code="R10", at=timedelta(days=30))
+    assert twice == DuplicateDelivery(id="twice", event="returned")
+
+
+@pytest.mark.parametrize(
+    ("code", "at", "fits"),
+    [
+        ("R01", R01_LAST_MOMENT, True),
+        ("R01", R01_LAST_MOMENT + timedelta(seconds=1), False),
+        ("R03", timedelta(days=5), False),
+        ("R10", timedelta(days=60, hours=16, minutes=30), True),  # opening of 4 November (EST)
+        ("R10", timedelta(days=60, hours=16, minutes=30, seconds=1), False),
+    ],
+)
+def test_a_return_must_fit_its_window(code: str, at: timedelta, fits: bool) -> None:
+    if fits:
+        scenario(faults=[a_return(code, at)])
+    else:
+        with pytest.raises(ValidationError, match="Return Window"):
+            scenario(faults=[a_return(code, at)])
+
+
+@pytest.mark.parametrize(
+    "faults",
+    [
+        pytest.param([a_return("R01", "PT1H", payment="second")], id="a pull that's declined"),
+        pytest.param([a_return("R99", "PT1H")], id="an unknown return code"),
+        pytest.param(
+            [{"id": "d", "kind": "duplicate", "payment": "first", "event": "returned"}],
+            id="a Fault on a Return never planned",
+        ),
+    ],
+)
+def test_a_return_that_cannot_happen_is_refused(faults: list[dict[str, Any]]) -> None:
+    with pytest.raises(ValidationError):
+        scenario(faults=faults)
+
+
+def test_a_payout_is_never_returned() -> None:
+    with pytest.raises(ValidationError, match="pull"):
+        with_auction(faults=[a_return("R03", "PT1H", payment="bram-payout")])
