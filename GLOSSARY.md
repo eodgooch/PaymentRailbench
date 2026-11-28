@@ -14,6 +14,13 @@ _Avoid_: User, account holder
 **Auction Close**:
 The moment an auction ends and the money owed between buyers, sellers and Mintwharf becomes due, producing a batch of Payouts.
 
+**Lot**:
+One card sold at an auction, to one buyer, for its Hammer Price.
+_Avoid_: Item, listing
+
+**Hammer Price**:
+The price a Lot sells for at the Auction Close, before Mintwharf's fee.
+
 ## Ledger
 
 **Ledger**:
@@ -140,7 +147,8 @@ One movement of money on one Rail through one Provider, with its own state machi
 _Avoid_: Transfer, transaction
 
 **Payout**:
-A Payment that sends money from Mintwharf to a Customer.
+What Mintwharf owes a seller from one Auction Close, and the sending of it to the seller. It goes out as a Payment; an Instant Payout declined on its instant Rail goes out again as a Standard Payout, by a second Payment.
+_Avoid_: Disbursement (that's a Loan's), withdrawal
 
 **Standard Payout**:
 A Payout released only once the funds behind it are Available.

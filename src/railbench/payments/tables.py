@@ -1,4 +1,5 @@
-"""SQLAlchemy Core views of the `payments` schema (migration 0004 is the source of truth)."""
+"""SQLAlchemy Core views of the `payments` schema (migrations 0004 and 0007 are the source of
+truth)."""
 
 from sqlalchemy import BigInteger, Column, DateTime, LargeBinary, MetaData, Table, Text
 from sqlalchemy.dialects.postgresql import JSONB
@@ -22,6 +23,7 @@ payments = Table(
     Column("amount", BigInteger, nullable=False),
     Column("description", Text, nullable=False),
     Column("recorded_at", DateTime(timezone=True), nullable=False),
+    Column("hold_id", BigInteger),
 )
 
 inbox = Table(

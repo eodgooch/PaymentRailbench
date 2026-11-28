@@ -268,3 +268,85 @@ def test_replaying_the_inbox_from_scratch_reproduces_the_ledger_exactly(
         assert ledger_summary(replayed) == original.summary
     finally:
         replayed.dispose()
+
+
+def test_an_auction_close_scenario_pays_sellers_standard_and_instant(
+    database_url: str, manifests: Path
+) -> None:
+    found = run_in_fresh_database(
+        database_url, manifests, load(SCENARIOS / "auction-close-payouts.yaml")
+    )
+
+    [close] = found.summary["auction_closes"].values()
+    payouts = {account.split(":")[1]: p for account, p in close["payouts"].items()}
+    assert {name: [s["step"] for s in p["steps"]] for name, p in payouts.items()} == {
+        "c-bram": ["reserved", "standard", "released"],
+        "c-cleo": ["reserved", "instant"],
+        "c-dara": ["reserved", "standard", "released"],  # over the limit
+        "c-emil": ["reserved", "instant", "standard", "released"],  # declined over RTP
+    }
+    assert payouts["c-cleo"]["steps"][0]["effective_at"] == "2026-09-03T21:00:00+00:00"
+    released = {payouts[n]["steps"][-1]["effective_at"] for n in ("c-bram", "c-dara", "c-emil")}
+    assert released == {"2026-09-09T04:00:00+00:00"}  # midnight New York, Wednesday
+
+    by_key = found.summary["payments"]
+    key = "auction:auction-close-payouts:3:thursday-evening:payout:customer:{}:usd:{}"
+    assert [s["state"] for s in by_key[key.format("c-cleo", "rtp")]["transitions"]] == [
+        "created",
+        "settled",
+    ]
+    assert [o["outcome"] for o in by_key[key.format("c-cleo", "rtp")]["inbox_outcomes"]] == [
+        "applied"
+    ]
+    assert [s["state"] for s in by_key[key.format("c-emil", "rtp")]["transitions"]] == [
+        "created",
+        "declined",
+    ]
+    for name in ("c-bram", "c-dara", "c-emil"):
+        steps = by_key[key.format(name, "ach")]["transitions"]
+        assert [s["state"] for s in steps] == ["created", "submitted", "settled"]
+        assert steps[-1]["effective_at"] == "2026-09-10T12:30:00+00:00"
+    assert key.format("c-dara", "rtp") not in by_key  # never sent over RTP
+    assert {f.fault_id for f in found.manifest.faults} == {
+        "cleo-settled-twice",
+        "bram-submitted-late",
+    }
+    assert no_exceptions(found)
+    assert clearing_totals(found.summary) == {
+        "clearing:simulator:ach:usd": 0,
+        "clearing:simulator:rtp:usd": 0,
+    }
+
+
+def clearing_totals(summary: dict[str, Any]) -> dict[str, int]:
+    totals: dict[str, int] = {}
+    for transaction in summary["transactions"].values():
+        for account, _currency, amount, *_ in transaction["entries"]:
+            if account.startswith("clearing:"):
+                totals[account] = totals.get(account, 0) + amount
+    return totals
+
+
+def test_replaying_the_inbox_reproduces_a_ledger_with_payouts(
+    database_url: str, fresh: str, manifests: Path
+) -> None:
+    with fresh_database(database_url) as source:
+        original = run(
+            load(SCENARIOS / "auction-close-payouts.yaml"),
+            source,
+            manifest_path=manifests / "payouts.json",
+        )
+        owner: Engine = create_engine(source)
+        target = make_engine(fresh, role=LEDGER_APP_ROLE)
+        try:
+            replay_inbox(owner, target)
+        finally:
+            owner.dispose()
+            target.dispose()
+
+    assert original.summary["auction_closes"]
+    replayed = create_engine(fresh)
+    try:
+        assert ledger_summary(replayed) == original.summary
+    finally:
+        replayed.dispose()

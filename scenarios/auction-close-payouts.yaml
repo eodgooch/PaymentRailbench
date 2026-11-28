@@ -1,0 +1,63 @@
+# Two buyers fund by ACH pull on Thursday afternoon, and the auction closes at 17:00 New
+# York. One Customer, Bram, both buys and sells. Mintwharf's fee is 10% (fictional), and a
+# Customer's outstanding Instant Payouts may total 150.00.
+# Expected:
+# - Cleo's Instant Payout (126.00) goes out over RTP at the close, before any buyer's funds
+#   are Available, at Mintwharf's risk; its settlement event arrives twice and is applied once;
+# - Dara asked for an Instant Payout of 180.00, over the limit: it falls back to Standard;
+# - RTP declines Emil's Instant Payout, so it falls back to Standard too;
+# - Bram's, Dara's and Emil's Standard Payouts are held until the buyers' funds are Available
+#   (midnight New York on Wednesday 9 September, after a weekend and Labor Day), then go out
+#   over ACH and settle on Thursday 10 September; Bram's submission is delivered an hour late;
+# - every Clearing Account nets to zero, and replaying the Inbox reproduces the Ledger.
+name: auction-close-payouts
+description: An Auction Close with Standard and Instant Payouts, a fallback over the limit and a declined RTP.
+seed: 3
+start: 2026-09-03T15:00:00-04:00 # Thursday, before the 16:00 New York ACH Cutoff
+instant_payout_limit: 15000
+seller_fee_bps: 1000
+customers:
+  - id: c-avery
+    name: Avery Quill
+  - id: c-bram
+    name: Bram Okonkwo-Hale
+  - id: c-cleo
+    name: Cleo Marchetti
+  - id: c-dara
+    name: Dara Nakashima
+  - id: c-emil
+    name: Emil Restrepo
+payments:
+  - id: avery-funding
+    customer: c-avery
+    amount: 60000
+    description: Buyer funds their Customer Balance
+  - id: bram-funding
+    customer: c-bram
+    amount: 4000
+    at: PT10M
+    description: Buyer funds their Customer Balance
+auction_closes:
+  - id: thursday-evening
+    at: PT2H
+    lots:
+      - {id: lot-1, buyer: c-avery, seller: c-bram, hammer_price: 25000}
+      - {id: lot-2, buyer: c-avery, seller: c-cleo, hammer_price: 10000}
+      - {id: lot-3, buyer: c-bram, seller: c-cleo, hammer_price: 4000}
+      - {id: lot-4, buyer: c-avery, seller: c-dara, hammer_price: 20000}
+      - {id: lot-5, buyer: c-avery, seller: c-emil, hammer_price: 5000}
+    payouts:
+      - {id: cleo-payout, seller: c-cleo, speed: instant}
+      - {id: dara-payout, seller: c-dara, speed: instant}
+      - {id: emil-payout, seller: c-emil, speed: instant, rtp_outcome: decline}
+      - {id: bram-payout, seller: c-bram}
+faults:
+  - id: cleo-settled-twice
+    kind: duplicate
+    payment: cleo-payout
+    event: settled
+  - id: bram-submitted-late
+    kind: delay
+    payment: bram-payout
+    event: submitted
+    by: PT1H

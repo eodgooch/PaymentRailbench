@@ -2,15 +2,14 @@
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from railbench.ledger.model import BIGINT_MAX, AccountCode, Currency, IdempotencyKey
-from railbench.payments.state_machine import AchState
+from railbench.payments.state_machine import PaymentState, Rail
 
-Rail = Literal["ach"]  # RTP joins with Payouts (#6)
-Direction = Literal["pull"]
+Direction = Literal["pull", "push"]
 
 
 class _Value(BaseModel):
@@ -18,7 +17,8 @@ class _Value(BaseModel):
 
 
 class NewPayment(_Value):
-    """An ACH pull from the Customer's bank into their Customer Balance."""
+    """A pull from the Customer's bank into their Customer Balance (ACH), or a push out of
+    it to the Customer's bank, a Payout (ACH or RTP; RTP is credit push only)."""
 
     idempotency_key: IdempotencyKey
     rail: Rail
@@ -27,12 +27,24 @@ class NewPayment(_Value):
     amount: Annotated[int, Field(strict=True, gt=0, le=BIGINT_MAX)]
     currency: Currency
     description: Annotated[str, Field(max_length=200)] = ""
+    # A push may name the Hold reserving its amount on the Customer Balance: the Transaction
+    # that books the money going out captures it, so the money is never Available on its
+    # way out (ADR 0012).
+    hold_id: Annotated[int, Field(strict=True, gt=0)] | None = None
+
+    @model_validator(mode="after")
+    def _rtp_pushes_only(self) -> Self:
+        if self.rail == "rtp" and self.direction != "push":
+            raise ValueError("RTP is credit push only: it can't pull money")
+        if self.hold_id is not None and self.direction != "push":
+            raise ValueError("only a push reserves its amount with a Hold")
+        return self
 
 
 class Transition(_Value):
     """One state change. Its Actor is the Inbox event behind it or a system job."""
 
-    state: AchState
+    state: PaymentState
     effective_at: datetime
     recorded_at: datetime
     inbox_id: int | None
@@ -65,12 +77,23 @@ class Payment(_Value):
     amount: int
     description: str
     recorded_at: datetime
-    state: AchState
-    # When a settled ACH Payment becomes Available: the start (midnight, New York) of the
+    hold_id: int | None
+    state: PaymentState
+    # When a settled ACH pull becomes Available: the start (midnight, New York) of the
     # second Banking Day after the Banking Day it settled on (ADR 0004, ADR 0010).
     available_at: datetime | None
     transitions: list[Transition]
     exceptions: list[PaymentException]
+
+
+class PaymentRef(_Value):
+    """A Payment's identity and where it stands, without its history."""
+
+    id: int
+    idempotency_key: str
+    rail: Rail
+    direction: Direction
+    state: PaymentState
 
 
 class PaymentCreated(_Value):

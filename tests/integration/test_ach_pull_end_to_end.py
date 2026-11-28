@@ -31,7 +31,7 @@ from railbench.ledger.model import AccountType, NewAccount
 from railbench.payments.model import NewPayment
 from railbench.payments.provider import Provider, ProviderPayment, SimulatorProvider
 from railbench.payments.service import Payments
-from railbench.payments.state_machine import AchState
+from railbench.payments.state_machine import PaymentState
 from railbench.payments.tables import inbox
 from railbench.scenarios.servers import free_port, serving
 from railbench.simulator.app import create_app as create_simulator_app
@@ -165,7 +165,7 @@ def test_an_ach_pull_is_pending_then_posted_then_available_two_banking_days_late
     assert stack.balances(customer) == {"posted": 25_000, "pending": 0, "available": 0}
     # The Provider agrees, read back through the Provider interface's get Payment.
     assert stack.provider.get_payment(payment["provider_payment_id"]) == ProviderPayment(
-        provider_payment_id=payment["provider_payment_id"], status=AchState.SETTLED
+        provider_payment_id=payment["provider_payment_id"], status=PaymentState.SETTLED
     )
     # The Clearing Account has passed the money on to Bank Cash: it nets to zero again.
     assert clearing_and_bank_cash(stack, payment["id"]) == {

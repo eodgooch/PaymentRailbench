@@ -10,11 +10,14 @@ row by something stable instead:
   key (`ledger_key`, which holds the Payment's database ID) renamed `<Payment's Idempotency
   Key>/<step>`;
 - Payments by Idempotency Key;
-- a Provider Event Actor by the Provider event ID instead of its Inbox row ID.
+- a Provider Event Actor by the Provider event ID instead of its Inbox row ID;
+- Auction Closes by auction ID, their lots by lot ID and their Payouts by seller, each lot's
+  Transaction and each Payout step's Hold by Idempotency Key.
 
 `accounts` narrows the summary to the Payments funding those Customer Balances and the
 Ledger rows that touch them or belong to those Payments, for databases shared with other
-work (the property tests). Without it, the whole Ledger is summarised.
+work (the property tests), and to the Auction Closes whose lots touch them. Without it, the
+whole Ledger is summarised.
 """
 
 from collections.abc import Collection
@@ -24,6 +27,7 @@ from typing import Any
 from sqlalchemy import Connection, Engine, select
 
 from railbench.ledger.tables import accounts, entries, hold_ends, holds, settlements, transactions
+from railbench.marketplace.tables import auction_closes, lots, payout_steps, payouts
 from railbench.payments.service import parse_ledger_key
 from railbench.payments.tables import inbox, inbox_outcomes, payments, transitions
 
@@ -91,7 +95,61 @@ class _Summariser:
             "payments": self._summarise_payments(),
             "transactions": dict(sorted(found_transactions.items())),
             "holds": self._holds(),
+            "auction_closes": self._auction_closes(),
         }
+
+    def _auction_closes(self) -> dict[str, Any]:
+        lot_rows = self._c.execute(select(lots).order_by(lots.c.id)).all()
+        payout_rows = self._c.execute(select(payouts).order_by(payouts.c.id)).all()
+        step_rows = self._c.execute(select(payout_steps).order_by(payout_steps.c.id)).all()
+        found = {}
+        for close in self._c.execute(select(auction_closes)):
+            its_lots = [lot for lot in lot_rows if lot.auction_close_id == close.id]
+            touched = {code for lot in its_lots for code in (lot.buyer, lot.seller)}
+            if self._scope is not None and not touched & self._scope:
+                continue
+            found[close.auction_id] = {
+                "currency": close.currency,
+                "closed_at": _time(close.closed_at),
+                "seller_fee_bps": close.seller_fee_bps,
+                "instant_payout_limit": close.instant_payout_limit,
+                "recorded_at": _time(close.recorded_at),
+                "lots": {
+                    lot.lot_id: {
+                        "buyer": lot.buyer,
+                        "seller": lot.seller,
+                        "hammer_price": lot.hammer_price,
+                        "fee": lot.fee,
+                        "transaction": self._transaction_key(lot.transaction_id),
+                    }
+                    for lot in its_lots
+                },
+                "payouts": {
+                    payout.customer_account: {
+                        "amount": payout.amount,
+                        "currency": payout.currency,
+                        "requested": payout.requested,
+                        "recorded_at": _time(payout.recorded_at),
+                        "steps": [
+                            {
+                                "step": step.step,
+                                "detail": step.detail,
+                                "hold": None
+                                if step.hold_id is None
+                                else self._hold_key(step.hold_id),
+                                "job": f"{step.job_name}@{step.job_version}",
+                                "effective_at": _time(step.effective_at),
+                                "recorded_at": _time(step.recorded_at),
+                            }
+                            for step in step_rows
+                            if step.payout_id == payout.id
+                        ],
+                    }
+                    for payout in payout_rows
+                    if payout.auction_close_id == close.id
+                },
+            }
+        return dict(sorted(found.items()))
 
     def _summarise_payments(self) -> dict[str, Any]:
         steps = self._c.execute(select(transitions).order_by(transitions.c.id)).all()
@@ -101,11 +159,14 @@ class _Summariser:
             found[row.idempotency_key] = {
                 "provider": row.provider,
                 "provider_payment_id": row.provider_payment_id,
+                "rail": row.rail,
+                "direction": row.direction,
                 "customer_account": row.customer_account,
                 "currency": row.currency,
                 "amount": row.amount,
                 "description": row.description,
                 "recorded_at": _time(row.recorded_at),
+                "hold": None if row.hold_id is None else self._key(self._hold_key(row.hold_id)),
                 "transitions": [
                     {
                         "state": s.state,

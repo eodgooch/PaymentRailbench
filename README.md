@@ -147,10 +147,66 @@ The Ledger API adds `POST /payments`, `GET /payments/{id}` and
 `POST /providers/{provider}/events`; the Simulator serves `POST /payments` and
 `GET /payments/{id}`.
 
+## Auction Closes and Payouts
+
+At an Auction Close sellers get paid (SPEC §4.4, ADR 0004, ADR 0012).
+`POST /auction-closes` takes one auction's lots (buyer, seller, hammer price, each Customer
+named by their Customer Balance) and the sellers asking for an Instant Payout:
+
+```json
+{"auction_id": "fall-auction", "closed_at": "2026-09-03T17:00:00-04:00", "currency": "USD",
+ "lots": [{"lot_id": "lot-1", "buyer": "customer:c-avery:usd",
+           "seller": "customer:c-bram:usd", "hammer_price": 25000}],
+ "instant_payouts": ["customer:c-bram:usd"]}
+```
+
+- **Booking, gross.** Each lot is one posted Transaction at the close, by the
+  `auction-close` system job: the buyer's Customer Balance pays the hammer price, the
+  seller's is credited it less Mintwharf's fee (`SELLER_FEE_BPS`, 10% by default, rounded
+  down; fictional), and Fee Revenue takes the fee. A Customer who both bought and sold owes
+  their purchases and is owed their sales, lot by lot, and funds their purchases like any
+  buyer. `GET /auction-closes/{auction_id}` returns the lots, each Customer's position
+  (`owes`, `sold`, `fees`, `owed`) and each Payout with its steps and Payments. An auction
+  closes once: a retry answers `200` with `Idempotent-Replayed: true`, other lots `409`.
+- **Reserved until it goes out.** Every Payout's amount is held on the seller's Customer
+  Balance from the close, so the proceeds are Posted but not Available. The Payout's
+  Payment names that Hold, and the Transaction booking the money going out captures it (an
+  RTP settlement, an ACH push's submission). If the money stays (an ACH push declined), it's
+  Available again: reversed, or the Hold released.
+- **Standard Payout** (over ACH): sent when the funds behind it are Available, that is when
+  neither the buyers of that seller's lots nor the seller has a negative Available Balance
+  (a buyer who funded by ACH: once the Ledger releases their funding's Hold; the seller: once
+  their own purchases are paid for). The `payout-release` job then sends an ACH credit push.
+  Until then the Payout's `waiting_for` names who it's waiting on.
+- **Instant Payout** (over RTP): sent at once, at Mintwharf's risk, if the seller's
+  outstanding exposure (their Instant Payouts not declined whose funds aren't Available yet)
+  plus this one is within `INSTANT_PAYOUT_LIMIT_CENTS` (inclusive) and the seller doesn't
+  owe for their own purchases. Otherwise the whole amount falls back to a Standard Payout. A
+  declined RTP moved nothing, and also falls back to Standard. A per-seller lock keeps two
+  auctions closing at once from both spending one seller's limit.
+- **Pushes in the Ledger** mirror the pull through the Clearing Account for their Rail: an
+  ACH push is a pending Transaction from the Customer Balance to the Clearing Account at
+  submission (an unsettled outflow, no longer Available), then its Settlement and Bank Cash
+  to the Clearing Account; declined, a pending Reversal gives the money back. A settled RTP
+  push is two posted Transactions, Customer Balance to the RTP Clearing Account and Bank Cash
+  to it, so the Clearing Account nets to zero at once. `POST /payments` only makes pulls.
+- **RTP in the Simulator** is credit push only (an RTP pull is a `422`), instant and final:
+  it settles, or is declined if planned, the moment it's created, any day at any hour (no
+  Cutoff, no Banking Days), with one Provider Event, `payment.settled` or `payment.declined`,
+  and no Returns. Its state machine is `created → settled | declined`; anything else is an
+  exception. Duplicate and delayed delivery Faults work on RTP events; out-of-order needs a
+  later event, which RTP never has. ACH pushes run on the pull's timetable.
+
+A Payout's steps, each at most once, are `reserved`, then `instant` or `standard`, then
+`released` (sent over ACH) and, if its ACH Payment ended without moving money, `returned`.
+The Ledger's ticker (`LEDGER_TICK_SECONDS`) runs ACH availability and then Payout release.
+`SELLER_FEE_BPS` extends SPEC §13. Auction Closes, lots, Payouts and Payout steps are
+append-only in the `marketplace` schema (migration `0007`).
+
 ## Scenarios and delivery Faults
 
-A **Scenario** is a named, seeded YAML file of Customers, ACH pulls and **Faults** (SPEC §6,
-ADR 0011); the committed ones are in `scenarios/`. Each pull has an amount in Minor Units and
+A **Scenario** is a named, seeded YAML file of Customers, ACH pulls, Auction Closes and
+**Faults** (SPEC §6, ADR 0011, ADR 0012); the committed ones are in `scenarios/`. Each pull has an amount in Minor Units and
 an ending, `settle`, `decline` or `cancel` (a decline or cancellation happens when the pull
 would have settled). Faults are a `kind` plus the Payment and Provider Event they hit:
 
@@ -164,8 +220,11 @@ random_faults: {rate: 0.5, kinds: [duplicate, delay, out_of_order], max_delay: P
 
 The Simulator injects them on its outbox, over the normal signed webhooks: a duplicate is
 the same event ID and body delivered again, a delay holds the event back on the Clock, and an
-out-of-order Fault holds an event until a later one of the same Payment has gone. Random
-Faults are drawn from the seed before the run; Payment and event IDs are derived from
+out-of-order Fault holds an event until a later one of the same Payment has gone. An Auction Close lists its lots
+and, per seller, a Payout's `speed` and how its RTP and ACH Payments end
+(`scenarios/auction-close-payouts.yaml`); Faults can name a Payout like a Payment, and land
+on whichever of its Payments emits the event. Random Faults are drawn from the seed before
+the run (for pulls only); Payment and event IDs are derived from
 Idempotency Keys, and the runner jumps the ManualClock from one due moment to the next, so a
 Scenario and seed replay exactly (tested: two runs, one in a database already holding another
 run, give the same manifest, ticks and Ledger; another seed gives other Faults). A webhook
@@ -200,8 +259,10 @@ recorded), reproduces the Ledger exactly, Recorded Times included.
   `model.py` holds the validated values, `app.py` is the thin HTTP layer
 - `src/railbench/payments`: Payments, the Inbox and the ACH state machine, the Provider
   interface and its Simulator adapter; served by the Ledger API
-- `src/railbench/simulator`: the Simulator, a separate service (ADR 0005), with scripted
-  endings and delivery Faults
+- `src/railbench/marketplace`: Auction Closes, Payouts and the Payout release job; served by
+  the Ledger API
+- `src/railbench/simulator`: the Simulator, a separate service (ADR 0005), with ACH and RTP,
+  scripted endings and delivery Faults
 - `src/railbench/scenarios`: Scenario files, the runner and CLI, the Fault Manifest, the
   Inbox replay and the Ledger summary they're compared by
 - `scenarios/`: the committed Scenario files
@@ -209,7 +270,8 @@ recorded), reproduces the Ledger exactly, Recorded Times included.
   Inbox), `reconciliation` and `simulator` schemas; `0002` adds the Ledger tables, triggers
   and the `railbench_app` role; `0003` adds Transaction status, Settlements and Holds;
   `0004` adds Payments, the Inbox and state changes; `0005` the Simulator's state; `0006`
-  its plans, delivery Faults and the Fault Manifest.
+  its plans, delivery Faults and the Fault Manifest; `0007` pushes and RTP, and the
+  `marketplace` schema.
 
 Nothing reads the system time directly: code takes a `Clock` (`WallClock` by default,
 `ManualClock` in tests and Scenarios), and a ruff rule bans `datetime.now()` and friends

@@ -14,6 +14,11 @@ ACH pull, `GET /payments/{id}` reads one, and `POST /providers/{provider}/events
 webhook receiver for Provider Events. The receiver answers 401 to a webhook whose signature
 doesn't verify, 400 to a verified body it can't read, and 503 (retry later) to an event for a
 Payment it hasn't recorded yet.
+
+Auction Closes (`railbench.marketplace`): `POST /auction-closes` books one auction's lots and
+makes its sellers' Payouts, once per auction ID (201, a retry 200, different lots 409), and
+`GET /auction-closes/{auction_id}` reads it back with each Payout's steps and Payments. A
+Payout is never made through `POST /payments`, which only makes pulls.
 """
 
 import logging
@@ -45,6 +50,14 @@ from railbench.ledger.model import (
     ReversalRequest,
     SettlementRequest,
     Transaction,
+)
+from railbench.marketplace.model import AuctionClose, NewAuctionClose
+from railbench.marketplace.service import (
+    AuctionCloseConflict,
+    AuctionCloseNotFound,
+    AuctionTerms,
+    Marketplace,
+    MarketplaceError,
 )
 from railbench.payments.model import NewPayment, Payment, Receipt
 from railbench.payments.provider import MalformedEvent, Provider, ProviderError, SimulatorProvider
@@ -101,6 +114,19 @@ def get_payments(request: Request) -> Payments:
 PaymentsDep = Annotated[Payments, Depends(get_payments)]
 
 
+def get_marketplace(request: Request) -> Marketplace:
+    marketplace: Marketplace = request.app.state.marketplace
+    return marketplace
+
+
+MarketplaceDep = Annotated[Marketplace, Depends(get_marketplace)]
+
+MARKETPLACE_ERROR_STATUS = {
+    AuctionCloseNotFound: status.HTTP_404_NOT_FOUND,
+    AuctionCloseConflict: status.HTTP_409_CONFLICT,
+}
+
+
 def create_app(
     engine: Engine,
     clock: Clock,
@@ -115,15 +141,32 @@ def create_app(
         )
     journal = Journal(engine, clock)
     payments = Payments(engine, clock, journal, provider)
+    marketplace = Marketplace(
+        engine,
+        clock,
+        journal,
+        payments,
+        AuctionTerms(
+            seller_fee_bps=settings.seller_fee_bps,
+            instant_payout_limit=settings.instant_payout_limit_cents,
+        ),
+    )
+
+    def jobs() -> None:
+        """The Ledger's Clock-driven work, in order: ACH funds become Available, then the
+        Standard Payouts they were behind are released."""
+        payments.make_available()
+        marketplace.release_payouts()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        with ticking("ach-availability", payments.make_available, settings.ledger_tick_seconds):
+        with ticking("ledger-jobs", jobs, settings.ledger_tick_seconds):
             yield
 
     app = create_service_app("ledger", engine, clock, lifespan=lifespan)
     app.state.journal = journal
     app.state.payments = payments
+    app.state.marketplace = marketplace
     app.state.provider = provider
 
     @app.exception_handler(LedgerError)
@@ -133,6 +176,11 @@ def create_app(
     @app.exception_handler(PaymentsError)
     def payments_error(_request: Request, error: PaymentsError) -> JSONResponse:
         code = PAYMENTS_ERROR_STATUS.get(type(error), status.HTTP_422_UNPROCESSABLE_CONTENT)
+        return JSONResponse(status_code=code, content={"detail": str(error)})
+
+    @app.exception_handler(MarketplaceError)
+    def marketplace_error(_request: Request, error: MarketplaceError) -> JSONResponse:
+        code = MARKETPLACE_ERROR_STATUS.get(type(error), status.HTTP_422_UNPROCESSABLE_CONTENT)
         return JSONResponse(status_code=code, content={"detail": str(error)})
 
     @app.exception_handler(ProviderError)
@@ -233,6 +281,11 @@ def create_app(
         responses={200: {"description": "A retry: the original Payment", "model": Payment}},
     )
     def create_payment(new: NewPayment, payments: PaymentsDep, response: Response) -> Payment:
+        if new.direction != "pull":
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "only pulls are made here: Payouts are made by an Auction Close",
+            )
         created = payments.originate(new)
         return _respond(
             created.replayed,
@@ -244,6 +297,26 @@ def create_app(
     @app.get("/payments/{payment_id}")
     def get_payment(payment_id: int, payments: PaymentsDep) -> Payment:
         return payments.payment(payment_id)
+
+    @app.post(
+        "/auction-closes",
+        status_code=status.HTTP_201_CREATED,
+        responses={200: {"description": "A retry: the original", "model": AuctionClose}},
+    )
+    def close_auction(
+        new: NewAuctionClose, marketplace: MarketplaceDep, response: Response
+    ) -> AuctionClose:
+        recorded = marketplace.close(new)
+        return _respond(
+            recorded.replayed,
+            recorded.auction_close,
+            response,
+            location=f"/auction-closes/{new.auction_id}",
+        )
+
+    @app.get("/auction-closes/{auction_id}")
+    def get_auction_close(auction_id: str, marketplace: MarketplaceDep) -> AuctionClose:
+        return marketplace.auction_close(auction_id)
 
     @app.post("/providers/{provider}/events", responses={401: {}, 400: {}, 503: {}})
     async def receive_event(provider: str, request: Request, payments: PaymentsDep) -> Receipt:

@@ -3,10 +3,15 @@ already passed is stale and does nothing; an impossible one is an exception, nev
 
 import pytest
 
-from railbench.payments.state_machine import AchState, Advance, Impossible, Stale, decide
+from railbench.payments.state_machine import Advance, Impossible, PaymentState, Stale, decide
 
-C, SUB, SET, AV = AchState.CREATED, AchState.SUBMITTED, AchState.SETTLED, AchState.AVAILABLE
-CAN, DEC = AchState.CANCELED, AchState.DECLINED
+C, SUB, SET, AV = (
+    PaymentState.CREATED,
+    PaymentState.SUBMITTED,
+    PaymentState.SETTLED,
+    PaymentState.AVAILABLE,
+)
+CAN, DEC = PaymentState.CANCELED, PaymentState.DECLINED
 
 
 @pytest.mark.parametrize(
@@ -24,9 +29,9 @@ CAN, DEC = AchState.CANCELED, AchState.DECLINED
     ],
 )
 def test_the_payment_moves_forward(
-    current: AchState, reported: AchState, path: list[AchState]
+    current: PaymentState, reported: PaymentState, path: list[PaymentState]
 ) -> None:
-    assert decide(current, reported) == Advance(path=tuple(path))
+    assert decide(current, reported, rail="ach") == Advance(path=tuple(path))
 
 
 @pytest.mark.parametrize(
@@ -44,23 +49,23 @@ def test_the_payment_moves_forward(
     ],
 )
 def test_an_event_for_a_state_already_passed_is_stale(
-    current: AchState, reported: AchState
+    current: PaymentState, reported: PaymentState
 ) -> None:
-    assert decide(current, reported) == Stale()
+    assert decide(current, reported, rail="ach") == Stale()
 
 
 @pytest.mark.parametrize("ending", [DEC, CAN])
-def test_a_submitted_for_a_payment_submitted_before_it_ended_is_stale(ending: AchState) -> None:
-    assert decide(ending, SUB, reached=[C, SUB, ending]) == Stale()
+def test_a_submitted_for_a_payment_submitted_before_it_ended_is_stale(ending: PaymentState) -> None:
+    assert decide(ending, SUB, reached=[C, SUB, ending], rail="ach") == Stale()
 
 
 @pytest.mark.parametrize("ending", [DEC, CAN])
 def test_a_submitted_for_a_payment_that_ended_without_being_submitted_is_impossible(
-    ending: AchState,
+    ending: PaymentState,
 ) -> None:
     """It went created → canceled|declined, so a `submitted` now may mean the Provider
     really sent the debit after all: an exception, not something to shrug off."""
-    assert isinstance(decide(ending, SUB, reached=[C, ending]), Impossible)
+    assert isinstance(decide(ending, SUB, reached=[C, ending], rail="ach"), Impossible)
 
 
 @pytest.mark.parametrize(
@@ -76,8 +81,10 @@ def test_a_submitted_for_a_payment_that_ended_without_being_submitted_is_impossi
         (SUB, AV),
     ],
 )
-def test_an_impossible_transition_is_an_exception(current: AchState, reported: AchState) -> None:
-    decision = decide(current, reported)
+def test_an_impossible_transition_is_an_exception(
+    current: PaymentState, reported: PaymentState
+) -> None:
+    decision = decide(current, reported, rail="ach")
 
     assert isinstance(decision, Impossible)
     assert current.value in decision.reason

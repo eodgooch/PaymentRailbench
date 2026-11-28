@@ -18,8 +18,8 @@ from typing import Any, Protocol
 import httpx
 
 from railbench.common.signing import SIGNATURE_HEADER, BadSignature, verify
-from railbench.payments.model import Direction, Rail
-from railbench.payments.state_machine import AchState
+from railbench.payments.model import Direction
+from railbench.payments.state_machine import PaymentState, Rail
 
 
 @dataclass(frozen=True)
@@ -37,14 +37,14 @@ class PaymentOrder:
 @dataclass(frozen=True)
 class ProviderPayment:
     provider_payment_id: str
-    status: AchState
+    status: PaymentState
 
 
 @dataclass(frozen=True)
 class ProviderEvent:
     event_id: str
     provider_payment_id: str
-    reported: AchState
+    reported: PaymentState
     occurred_at: datetime
 
 
@@ -73,10 +73,10 @@ class Provider(Protocol):
 
 
 EVENT_STATES = {
-    "payment.submitted": AchState.SUBMITTED,
-    "payment.settled": AchState.SETTLED,
-    "payment.canceled": AchState.CANCELED,
-    "payment.declined": AchState.DECLINED,
+    "payment.submitted": PaymentState.SUBMITTED,
+    "payment.settled": PaymentState.SETTLED,
+    "payment.canceled": PaymentState.CANCELED,
+    "payment.declined": PaymentState.DECLINED,
 }
 
 
@@ -146,4 +146,4 @@ class SimulatorProvider:
 
     @staticmethod
     def _payment(body: dict[str, Any]) -> ProviderPayment:
-        return ProviderPayment(provider_payment_id=body["id"], status=AchState(body["status"]))
+        return ProviderPayment(provider_payment_id=body["id"], status=PaymentState(body["status"]))

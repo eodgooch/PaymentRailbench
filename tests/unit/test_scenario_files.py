@@ -35,7 +35,7 @@ def test_every_committed_scenario_file_parses(path: Path) -> None:
     found = load(path)
 
     assert found.name == path.stem
-    assert found.payments
+    assert found.payments or found.auction_closes
     for seed in (found.seed, found.seed + 1):
         assert found.plans(seed)  # every Fault fits its Payment's outcome
 
@@ -142,3 +142,98 @@ def test_random_faults_are_the_same_for_the_same_seed_and_differ_for_another() -
     assert 0 < len(faults) < 24  # a rate of 0.5 over 24 events
     assert {f.kind for f in faults} == {"duplicate", "delay", "out_of_order"}
     assert all(f.id.startswith("random-") for f in faults)
+
+
+# Auction Closes in a Scenario (ADR 0012)
+
+AUCTION: dict[str, Any] = {
+    "id": "fall-auction",
+    "at": "PT2H",
+    "lots": [
+        {"id": "lot-1", "buyer": "c-avery", "seller": "c-bram", "hammer_price": 25_000},
+        {"id": "lot-2", "buyer": "c-bram", "seller": "c-cleo", "hammer_price": 4_000},
+    ],
+    "payouts": [
+        {"id": "cleo-payout", "seller": "c-cleo", "speed": "instant", "rtp_outcome": "decline"},
+        {"id": "bram-payout", "seller": "c-bram"},
+    ],
+}
+SELLERS = [
+    {"id": "c-avery", "name": "Avery Quill"},
+    {"id": "c-bram", "name": "Bram Okonkwo-Hale"},
+    {"id": "c-cleo", "name": "Cleo Marchetti"},
+]
+
+
+def with_auction(auction: dict[str, Any] | None = None, **changes: Any) -> Scenario:
+    return scenario(customers=SELLERS, auction_closes=[auction or AUCTION], **changes)
+
+
+def test_an_auction_close_names_its_lots_and_payouts() -> None:
+    found = with_auction()
+
+    [close] = found.auction_closes
+    assert found.auction_id(close, 7) == "two-pulls:7:fall-auction"
+    assert [(lot.buyer, lot.seller, lot.hammer_price) for lot in close.lots] == [
+        ("c-avery", "c-bram", 25_000),
+        ("c-bram", "c-cleo", 4_000),
+    ]
+    assert found.instant_payouts(close) == ["customer:c-cleo:usd"]
+
+
+def test_a_payout_is_planned_on_every_rail_it_can_go_out_on() -> None:
+    """An Instant Payout may go out over RTP or, over the limit or declined, over ACH: the
+    Simulator gets a plan for each, under the Idempotency Keys the Ledger will use."""
+    found = with_auction(
+        faults=[
+            {"id": "dup", "kind": "duplicate", "payment": "cleo-payout", "event": "declined"},
+            {
+                "id": "late",
+                "kind": "delay",
+                "payment": "bram-payout",
+                "event": "submitted",
+                "by": "PT1H",
+            },
+        ]
+    )
+
+    plans = found.plans(7)
+
+    rtp, ach = plans["cleo-payout:rtp"], plans["cleo-payout:ach"]
+    assert rtp.idempotency_key == "auction:two-pulls:7:fall-auction:payout:customer:c-cleo:usd:rtp"
+    assert (rtp.rail, rtp.outcome, [f.id for f in rtp.faults]) == ("rtp", "decline", ["dup"])
+    assert (ach.rail, ach.outcome, ach.faults) == ("ach", "settle", ())
+    assert "bram-payout:rtp" not in plans  # a Standard Payout only ever goes over ACH
+    assert [f.id for f in plans["bram-payout:ach"].faults] == ["late"]
+
+
+@pytest.mark.parametrize(
+    "auction",
+    [
+        pytest.param(
+            {
+                **AUCTION,
+                "lots": [{"id": "l", "buyer": "nobody", "seller": "c-bram", "hammer_price": 1}],
+            },
+            id="a lot with an unknown buyer",
+        ),
+        pytest.param(
+            {**AUCTION, "payouts": [{"id": "p", "seller": "c-avery", "speed": "instant"}]},
+            id="a Payout for a Customer who sold nothing",
+        ),
+        pytest.param(
+            {**AUCTION, "lots": [{**AUCTION["lots"][0], "hammer_price": 10.5}]},
+            id="a price that isn't an integer",
+        ),
+    ],
+)
+def test_a_malformed_auction_close_is_refused(auction: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        with_auction(auction)
+
+
+def test_a_fault_on_a_payout_must_hit_an_event_one_of_its_payments_emits() -> None:
+    with pytest.raises(ValidationError, match="never emits"):
+        with_auction(
+            faults=[{"id": "f", "kind": "duplicate", "payment": "bram-payout", "event": "declined"}]
+        )

@@ -123,7 +123,14 @@ def test_creating_is_idempotent(client: TestClient) -> None:
 
 @pytest.mark.parametrize(
     "change",
-    [{"amount": 12.5}, {"amount": "100"}, {"amount": 0}, {"rail": "rtp"}, {"direction": "push"}],
+    [
+        {"amount": 12.5},
+        {"amount": "100"},
+        {"amount": 0},
+        {"rail": "wire"},
+        {"direction": "sideways"},
+        pytest.param({"rail": "rtp"}, id="an RTP pull: RTP is credit push only"),
+    ],
 )
 def test_a_payment_the_simulator_cannot_make_is_refused(
     client: TestClient, change: dict[str, Any]
@@ -401,3 +408,123 @@ def test_a_payment_is_planned_once(client: TestClient) -> None:
 
     with pytest.raises(PlanConflict):
         simulator(client).plan(plan.model_copy(update={"outcome": "cancel"}))
+
+
+# RTP (SPEC §4.1): credit push only, instant and final, can be declined, never returned.
+LABOR_DAY_NOON = datetime(2026, 9, 7, 16, 0, tzinfo=UTC)
+
+
+def rtp_push(key: str = "", amount: int = 10_000) -> dict[str, Any]:
+    return ach_pull(key, amount, rail="rtp", direction="push", reference="Mintwharf payout")
+
+
+def test_an_rtp_push_settles_the_moment_it_is_created_even_on_a_fed_holiday(
+    client: TestClient, clock: ManualClock, receiver: Receiver
+) -> None:
+    """RTP runs 24/7/365: no Cutoff, no Banking Days, no submission step."""
+    clock.set(LABOR_DAY_NOON)
+
+    payment = create(client, rtp_push(amount=4_500))
+
+    assert payment["status"] == "settled"
+    assert payment["settled_at"] == "2026-09-07T16:00:00Z"
+    assert payment["submitted_at"] is None
+    simulator(client).tick()
+    assert [type_ for type_, _ in received(receiver, payment["id"])] == ["payment.settled"]
+    # Final: nothing more ever happens to it, however long the Clock runs.
+    clock.set(datetime(2026, 12, 31, tzinfo=UTC))
+    simulator(client).tick()
+    assert [type_ for type_, _ in received(receiver, payment["id"])] == ["payment.settled"]
+    assert client.get(f"/payments/{payment['id']}").json()["status"] == "settled"
+
+
+def test_an_ach_push_settles_on_the_banking_day_after_submission(
+    client: TestClient, clock: ManualClock, receiver: Receiver
+) -> None:
+    payment = create(client, ach_pull(direction="push", reference="Mintwharf payout"))
+    assert payment["status"] == "submitted"
+
+    clock.set(FRIDAY_SETTLEMENT)
+    simulator(client).tick()
+
+    assert client.get(f"/payments/{payment['id']}").json()["status"] == "settled"
+    assert [type_ for type_, _ in received(receiver, payment["id"])] == [
+        "payment.submitted",
+        "payment.settled",
+    ]
+
+
+def planned_rtp(client: TestClient, outcome: str = "settle", *faults: dict[str, Any]) -> str:
+    key = unique("scripted-rtp")
+    simulator(client).plan(
+        PaymentPlan.model_validate(
+            {"idempotency_key": key, "rail": "rtp", "outcome": outcome, "faults": list(faults)}
+        )
+    )
+    found: str = create(client, rtp_push(key))["id"]
+    return found
+
+
+def test_a_planned_rtp_decline_happens_at_once(
+    client: TestClient, clock: ManualClock, receiver: Receiver
+) -> None:
+    payment_id = planned_rtp(client, "decline")
+    simulator(client).tick()
+
+    found = client.get(f"/payments/{payment_id}").json()
+    assert (found["status"], found["settled_at"]) == ("declined", None)
+    assert found["ended_at"] == "2026-09-03T19:00:00Z"
+    assert [type_ for type_, _ in received(receiver, payment_id)] == ["payment.declined"]
+
+
+def test_delivery_faults_act_on_rtp_events_too(
+    client: TestClient, clock: ManualClock, receiver: Receiver
+) -> None:
+    doubled = planned_rtp(client, "settle", {"id": "dup", "kind": "duplicate", "event": "settled"})
+    late = planned_rtp(
+        client, "decline", {"id": "late", "kind": "delay", "event": "declined", "by": "PT1H"}
+    )
+    simulator(client).tick()
+    assert len(received(receiver, doubled)) == 2
+    assert received(receiver, late) == []
+
+    clock.advance(timedelta(hours=1))
+    simulator(client).tick()
+    assert [type_ for type_, _ in received(receiver, late)] == ["payment.declined"]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "fault"),
+    [
+        pytest.param("cancel", None, id="an RTP Payment can't be canceled"),
+        pytest.param(
+            "settle",
+            {"id": "d", "kind": "duplicate", "event": "submitted"},
+            id="RTP emits no submitted",
+        ),
+        pytest.param(
+            "settle",
+            {"id": "o", "kind": "out_of_order", "event": "settled", "after": "declined"},
+            id="RTP emits one event, so nothing can overtake it",
+        ),
+    ],
+)
+def test_an_rtp_plan_can_only_script_what_rtp_does(
+    outcome: str, fault: dict[str, Any] | None
+) -> None:
+    with pytest.raises(ValueError):
+        PaymentPlan.model_validate(
+            {
+                "idempotency_key": "k",
+                "rail": "rtp",
+                "outcome": outcome,
+                "faults": [fault] if fault else [],
+            }
+        )
+
+
+def test_a_payment_must_be_on_the_rail_it_was_planned_for(client: TestClient) -> None:
+    key = unique("planned-for-ach")
+    simulator(client).plan(PaymentPlan(idempotency_key=key, outcome="decline"))
+
+    assert client.post("/payments", json=rtp_push(key)).status_code == 409

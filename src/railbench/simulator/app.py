@@ -18,7 +18,12 @@ from railbench.common.service import create_service_app
 from railbench.common.settings import Settings
 from railbench.common.ticker import ticking
 from railbench.simulator.model import PaymentRequest, SimulatedPayment
-from railbench.simulator.provider import IdempotencyConflict, PaymentNotFound, Simulator
+from railbench.simulator.provider import (
+    IdempotencyConflict,
+    PaymentNotFound,
+    PlanMismatch,
+    Simulator,
+)
 
 
 def get_simulator(request: Request) -> Simulator:
@@ -57,7 +62,7 @@ def create_app(
     def create_payment(payment: PaymentRequest, response: Response) -> SimulatedPayment:
         try:
             created, replayed = simulator.create_payment(payment)
-        except IdempotencyConflict as error:
+        except (IdempotencyConflict, PlanMismatch) as error:
             raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
         if replayed:
             response.status_code = status.HTTP_200_OK
