@@ -4,7 +4,8 @@
 # the 17:00 Auction Close for 300.00, and Ottoline's Instant Payout of 270.00 (less
 # Mintwharf's fictional 10% fee) goes out over RTP at once, before the 18:00 RTP Cutoff.
 # Expected Settlement Reports (one per Banking Day; Monday 7 September is Labor Day):
-# - Thursday 3: Ottoline's Payout, -27000;
+# - Thursday 3: Ottoline's Payout, -27000, listed twice under two line IDs (duplicate
+#   report line);
 # - Friday 4: Wren's pull reported as 59500, 500 short of what settled (wrong amount); Pax's
 #   pull left off (missing line); a Provider Adjustment at noon recalling 20.00 of
 #   Ottoline's Payout, +2000;
@@ -25,8 +26,12 @@
 # - the orphan adjustment is stored unmatched and books nothing;
 # - Bank Cash ends at 59750, Provider Fees at 250; every Clearing Account nets to zero;
 # - the Fault Manifest names every report Fault; replaying reproduces the Ledger.
+# Expected Breaks (ADR 0015): Thursday 3, a duplicate (Ottoline's second line); Friday 4, an
+# amount mismatch (Wren), missing at Provider (Pax), a timing mismatch (Jules) and a status
+# mismatch (Rosa, still unheard on Tuesday's report); Tuesday 8, missing in Ledger (the
+# orphan). The three booked Provider Adjustments raise none.
 name: settlement-report-faults
-description: A missing line, a wrong amount, a settlement after Cutoff and two Provider Adjustments.
+description: A missing line, a wrong amount, a settlement after Cutoff, a line listed twice and Provider Adjustments.
 seed: 8
 start: 2026-09-03T15:00:00-04:00 # Thursday, before the 16:00 New York ACH Cutoff
 instant_payout_limit: 50000
@@ -77,6 +82,9 @@ faults:
   - id: jules-after-cutoff
     kind: settlement_after_cutoff
     payment: jules-funding
+  - id: ottoline-listed-twice
+    kind: duplicate_report_line
+    payment: ottoline-payout
   - id: ottoline-payout-recalled
     kind: provider_adjustment
     payment: ottoline-payout

@@ -27,13 +27,23 @@ report through the Provider interface and ingest it; `GET /settlement-reports/{p
 {date}` lists every report received for that day, with its outcome, its lines as stated and
 what was done with each Provider Adjustment. A Payment's booked adjustments are on
 `GET /payments/{id}` too.
+
+Reconciliation (`railbench.reconciliation`, ADR 0015): the `reconciliation` job reconciles
+each Banking Day once its report and the next Banking Day's are ingested. `GET /breaks` is
+the Exception Queue (open Breaks by default; `status=resolved` or `all`, and filters by
+`provider`, `banking_day` and `break_type`), within each currency largest exposure first,
+then oldest; `GET /breaks/{id}` reads one with its evidence and related Breaks;
+`POST /breaks/{id}/resolution` resolves it once, by a person, with a correcting Transaction
+or a reason (a retry 200, otherwise 409). `GET /reconciliations/{provider}/{date}` says
+whether the day is reconciled and what's unresolved, and `POST` to it reconciles the day
+(or re-runs it, finding the same Breaks; 409 until it's ready, 404 for another Provider).
 """
 
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import date
-from typing import Annotated
+from datetime import date, timedelta
+from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
@@ -86,6 +96,23 @@ from railbench.payments.service import (
     PaymentsError,
     UnknownProvider,
 )
+from railbench.reconciliation.matching import BreakType, ReportDay
+from railbench.reconciliation.model import (
+    Break,
+    BreakStatus,
+    DayStatus,
+    NewResolution,
+    RunView,
+)
+from railbench.reconciliation.service import (
+    BreakNotFound,
+    CorrectingTransactionNotFound,
+    NotReady,
+    Reconciliation,
+    ReconciliationError,
+    ResolutionConflict,
+)
+from railbench.reconciliation.service import UnknownProvider as NotReconciledHere
 
 log = logging.getLogger(__name__)
 
@@ -145,6 +172,22 @@ def get_reports(request: Request) -> SettlementReports:
 
 ReportsDep = Annotated[SettlementReports, Depends(get_reports)]
 
+
+def get_reconciliation(request: Request) -> Reconciliation:
+    reconciliation: Reconciliation = request.app.state.reconciliation
+    return reconciliation
+
+
+ReconciliationDep = Annotated[Reconciliation, Depends(get_reconciliation)]
+
+RECONCILIATION_ERROR_STATUS = {
+    BreakNotFound: status.HTTP_404_NOT_FOUND,
+    NotReconciledHere: status.HTTP_404_NOT_FOUND,
+    ResolutionConflict: status.HTTP_409_CONFLICT,
+    NotReady: status.HTTP_409_CONFLICT,
+    CorrectingTransactionNotFound: status.HTTP_422_UNPROCESSABLE_CONTENT,
+}
+
 MARKETPLACE_ERROR_STATUS = {
     AuctionCloseNotFound: status.HTTP_404_NOT_FOUND,
     AuctionCloseConflict: status.HTTP_409_CONFLICT,
@@ -166,6 +209,9 @@ def create_app(
     journal = Journal(engine, clock)
     payments = Payments(engine, clock, journal, provider)
     reports = SettlementReports(engine, clock, journal, provider)
+    reconciliation = Reconciliation(
+        engine, clock, provider, settle=timedelta(seconds=settings.reconciliation_settle_seconds)
+    )
     marketplace = Marketplace(
         engine,
         clock,
@@ -180,10 +226,11 @@ def create_app(
     def jobs() -> None:
         """The Ledger's Clock-driven work, in order: ACH funds become Available, then the
         Standard Payouts they were behind are released, then due Settlement Reports are
-        ingested."""
+        ingested, then every Banking Day whose reports are in is reconciled."""
         payments.make_available()
         marketplace.release_payouts()
         reports.ingest_due()
+        reconciliation.reconcile_due()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -195,6 +242,7 @@ def create_app(
     app.state.payments = payments
     app.state.marketplace = marketplace
     app.state.reports = reports
+    app.state.reconciliation = reconciliation
     app.state.provider = provider
 
     @app.exception_handler(LedgerError)
@@ -209,6 +257,11 @@ def create_app(
     @app.exception_handler(MarketplaceError)
     def marketplace_error(_request: Request, error: MarketplaceError) -> JSONResponse:
         code = MARKETPLACE_ERROR_STATUS.get(type(error), status.HTTP_422_UNPROCESSABLE_CONTENT)
+        return JSONResponse(status_code=code, content={"detail": str(error)})
+
+    @app.exception_handler(ReconciliationError)
+    def reconciliation_error(_request: Request, error: ReconciliationError) -> JSONResponse:
+        code = RECONCILIATION_ERROR_STATUS.get(type(error), status.HTTP_422_UNPROCESSABLE_CONTENT)
         return JSONResponse(status_code=code, content={"detail": str(error)})
 
     @app.exception_handler(ProviderError)
@@ -357,6 +410,45 @@ def create_app(
         provider: str, report_date: date, reports: ReportsDep
     ) -> list[SettlementReportView]:
         return reports.reports(provider, report_date)
+
+    @app.get("/breaks")
+    def list_breaks(
+        reconciliation: ReconciliationDep,
+        status_: Annotated[BreakStatus | Literal["all"], Query(alias="status")] = BreakStatus.OPEN,
+        provider: Annotated[str | None, Query()] = None,
+        banking_day: Annotated[date | None, Query()] = None,
+        break_type: Annotated[BreakType | None, Query()] = None,
+    ) -> list[Break]:
+        return reconciliation.breaks(
+            None if status_ == "all" else status_, provider, banking_day, break_type
+        )
+
+    @app.get("/breaks/{break_id}")
+    def get_break(break_id: str, reconciliation: ReconciliationDep) -> Break:
+        return reconciliation.find(break_id)
+
+    @app.post(
+        "/breaks/{break_id}/resolution",
+        status_code=status.HTTP_201_CREATED,
+        responses={200: {"description": "A retry: the resolved Break", "model": Break}},
+    )
+    def resolve_break(
+        break_id: str, new: NewResolution, reconciliation: ReconciliationDep, response: Response
+    ) -> Break:
+        resolved, replayed = reconciliation.resolve(break_id, new)
+        return _respond(replayed, resolved, response)
+
+    @app.get("/reconciliations/{provider}/{banking_day}")
+    def get_reconciliation_status(
+        provider: str, banking_day: date, reconciliation: ReconciliationDep
+    ) -> DayStatus:
+        return reconciliation.day_status(ReportDay(provider, banking_day))
+
+    @app.post("/reconciliations/{provider}/{banking_day}")
+    def reconcile_day(
+        provider: str, banking_day: date, reconciliation: ReconciliationDep
+    ) -> RunView:
+        return reconciliation.reconcile(ReportDay(provider, banking_day))
 
     @app.post("/providers/{provider}/events", responses={401: {}, 400: {}, 503: {}})
     async def receive_event(provider: str, request: Request, payments: PaymentsDep) -> Receipt:

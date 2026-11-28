@@ -13,7 +13,10 @@ the Ledger received, raw, at the time it received it (ADR 0014), so its lines, a
 Provider Adjustments' bookings, come out the same. At one moment they go in this order:
 Accounts, Auction Closes, originations, Provider Events, the two jobs, the ingest job's
 retries of pending Provider Adjustments (at each moment one was decided), then Settlement
-Reports, in the order received. Every
+Reports, in the order received, then Reconciliation, at each moment it recorded a run
+(ADR 0015; it reads only what the Ledger knew when the day's second report arrived, so it
+finds the same Breaks). A Break's resolution is a person's act, like a Transaction posted
+through the API, and isn't replayed. Every
 Payment is originated from its row, a Payout's too, naming the Hold that reserves it (found
 in the target by the Hold's Idempotency Key), so a Payout's Payment exists before Provider
 Events about it arrive, even when the run made it and heard of it at one Clock moment.
@@ -59,6 +62,8 @@ from railbench.payments.tables import (
     settlement_reports,
     transitions,
 )
+from railbench.reconciliation.service import Reconciliation
+from railbench.reconciliation.tables import runs
 
 
 class RecordedProvider:
@@ -143,6 +148,7 @@ class StepKind(IntEnum):
     RUN_PAYOUT_JOB = 5
     RETRY_ADJUSTMENTS = 6
     RECEIVE_REPORT = 7
+    RECONCILE = 8
 
 
 @dataclass(frozen=True)
@@ -179,6 +185,7 @@ def replay_inbox(
         payout_runs: list[datetime] = []
         report_rows: list[Any] = []
         retry_runs: list[datetime] = []
+        reconciled: list[datetime] = []
         if accounts_in_scope is None:
             closes = _auction_closes(connection)
             payout_runs = payout_job_runs(connection)
@@ -186,6 +193,7 @@ def replay_inbox(
                 connection.execute(select(settlement_reports).order_by(settlement_reports.c.id))
             )
             retry_runs = adjustment_retry_runs(connection)
+            reconciled = sorted(set(connection.scalars(select(runs.c.recorded_at))))
     providers = {p.provider for p in payment_rows}
     if len(providers) > 1:
         raise NotImplementedError(f"replaying more than one Provider: {sorted(providers)}")
@@ -211,6 +219,7 @@ def replay_inbox(
             *(Step(at, StepKind.RUN_PAYOUT_JOB, n) for n, at in enumerate(payout_runs)),
             *(Step(at, StepKind.RETRY_ADJUSTMENTS, n) for n, at in enumerate(retry_runs)),
             *(Step(r.received_at, StepKind.RECEIVE_REPORT, r.id, r) for r in report_rows),
+            *(Step(at, StepKind.RECONCILE, n) for n, at in enumerate(reconciled)),
         ],
         key=lambda step: step.sort_key,
     )
@@ -222,6 +231,7 @@ def replay_inbox(
     # Each Auction Close is booked under the terms it recorded; the release job needs none.
     marketplace = Marketplace(target, clock, journal, service)
     reports = SettlementReports(target, clock, journal, provider)
+    reconciliation = Reconciliation(target, clock, provider)  # no settle margin, as recorded
 
     for step in steps:
         clock.set(step.at)
@@ -262,6 +272,8 @@ def replay_inbox(
                 reports.retry_pending()
             case StepKind.RECEIVE_REPORT:
                 reports.replay(row.provider, row.report_date, bytes(row.body), row.headers)
+            case StepKind.RECONCILE:
+                reconciliation.reconcile_due()
 
 
 def _auction_closes(connection: Connection) -> list[tuple[Any, NewAuctionClose]]:

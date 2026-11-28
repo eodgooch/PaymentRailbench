@@ -210,6 +210,10 @@ The kind of disagreement: missing in Ledger, missing at Provider, amount mismatc
 **Exception Queue**:
 The list of open Breaks waiting for a person to resolve.
 
+**Resolver**:
+The person who resolves a Break: an operator, with the approved Proposal they acted on when there was one. Unlike an Entry's person Actor, the Proposal is optional: resolving a Break moves no money, and a correcting Transaction carries its own Actor. A system job is never a Resolver.
+_Avoid_: Actor (for a resolution), approver (only when a Proposal was approved)
+
 **Proposed Cause**:
 The triage agent's explanation of why a Break happened, more specific than its Break Type.
 

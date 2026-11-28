@@ -55,6 +55,13 @@ def outcomes(found: Run, payment_id: str) -> list[str]:
     return [o["outcome"] for o in payment(found, payment_id)["inbox_outcomes"]]
 
 
+def no_breaks(found: Run) -> bool:
+    """Reconciliation found nothing: delivery Faults and Returns are the Ledger's to absorb,
+    never Breaks (ADR 0015)."""
+    reconciled = found.summary["reconciliation"]
+    return bool(reconciled["runs"]) and reconciled["breaks"] == {}
+
+
 def no_exceptions(found: Run) -> bool:
     return all(
         o["outcome"] != "exception"
@@ -77,6 +84,7 @@ def test_duplicate_webhooks_are_applied_once(database_url: str, manifests: Path)
         # One Inbox row per event, each applied once, however many times it was delivered.
         assert outcomes(found, payment_id) == ["applied", "applied"]
     assert no_exceptions(found)
+    assert no_breaks(found)
 
 
 def test_out_of_order_and_delayed_webhooks_still_move_payments_forward(
@@ -111,6 +119,7 @@ def test_out_of_order_and_delayed_webhooks_still_move_payments_forward(
     assert top_up[2]["recorded_at"] == "2026-09-04T18:30:00+00:00"
     assert outcomes(found, "cleo-top-up") == ["applied", "applied"]
     assert {f.kind for f in found.manifest.faults} == {"out_of_order", "delay"}
+    assert no_breaks(found)
 
 
 def test_a_declined_or_canceled_pull_runs_end_to_end_through_real_webhooks(
@@ -184,6 +193,7 @@ def test_the_same_scenario_and_seed_replay_exactly(database_url: str, manifests:
     assert first.settlement_reports and first.settlement_reports == second.settlement_reports
     assert first.summary == second.summary
     assert other_seed.manifest.faults != first.manifest.faults
+    assert no_breaks(first) and no_breaks(other_seed)
 
 
 def test_a_scenario_refuses_a_database_that_is_not_fresh(
@@ -312,6 +322,7 @@ def test_an_auction_close_scenario_pays_sellers_standard_and_instant(
         "bram-submitted-late",
     }
     assert no_exceptions(found)
+    assert no_breaks(found)
     assert clearing_totals(found.summary) == {
         "clearing:simulator:ach:usd": 0,
         "clearing:simulator:rtp:usd": 0,
@@ -406,6 +417,7 @@ def test_the_headline_late_r10_after_an_instant_payout_ends_in_recovery_receivab
         ("return-delivered-twice", "duplicate", "duplicate_delivery"),
     ]
     assert "R10" in found.manifest.faults[0].root_cause
+    assert no_breaks(found)  # a Return isn't on a report, and its line stays on its day
 
 
 def test_a_settlement_redelivered_after_a_return_changes_nothing(
@@ -426,6 +438,7 @@ def test_a_settlement_redelivered_after_a_return_changes_nothing(
     [hold] = found.summary["holds"].values()
     assert hold["end"]["effective_at"] == "2026-09-07T16:00:00+00:00"  # ended by the Return
     assert payment(found, "kit-funding")["return_exceptions"] == []
+    assert no_breaks(found)
 
 
 @pytest.mark.parametrize(
@@ -490,9 +503,13 @@ def test_every_settlement_report_fault_shows_on_its_report_and_in_the_manifest(
         "simulator:2026-09-04",
         "simulator:2026-09-08",
         "simulator:2026-09-09",
+        # Empty, fetched so Wednesday 9 can be reconciled (ADR 0015).
+        "simulator:2026-09-10",
     ]
+    assert report_lines(found, "2026-09-10") == []
     assert report_lines(found, "2026-09-03") == [
-        ("settlement", "rtp", -27_000, "2026-09-03T21:00:00+00:00")
+        ("settlement", "rtp", -27_000, "2026-09-03T21:00:00+00:00"),
+        ("settlement", "rtp", -27_000, "2026-09-03T21:00:00+00:00"),  # listed twice
     ]
     assert sorted(report_lines(found, "2026-09-04")) == [
         ("adjustment", "rtp", 2_000, "2026-09-04T16:00:00+00:00"),
@@ -511,6 +528,7 @@ def test_every_settlement_report_fault_shows_on_its_report_and_in_the_manifest(
         ("wren-reported-short", "wren-funding", "wrong_report_amount"),
         ("pax-line-missing", "pax-funding", "missing_report_line"),
         ("jules-after-cutoff", "jules-funding", "settlement_after_cutoff"),
+        ("ottoline-listed-twice", "ottoline-payout:rtp", "duplicate_report_line"),
         ("ottoline-payout-recalled", "ottoline-payout:rtp", "provider_adjustment"),
         ("wren-fee-corrected", "wren-funding", "provider_adjustment"),
         ("rosa-settled-late", "rosa-funding", "delayed_delivery"),
@@ -581,6 +599,7 @@ def test_replaying_reproduces_a_ledger_with_settlement_reports_and_adjustments(
             target.dispose()
 
     assert original.summary["settlement_reports"]
+    assert original.summary["reconciliation"]["breaks"]  # replay reproduces them too
     replayed = create_engine(fresh)
     try:
         assert ledger_summary(replayed) == original.summary

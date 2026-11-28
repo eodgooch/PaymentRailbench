@@ -389,11 +389,23 @@ def test_a_report_fault_that_cannot_happen_is_refused(fault: dict[str, Any], why
         with_auction(faults=[fault])
 
 
-def test_a_report_line_is_missing_wrong_or_late_but_only_one_of_them() -> None:
+@pytest.mark.parametrize("other", ["settlement_after_cutoff", "duplicate_report_line"])
+def test_a_report_line_is_missing_wrong_late_or_listed_twice_but_only_one_of_them(
+    other: str,
+) -> None:
     with pytest.raises(ValidationError, match="only one"):
         scenario(
             faults=[
                 {"id": "a", "kind": "missing_report_line", "payment": "first"},
-                {"id": "b", "kind": "settlement_after_cutoff", "payment": "first"},
+                {"id": "b", "kind": other, "payment": "first"},
             ]
         )
+
+
+def test_a_duplicate_report_line_names_a_payment_that_settles() -> None:
+    plans = scenario(
+        faults=[{"id": "twice", "kind": "duplicate_report_line", "payment": "first"}]
+    ).plans(0)
+
+    [fault] = plans["first"].report_faults
+    assert (fault.kind, fault.event) == ("duplicate_report_line", "settled")

@@ -16,21 +16,28 @@ row by something stable instead:
   Transaction and each Payout step's Hold by Idempotency Key;
 - Settlement Reports by `<provider>:<report date>`, every version received in order, with
   its lines as stated and every decision about each Provider Adjustment (pending, booked,
-  unmatched) with its Payment (by Idempotency Key) and Transaction (by its key).
+  unmatched) with its Payment (by Idempotency Key) and Transaction (by its key);
+- Reconciliation runs by `<provider>:<banking day>`, and Breaks by their own ids (a hash of
+  provider, day, Break Type and match key, the same in every database), each with its
+  evidence named the stable way: a Payment by Idempotency Key, a state change as
+  `<Payment key>/<state>`, an Inbox event by event ID, a Transaction by its key, a report
+  as `<provider>:<date>:<SHA-256>`, a line as `<report>/<line ID>`, and a Provider
+  Adjustment decision as `<line>/<outcome>@<recorded at>`; and each Break's resolution.
 
 `accounts` narrows the summary to the Payments funding those Customer Balances and the
 Ledger rows that touch them or belong to those Payments, for databases shared with other
 work (the property tests), and to the Auction Closes whose lots touch them, and leaves
-Settlement Reports out (a report covers every Payment). Without it, the whole Ledger is
-summarised.
+Settlement Reports and Reconciliation out (a report covers every Payment). Without it, the
+whole Ledger is summarised.
 """
 
 from collections.abc import Collection
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Connection, Engine, select
+from sqlalchemy import Connection, Engine, select, true
 
+from railbench.ledger.model import job_label
 from railbench.ledger.tables import accounts, entries, hold_ends, holds, settlements, transactions
 from railbench.marketplace.tables import auction_closes, lots, payout_steps, payouts
 from railbench.payments.accounts import parse_ledger_key
@@ -45,6 +52,8 @@ from railbench.payments.tables import (
     settlement_reports,
     transitions,
 )
+from railbench.reconciliation.service import read_breaks
+from railbench.reconciliation.tables import runs
 
 Summary = dict[str, Any]
 
@@ -112,6 +121,82 @@ class _Summariser:
             "holds": self._holds(),
             "auction_closes": self._auction_closes(),
             "settlement_reports": self._settlement_reports(),
+            "reconciliation": self._reconciliation(),
+        }
+
+    def _reconciliation(self) -> dict[str, Any]:
+        if self._scope is not None:
+            return {}
+        reports = {
+            row.id: f"{row.provider}:{row.report_date.isoformat()}:{row.body_sha256}"
+            for row in self._c.execute(select(settlement_reports))
+        }
+        lines = {
+            row.id: f"{reports[row.report_id]}/{row.line_id}"
+            for row in self._c.execute(select(settlement_report_lines))
+        }
+        keys = {row.id: row.idempotency_key for row in self._c.execute(select(payments))}
+        names: dict[str, dict[int, str]] = {
+            "payments": keys,
+            "transitions": {
+                row.id: f"{keys[row.payment_id]}/{row.state}"
+                for row in self._c.execute(select(transitions))
+            },
+            "inbox": {int(k): v for k, v in self._events.items()},
+            "reports": reports,
+            "report_lines": lines,
+            "provider_adjustments": {
+                row.id: f"{lines[row.line_id]}/{row.outcome}@{_time(row.recorded_at)}"
+                for row in self._c.execute(select(provider_adjustments))
+            },
+        }
+        found_runs = {}
+        for run in self._c.execute(select(runs)):
+            found_runs[f"{run.provider}:{run.banking_day.isoformat()}"] = {
+                "report": reports[run.report_id],
+                "next_report": reports[run.next_report_id],
+                "known_at": _time(run.known_at),
+                "job": job_label(run.job_name, run.job_version),
+                "recorded_at": _time(run.recorded_at),
+            }
+
+        def name(kind: str, ref: int) -> str:
+            if kind == "transactions":
+                return self._key(self._transaction_key(ref))
+            return names[kind][ref]
+
+        found_breaks = {}
+        for found in read_breaks(self._c, None, true()):
+            resolution = found.resolution
+            found_breaks[found.id] = {
+                "run": f"{found.provider}:{found.banking_day.isoformat()}",
+                "break_type": found.break_type,
+                "match_key": found.match_key,
+                "exposure": found.exposure,
+                "currency": found.currency,
+                "facts": found.facts,
+                "related_breaks": found.related_breaks,
+                "detected_at": _time(found.detected_at),
+                "evidence": {
+                    kind: sorted(name(kind, ref) for ref in refs)
+                    for kind, refs in sorted(found.evidence.model_dump().items())
+                    if refs
+                },
+                "resolution": None
+                if resolution is None
+                else {
+                    "operator_id": resolution.actor.operator_id,
+                    "proposal_id": resolution.actor.proposal_id,
+                    "correcting_transaction": None
+                    if resolution.correcting_transaction_id is None
+                    else self._key(self._transaction_key(resolution.correcting_transaction_id)),
+                    "reason": resolution.reason,
+                    "recorded_at": _time(resolution.recorded_at),
+                },
+            }
+        return {
+            "runs": dict(sorted(found_runs.items())),
+            "breaks": dict(sorted(found_breaks.items())),
         }
 
     def _settlement_reports(self) -> dict[str, Any]:
@@ -206,7 +291,7 @@ class _Summariser:
                                 "hold": None
                                 if step.hold_id is None
                                 else self._hold_key(step.hold_id),
-                                "job": f"{step.job_name}@{step.job_version}",
+                                "job": job_label(step.job_name, step.job_version),
                                 "effective_at": _time(step.effective_at),
                                 "recorded_at": _time(step.recorded_at),
                             }
@@ -244,7 +329,7 @@ class _Summariser:
                         "recorded_at": _time(s.recorded_at),
                         "actor": self._events[str(s.inbox_id)]
                         if s.inbox_id is not None
-                        else f"{s.job_name}@{s.job_version}",
+                        else job_label(s.job_name, s.job_version),
                         "transaction": None
                         if s.transaction_id is None
                         else self._key(self._transaction_key(s.transaction_id)),
@@ -333,7 +418,8 @@ class _Summariser:
             case "provider_event":
                 return f"provider_event:{self._events[row.actor_inbox_id]}"
             case "system_job":
-                return f"system_job:{row.actor_job_name}@{row.actor_job_version}"
+                job: str = job_label(row.actor_job_name, row.actor_job_version)
+                return f"system_job:{job}"
             case kind:
                 return f"{kind}:{row.actor_operator_id}:{row.actor_proposal_id}"
 
