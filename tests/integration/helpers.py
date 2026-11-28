@@ -22,7 +22,7 @@ def unique(prefix: str) -> str:
 def posted_balance(journal: Journal, code: str) -> int:
     """The Posted Balance counting every Entry known now, whatever its Effective Time, in the
     Account's normal direction."""
-    return journal.balance(code, END_OF_TIME).posted
+    return journal.balances(code, END_OF_TIME).posted
 
 
 END_OF_TIME = datetime(9999, 1, 1, tzinfo=UTC)

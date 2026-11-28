@@ -122,7 +122,7 @@ class NewTransaction(_Value):
 
 
 class ReversalRequest(_Value):
-    """A request to reverse a posted Transaction."""
+    """A request to reverse a Transaction, posted or pending (ADR 0009)."""
 
     idempotency_key: IdempotencyKey
     actor: Actor
@@ -176,7 +176,7 @@ class Posted(_Value):
     replayed: bool
 
 
-class Balance(_Value):
+class Balances(_Value):
     """An Account's balances at an Effective Time, as known at a Recorded Time, in its normal
     direction (ADR 0009). Always derived, never stored.
 

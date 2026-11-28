@@ -59,7 +59,7 @@ def test_an_account_reports_its_type_and_currency(client: TestClient) -> None:
 
 def balance(client: TestClient, code: str, **params: str) -> dict[str, Any]:
     response = client.get(
-        f"/accounts/{code}/balance", params={"effective_at": "2026-03-03T21:00:00Z", **params}
+        f"/accounts/{code}/balances", params={"effective_at": "2026-03-03T21:00:00Z", **params}
     )
     assert response.status_code == 200, response.text
     body: dict[str, Any] = response.json()
@@ -105,12 +105,12 @@ def test_a_balance_needs_aware_times_no_later_than_now(
 ) -> None:
     customer = open_account(client, "liability")
 
-    assert client.get(f"/accounts/{customer}/balance", params=params).status_code == 422
+    assert client.get(f"/accounts/{customer}/balances", params=params).status_code == 422
 
 
 def test_the_balance_of_an_unknown_account_is_not_found(client: TestClient) -> None:
     response = client.get(
-        "/accounts/nobody/balance", params={"effective_at": "2026-03-02T21:00:00Z"}
+        "/accounts/nobody/balances", params={"effective_at": "2026-03-02T21:00:00Z"}
     )
 
     assert response.status_code == 404

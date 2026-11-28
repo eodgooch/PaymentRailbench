@@ -1,5 +1,6 @@
-"""Idempotency under concurrency: simultaneous posts of one key post once, and a Transaction
-is reversed, or a Hold ended, at most once however many requests race (SPEC §3.2, §3.3).
+"""Idempotency under concurrency: simultaneous posts of one key post once, a Transaction is
+reversed once and either settles or is declined, never both, and a Hold ends once, however
+many requests race (SPEC §3.2, §3.3, ADR 0009).
 
 The Journal relies on the database's unique constraints, not on check-then-insert, so these
 race real threads on real connections.
@@ -10,12 +11,13 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from itertools import count
 from threading import Barrier
+from time import sleep
 
 import pytest
 from sqlalchemy import Engine
 
 from railbench.common.clock import ManualClock
-from railbench.ledger.journal import AlreadyReversed, HoldAlreadyEnded, Journal
+from railbench.ledger.journal import AlreadyReversed, AlreadySettled, HoldAlreadyEnded, Journal
 from railbench.ledger.model import (
     AccountType,
     HoldRecorded,
@@ -27,7 +29,9 @@ from railbench.ledger.model import (
     Posted,
     ReleaseRequest,
     ReversalRequest,
+    SettlementRequest,
     SystemJob,
+    TransactionStatus,
 )
 from tests.integration.helpers import posted_balance, unique
 
@@ -149,6 +153,58 @@ def test_racing_releases_and_captures_end_a_hold_once(journal: Journal) -> None:
     assert len(winners) == 1, results
     assert sum(isinstance(result, HoldAlreadyEnded) for result in results) == RACERS - 1
     captured = isinstance(winners[0], Posted)
-    balance = journal.balance(customer, AUCTION_CLOSE)
+    balance = journal.balances(customer, AUCTION_CLOSE)
     assert balance.held == 0
     assert balance.posted == (1_500 if captured else 2_500)
+
+
+class SlowClock(ManualClock):
+    """Pauses on every read. A write reads the clock between its checks and its insert, so
+    this holds every race window open long enough for the racers to overlap."""
+
+    def now(self) -> datetime:
+        sleep(0.05)
+        return super().now()
+
+
+def test_a_settlement_and_a_decline_never_both_win(app_engine: Engine) -> None:
+    """Settle and reverse race on one pending Transaction. If the Settlement wins the lock,
+    the Reversal that follows is a posted Return; if the Reversal wins, it's a pending
+    decline and every Settlement fails. Never a Settlement alongside a pending Reversal."""
+    journal = Journal(app_engine, SlowClock(AUCTION_CLOSE))
+    customer, new = funded(journal)
+    pending = journal.post(new.model_copy(update={"status": TransactionStatus.PENDING}))
+    transaction_id = pending.transaction.id
+    actor = SystemJob(name="ach-settlement", version="1.0.0")
+    turn = count()
+
+    def settle_or_reverse() -> Posted:
+        if next(turn) % 2:
+            return journal.settle(
+                transaction_id,
+                SettlementRequest(
+                    idempotency_key=unique("settlement"), actor=actor, effective_at=AUCTION_CLOSE
+                ),
+            )
+        return journal.reverse(
+            transaction_id,
+            ReversalRequest(
+                idempotency_key=unique("reversal"), actor=actor, effective_at=AUCTION_CLOSE
+            ),
+        )
+
+    results = race(settle_or_reverse)
+
+    assert all(isinstance(r, Posted | AlreadySettled | AlreadyReversed) for r in results), results
+    original = journal.transaction(transaction_id)
+    assert original.reversed_by is not None or original.settlement is not None
+    balances = journal.balances(customer, AUCTION_CLOSE)
+    if original.settlement is None:  # declined
+        assert original.reversed_by is not None
+        assert journal.transaction(original.reversed_by).status is TransactionStatus.PENDING
+        assert (balances.posted, balances.pending) == (0, 0)
+    elif original.reversed_by is None:  # settled
+        assert (balances.posted, balances.pending) == (2_500, 0)
+    else:  # settled, then returned
+        assert journal.transaction(original.reversed_by).status is TransactionStatus.POSTED
+        assert (balances.posted, balances.pending) == (0, 0)

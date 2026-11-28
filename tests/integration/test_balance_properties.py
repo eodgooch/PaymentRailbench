@@ -1,22 +1,30 @@
 """Properties of bitemporal balances under generated histories, against a real Postgres
 (SPEC §3.3, ADR 0002, ADR 0009).
 
-A random history of posted and pending Transactions, Settlements, Reversals and Holds
-(placed, released, captured), with backdated Effective Times, runs against one Customer
-Balance. A plain-Python model of the same history, written from the GLOSSARY definitions,
-is the oracle:
+A random history runs against a Customer Balance (a liability) and a Clearing Account (an
+asset): posted and pending Transactions, Settlements, declines and Returns, and Holds on
+either Account that are released or captured (by a posted or a pending Transaction), with
+backdated Effective Times. The oracle is a plain replay of that history, written from the
+GLOSSARY definitions rather than from the Journal's query: at (T, T') each Transaction is
+unknown, posted, settled, declined or in flight, each Hold is open or not, and
 
-- at any Effective Time and Recorded Time, the Journal's Posted, Pending, held and
-  unsettled-outflow totals match the model, and Available = Posted - Holds - unsettled
-  outflows
-- a balance as known at T' depends only on what was recorded by T': asking again after
-  more history has been recorded gives the same answer
+    Posted    = the Entries of posted and settled Transactions
+    Pending   = the Entries of in-flight Transactions
+    outflows  = what each in-flight Transaction takes out of the Account
+    Available = Posted - open Holds - outflows
+
+Two properties:
+
+- at any Effective Time and Recorded Time, the Journal's Balances match the oracle
+- Balances as known at T' depend only on what was recorded by T': asking again after more
+  history has been recorded gives the same answer
 
 There's no balance cache to check against (ADR 0009): every read is the derivation.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum, auto
 
 import pytest
 from hypothesis import HealthCheck, given, settings
@@ -27,7 +35,7 @@ from railbench.common.clock import ManualClock
 from railbench.ledger.journal import Journal
 from railbench.ledger.model import (
     AccountType,
-    Balance,
+    Balances,
     NewAccount,
     NewEntry,
     NewHold,
@@ -52,95 +60,126 @@ database = settings(
     suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
 )
 
+Moment = tuple[datetime, datetime]  # (Effective Time, Recorded Time)
+
+
+def seen(moment: Moment | None, effective_at: datetime, known_at: datetime) -> bool:
+    return moment is not None and moment[0] <= effective_at and moment[1] <= known_at
+
+
+class State(Enum):
+    UNKNOWN = auto()
+    POSTED = auto()
+    SETTLED = auto()
+    DECLINED = auto()
+    IN_FLIGHT = auto()
+
 
 @dataclass
 class Txn:
-    """One Transaction's effect on the Customer Balance, in its normal direction."""
-
     id: int
-    delta: int
+    raw: dict[str, int]  # debit-positive amount per Account code
     pending: bool
-    effective_at: datetime
-    recorded_at: datetime
-    base: int  # itself, or for a Reversal the Transaction it reverses
+    posted: Moment
+    is_return: bool = False
+    settled: Moment | None = None
+    declined: Moment | None = None
+
+    def state(self, effective_at: datetime, known_at: datetime) -> State:
+        if not seen(self.posted, effective_at, known_at):
+            return State.UNKNOWN
+        if not self.pending:
+            return State.POSTED
+        if seen(self.settled, effective_at, known_at):
+            return State.SETTLED
+        if seen(self.declined, effective_at, known_at):
+            return State.DECLINED
+        return State.IN_FLIGHT
 
 
 @dataclass
 class HoldRow:
     id: int
+    account: str
     amount: int
-    effective_at: datetime
-    recorded_at: datetime
-    ended: tuple[datetime, datetime] | None = None  # (effective, recorded)
-
-
-@dataclass
-class Model:
-    txns: list[Txn] = field(default_factory=list)
-    settlements: dict[int, tuple[datetime, datetime]] = field(default_factory=dict)
-    holds: list[HoldRow] = field(default_factory=list)
-    reversed: set[int] = field(default_factory=set)
-
-    def balance(self, effective_at: datetime, known_at: datetime) -> tuple[int, int, int, int]:
-        """(posted, pending, held, unsettled outflows), from the GLOSSARY definitions."""
-
-        def counts(effective: datetime, recorded: datetime) -> bool:
-            return effective <= effective_at and recorded <= known_at
-
-        posted = 0
-        unsettled: dict[int, int] = {}
-        for txn in self.txns:
-            if not counts(txn.effective_at, txn.recorded_at):
-                continue
-            settlement = self.settlements.get(txn.base)
-            if not txn.pending or (settlement is not None and counts(*settlement)):
-                posted += txn.delta
-            else:
-                unsettled[txn.base] = unsettled.get(txn.base, 0) + txn.delta
-        held = sum(
-            hold.amount
-            for hold in self.holds
-            if counts(hold.effective_at, hold.recorded_at)
-            and not (hold.ended is not None and counts(*hold.ended))
-        )
-        outflows = sum(-net for net in unsettled.values() if net < 0)
-        return posted, sum(unsettled.values()), held, outflows
+    placed: Moment
+    ended: Moment | None = None
 
 
 class History:
-    """Drives the Journal and the Model with the same operations."""
+    """Drives the Journal and records the same history for the oracle."""
 
     def __init__(self, journal: Journal, clock: ManualClock) -> None:
-        self.journal, self.clock, self.model = journal, clock, Model()
+        self.journal, self.clock = journal, clock
         self.customer, self.clearing = unique("customer"), unique("clearing")
+        self.sign = {self.customer: -1, self.clearing: 1}  # normal direction
         journal.open_account(
             NewAccount(code=self.customer, type=AccountType.LIABILITY, currency="USD")
         )
         journal.open_account(NewAccount(code=self.clearing, type=AccountType.ASSET, currency="USD"))
+        self.txns: list[Txn] = []
+        self.holds: list[HoldRow] = []
+        self.reversed: set[int] = set()
 
-    def _entries(self, delta: int) -> list[NewEntry]:
-        # The Customer Balance is a liability: +delta in its normal direction is a credit.
+    # The oracle
+
+    def expected(self, account: str, effective_at: datetime, known_at: datetime) -> Balances:
+        posted = pending = outflows = 0
+        for txn in self.txns:
+            amount = txn.raw.get(account, 0) * self.sign[account]
+            match txn.state(effective_at, known_at):
+                case State.POSTED | State.SETTLED:
+                    posted += amount
+                case State.IN_FLIGHT:
+                    pending += amount
+                    outflows += max(0, -amount)
+                case State.UNKNOWN | State.DECLINED:
+                    pass
+        held = sum(
+            hold.amount
+            for hold in self.holds
+            if hold.account == account
+            and seen(hold.placed, effective_at, known_at)
+            and not seen(hold.ended, effective_at, known_at)
+        )
+        return Balances(
+            account=account,
+            currency="USD",
+            effective_at=effective_at,
+            known_at=known_at,
+            posted=posted,
+            pending=pending,
+            held=held,
+            unsettled_outflows=outflows,
+            available=posted - held - outflows,
+        )
+
+    # Operations
+
+    def _entries(self, customer_raw: int) -> list[NewEntry]:
         return [
-            NewEntry(account=self.customer, currency="USD", amount=-delta),
-            NewEntry(account=self.clearing, currency="USD", amount=delta),
+            NewEntry(account=self.customer, currency="USD", amount=customer_raw),
+            NewEntry(account=self.clearing, currency="USD", amount=-customer_raw),
         ]
 
-    def post(self, delta: int, pending: bool, effective_at: datetime) -> None:
+    def _record(self, txn_id: int, customer_raw: int, pending: bool, posted: Moment) -> None:
+        raw = {self.customer: customer_raw, self.clearing: -customer_raw}
+        self.txns.append(Txn(txn_id, raw, pending, posted))
+
+    def post(self, customer_raw: int, pending: bool, effective_at: datetime) -> None:
         posted = self.journal.post(
             NewTransaction(
                 idempotency_key=unique("txn"),
                 actor=ACTOR,
                 effective_at=effective_at,
                 status=TransactionStatus.PENDING if pending else TransactionStatus.POSTED,
-                entries=self._entries(delta),
+                entries=self._entries(customer_raw),
             )
         ).transaction
-        self.model.txns.append(
-            Txn(posted.id, delta, pending, effective_at, posted.recorded_at, posted.id)
-        )
+        self._record(posted.id, customer_raw, pending, (effective_at, posted.recorded_at))
 
     def settle(self, txn: Txn, after: timedelta) -> None:
-        effective_at = txn.effective_at + after
+        effective_at = txn.posted[0] + after
         settled = self.journal.settle(
             txn.id,
             SettlementRequest(
@@ -148,35 +187,47 @@ class History:
             ),
         ).transaction
         assert settled.settlement is not None
-        self.model.settlements[txn.id] = (effective_at, settled.settlement.recorded_at)
+        txn.settled = (effective_at, settled.settlement.recorded_at)
 
-    def reverse(self, txn: Txn, effective_at: datetime) -> None:
+    def reverse(self, txn: Txn, after: timedelta) -> None:
+        earliest = txn.settled[0] if txn.settled else txn.posted[0]
+        effective_at = max(earliest, txn.posted[0]) + after
         reversal = self.journal.reverse(
             txn.id,
             ReversalRequest(
                 idempotency_key=unique("reverse"), actor=ACTOR, effective_at=effective_at
             ),
         ).transaction
-        self.model.reversed.add(txn.id)
-        self.model.txns.append(
-            Txn(reversal.id, -txn.delta, txn.pending, effective_at, reversal.recorded_at, txn.id)
-        )
+        self.reversed.add(txn.id)
+        if txn.pending and txn.settled is None:
+            assert reversal.status is TransactionStatus.PENDING
+            txn.declined = (effective_at, reversal.recorded_at)
+        else:
+            assert reversal.status is TransactionStatus.POSTED
+            returned = Txn(
+                reversal.id,
+                {code: -amount for code, amount in txn.raw.items()},
+                pending=False,
+                posted=(effective_at, reversal.recorded_at),
+                is_return=True,
+            )
+            self.txns.append(returned)
 
-    def place(self, amount: int, effective_at: datetime) -> None:
+    def place(self, account: str, amount: int, effective_at: datetime) -> None:
         hold = self.journal.place_hold(
             NewHold(
                 idempotency_key=unique("hold"),
                 actor=ACTOR,
                 effective_at=effective_at,
-                account=self.customer,
+                account=account,
                 currency="USD",
                 amount=amount,
             )
         ).hold
-        self.model.holds.append(HoldRow(hold.id, amount, effective_at, hold.recorded_at))
+        self.holds.append(HoldRow(hold.id, account, amount, (effective_at, hold.recorded_at)))
 
     def release(self, hold: HoldRow, after: timedelta) -> None:
-        effective_at = hold.effective_at + after
+        effective_at = hold.placed[0] + after
         ended = self.journal.release_hold(
             hold.id,
             ReleaseRequest(
@@ -186,84 +237,69 @@ class History:
         assert ended is not None
         hold.ended = (effective_at, ended.recorded_at)
 
-    def capture(self, hold: HoldRow, amount: int, after: timedelta) -> None:
-        effective_at = hold.effective_at + after
+    def capture(self, hold: HoldRow, amount: int, pending: bool, after: timedelta) -> None:
+        effective_at = hold.placed[0] + after
+        # Debit the Customer Balance and credit Clearing: money out of both, in their
+        # normal directions, so it captures a Hold on either.
         captured = self.journal.capture_hold(
             hold.id,
             NewTransaction(
                 idempotency_key=unique("capture"),
                 actor=ACTOR,
                 effective_at=effective_at,
-                entries=self._entries(-amount),
+                status=TransactionStatus.PENDING if pending else TransactionStatus.POSTED,
+                entries=self._entries(amount),
             ),
         ).transaction
         hold.ended = (effective_at, captured.recorded_at)
-        self.model.txns.append(
-            Txn(captured.id, -amount, False, effective_at, captured.recorded_at, captured.id)
-        )
-
-    def balance(self, effective_at: datetime, known_at: datetime | None = None) -> Balance:
-        return self.journal.balance(self.customer, effective_at, known_at)
+        self._record(captured.id, amount, pending, (effective_at, captured.recorded_at))
 
 
 hours = st.integers(min_value=0, max_value=HOURS).map(lambda h: START + timedelta(hours=h))
 delays = st.integers(min_value=0, max_value=48).map(lambda h: timedelta(hours=h))
 amounts = st.integers(min_value=-50_000, max_value=50_000).filter(bool)
-hold_amounts = st.integers(min_value=1, max_value=50_000)
-OPERATIONS = ("post", "settle", "reverse", "place", "release", "capture")
+positive = st.integers(min_value=1, max_value=50_000)
 
 
-def run_history(data: st.DataObject, history: History, steps: int) -> list[Balance]:
-    """Apply `steps` random operations, one simulated hour apart. After each, read the
-    balance at a random Effective Time as known now, and return those readings."""
-    readings: list[Balance] = []
+def run_history(data: st.DataObject, history: History, steps: int) -> list[Balances]:
+    """Apply `steps` random operations, one simulated hour apart. After each, read both
+    Accounts' Balances at a random Effective Time as known now, and return the readings."""
+    readings: list[Balances] = []
     for _ in range(steps):
         history.clock.advance(timedelta(hours=1))
-        model = history.model
-        settleable = [
-            t
-            for t in model.txns
-            if t.pending
-            and t.base == t.id
-            and t.id not in model.settlements
-            and t.id not in model.reversed
-        ]
-        reversible = [t for t in model.txns if t.base == t.id and t.id not in model.reversed]
-        open_holds = [h for h in model.holds if h.ended is None]
-        choices = [
-            op
-            for op, possible in zip(
-                OPERATIONS,
-                (
-                    True,
-                    bool(settleable),
-                    bool(reversible),
-                    True,
-                    bool(open_holds),
-                    bool(open_holds),
-                ),
-                strict=True,
-            )
-            if possible
-        ]
-        match data.draw(st.sampled_from(choices)):
+        originals = [t for t in history.txns if not t.is_return and t.id not in history.reversed]
+        settleable = [t for t in originals if t.pending and t.settled is None]
+        open_holds = [h for h in history.holds if h.ended is None]
+        possible = {
+            "post": True,
+            "settle": bool(settleable),
+            "reverse": bool(originals),
+            "place": True,
+            "release": bool(open_holds),
+            "capture": bool(open_holds),
+        }
+        match data.draw(st.sampled_from([op for op, ok in possible.items() if ok])):
             case "post":
                 history.post(data.draw(amounts), data.draw(st.booleans()), data.draw(hours))
             case "settle":
                 history.settle(data.draw(st.sampled_from(settleable)), data.draw(delays))
             case "reverse":
-                history.reverse(data.draw(st.sampled_from(reversible)), data.draw(hours))
+                history.reverse(data.draw(st.sampled_from(originals)), data.draw(delays))
             case "place":
-                history.place(data.draw(hold_amounts), data.draw(hours))
+                account = data.draw(st.sampled_from([history.customer, history.clearing]))
+                history.place(account, data.draw(positive), data.draw(hours))
             case "release":
                 history.release(data.draw(st.sampled_from(open_holds)), data.draw(delays))
             case "capture":
                 history.capture(
                     data.draw(st.sampled_from(open_holds)),
-                    data.draw(hold_amounts),
+                    data.draw(positive),
+                    data.draw(st.booleans()),
                     data.draw(delays),
                 )
-        readings.append(history.balance(data.draw(hours)))
+        effective_at = data.draw(hours)
+        for account in (history.customer, history.clearing):
+            readings.append(history.journal.balances(account, effective_at))
     return readings
 
 
@@ -279,30 +315,27 @@ def test_balances_match_the_definitions_at_every_time(
 ) -> None:
     history = new_history(app_engine)
     run_history(data, history, steps)
-    model = history.model
     known = sorted(
-        {t.recorded_at for t in model.txns}
-        | {h.recorded_at for h in model.holds}
-        | {recorded for _, recorded in model.settlements.values()}
+        {t.posted[1] for t in history.txns}
+        | {t.settled[1] for t in history.txns if t.settled}
+        | {t.declined[1] for t in history.txns if t.declined}
+        | {h.placed[1] for h in history.holds}
+        | {h.ended[1] for h in history.holds if h.ended}
         | {history.clock.now()}
     )
 
     for _ in range(8):
-        effective_at = data.draw(hours | st.sampled_from([START + timedelta(days=30)]))
+        effective_at = data.draw(hours | st.just(START + timedelta(days=30)))
         known_at = data.draw(st.sampled_from(known))
-        balance = history.balance(effective_at, known_at)
-
-        expected = model.balance(effective_at, known_at)
-        assert (balance.posted, balance.pending, balance.held, balance.unsettled_outflows) == (
-            expected
-        )
-        posted, _, held, outflows = expected
-        assert balance.available == posted - held - outflows
+        for account in (history.customer, history.clearing):
+            assert history.journal.balances(account, effective_at, known_at) == (
+                history.expected(account, effective_at, known_at)
+            )
 
 
 @database
 @given(data=st.data(), steps=st.integers(min_value=1, max_value=12))
-def test_a_balance_as_known_then_never_changes(
+def test_balances_as_known_then_never_change(
     app_engine: Engine, data: st.DataObject, steps: int
 ) -> None:
     history = new_history(app_engine)
@@ -310,4 +343,6 @@ def test_a_balance_as_known_then_never_changes(
     readings = run_history(data, history, steps)
 
     for reading in readings:
-        assert history.balance(reading.effective_at, reading.known_at) == reading
+        assert history.journal.balances(
+            reading.account, reading.effective_at, reading.known_at
+        ) == (reading)

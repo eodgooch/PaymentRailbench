@@ -22,9 +22,8 @@ from railbench.common.service import create_service_app
 from railbench.ledger.journal import Conflict, Journal, LedgerError, NotFound, Rejected
 from railbench.ledger.model import (
     Account,
-    Balance,
+    Balances,
     Hold,
-    HoldRecorded,
     NewAccount,
     NewHold,
     NewTransaction,
@@ -75,14 +74,14 @@ def create_app(engine: Engine, clock: Clock) -> FastAPI:
     def get_account(code: str, journal: JournalDep) -> Account:
         return journal.account(code)
 
-    @app.get("/accounts/{code}/balance")
-    def get_balance(
+    @app.get("/accounts/{code}/balances")
+    def get_balances(
         code: str,
         journal: JournalDep,
         effective_at: Annotated[AwareDatetime, Query()],
         known_at: Annotated[AwareDatetime | None, Query()] = None,
-    ) -> Balance:
-        return journal.balance(code, effective_at, known_at)
+    ) -> Balances:
+        return journal.balances(code, effective_at, known_at)
 
     @app.post(
         "/transactions",
@@ -92,7 +91,7 @@ def create_app(engine: Engine, clock: Clock) -> FastAPI:
     def post_transaction(
         new: NewTransaction, journal: JournalDep, response: Response
     ) -> Transaction:
-        return _respond(journal.post(new), response)
+        return _respond_posted(journal.post(new), response)
 
     @app.get("/transactions/{transaction_id}")
     def get_transaction(transaction_id: int, journal: JournalDep) -> Transaction:
@@ -106,7 +105,7 @@ def create_app(engine: Engine, clock: Clock) -> FastAPI:
     def reverse_transaction(
         transaction_id: int, request: ReversalRequest, journal: JournalDep, response: Response
     ) -> Transaction:
-        return _respond(journal.reverse(transaction_id, request), response)
+        return _respond_posted(journal.reverse(transaction_id, request), response)
 
     @app.post(
         "/transactions/{transaction_id}/settlement",
@@ -117,10 +116,7 @@ def create_app(engine: Engine, clock: Clock) -> FastAPI:
         transaction_id: int, request: SettlementRequest, journal: JournalDep, response: Response
     ) -> Transaction:
         posted = journal.settle(transaction_id, request)
-        if posted.replayed:
-            response.status_code = status.HTTP_200_OK
-            response.headers["Idempotent-Replayed"] = "true"
-        return posted.transaction
+        return _respond(posted.replayed, posted.transaction, response)
 
     @app.post(
         "/holds",
@@ -129,9 +125,9 @@ def create_app(engine: Engine, clock: Clock) -> FastAPI:
     )
     def place_hold(new: NewHold, journal: JournalDep, response: Response) -> Hold:
         recorded = journal.place_hold(new)
-        if not recorded.replayed:
-            response.headers["Location"] = f"/holds/{recorded.hold.id}"
-        return _respond_hold(recorded, response)
+        return _respond(
+            recorded.replayed, recorded.hold, response, location=f"/holds/{recorded.hold.id}"
+        )
 
     @app.get("/holds/{hold_id}")
     def get_hold(hold_id: int, journal: JournalDep) -> Hold:
@@ -145,7 +141,8 @@ def create_app(engine: Engine, clock: Clock) -> FastAPI:
     def release_hold(
         hold_id: int, request: ReleaseRequest, journal: JournalDep, response: Response
     ) -> Hold:
-        return _respond_hold(journal.release_hold(hold_id, request), response)
+        released = journal.release_hold(hold_id, request)
+        return _respond(released.replayed, released.hold, response)
 
     @app.post(
         "/holds/{hold_id}/capture",
@@ -155,22 +152,24 @@ def create_app(engine: Engine, clock: Clock) -> FastAPI:
     def capture_hold(
         hold_id: int, new: NewTransaction, journal: JournalDep, response: Response
     ) -> Transaction:
-        return _respond(journal.capture_hold(hold_id, new), response)
+        return _respond_posted(journal.capture_hold(hold_id, new), response)
 
     return app
 
 
-def _respond_hold(recorded: HoldRecorded, response: Response) -> Hold:
-    if recorded.replayed:
+def _respond[T](replayed: bool, body: T, response: Response, location: str = "") -> T:
+    """A retry answers 200 with `Idempotent-Replayed: true`; a first write keeps its 201,
+    with a Location when the new thing has its own URL."""
+    if replayed:
         response.status_code = status.HTTP_200_OK
         response.headers["Idempotent-Replayed"] = "true"
-    return recorded.hold
+    elif location:
+        response.headers["Location"] = location
+    return body
 
 
-def _respond(posted: Posted, response: Response) -> Transaction:
-    if posted.replayed:
-        response.status_code = status.HTTP_200_OK
-        response.headers["Idempotent-Replayed"] = "true"
-    else:
-        response.headers["Location"] = f"/transactions/{posted.transaction.id}"
-    return posted.transaction
+def _respond_posted(posted: Posted, response: Response) -> Transaction:
+    transaction = posted.transaction
+    return _respond(
+        posted.replayed, transaction, response, location=f"/transactions/{transaction.id}"
+    )

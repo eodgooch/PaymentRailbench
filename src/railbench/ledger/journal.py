@@ -18,6 +18,7 @@ import hashlib
 import json
 from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
@@ -25,6 +26,7 @@ from sqlalchemy import (
     Connection,
     Engine,
     Row,
+    Select,
     Table,
     case,
     exists,
@@ -42,7 +44,7 @@ from railbench.ledger.model import (
     Account,
     AccountType,
     Actor,
-    Balance,
+    Balances,
     Entry,
     Hold,
     HoldEnd,
@@ -175,9 +177,9 @@ class Journal:
             recorded_at=row.recorded_at,
         )
 
-    def balance(
+    def balances(
         self, code: str, effective_at: datetime, known_at: datetime | None = None
-    ) -> Balance:
+    ) -> Balances:
         """The Account's Posted, Pending and Available Balances at `effective_at`, as known at
         `known_at` (default: now), in the Account's normal direction (ADR 0009).
 
@@ -202,12 +204,12 @@ class Journal:
             if account is None:
                 raise AccountNotFound(f"no Account {code}")
             sign = AccountType(account.type).normal_sign
-            posted, pending, outflows = connection.execute(
+            sums = connection.execute(
                 _entry_balances(account.id, sign, effective_at, known_at)
             ).one()
-            held = connection.execute(_held(account.id, effective_at, known_at)).scalar_one()
-        posted, pending, outflows, held = (int(v) for v in (posted, pending, outflows, held))
-        return Balance(
+            held_sum = connection.execute(_held(account.id, effective_at, known_at)).scalar_one()
+        posted, pending, outflows, held = (int(v) for v in (*sums, held_sum))
+        return Balances(
             account=code,
             currency=account.currency,
             effective_at=effective_at,
@@ -226,7 +228,7 @@ class Journal:
             fingerprint=_fingerprint({"post": new.model_dump(exclude={"idempotency_key"})}),
             description=new.description,
             reverses=None,
-            status=new.status,
+            status=lambda _connection: new.status,
             actor=new.actor,
             effective_at=new.effective_at,
             new_entries=new.entries,
@@ -235,14 +237,38 @@ class Journal:
     def reverse(self, transaction_id: int, request: ReversalRequest) -> Posted:
         """Post a Reversal: a Transaction that negates every Entry of the original and
         references it. A Transaction can be reversed once, and a Reversal can't be reversed.
+        A Reversal can't take effect before its original.
 
-        The Reversal takes the original's status: a pending Transaction's Reversal is
-        pending too, and settles with it (ADR 0009)."""
+        Reversing a posted or settled Transaction posts the Reversal; for a settled one (a
+        Return) it can't take effect before the Settlement either. Reversing a pending
+        Transaction that hasn't settled (a decline) is itself pending: the two net to zero
+        and neither can settle afterwards (ADR 0009). Settling and reversing one Transaction
+        take the same lock, so they can't race."""
         original = self.transaction(transaction_id)
         if original.reverses is not None:
             raise CannotReverseReversal(
                 f"Transaction {transaction_id} is a Reversal; post a new Transaction instead"
             )
+        if request.effective_at < original.entries[0].effective_at:
+            raise TooEarly(f"a Reversal can't take effect before Transaction {transaction_id}")
+
+        def status(connection: Connection) -> TransactionStatus:
+            _lock(connection, transaction_id)
+            if original.status is TransactionStatus.POSTED:
+                return TransactionStatus.POSTED
+            settled_at = connection.scalar(
+                select(settlements.c.effective_at).where(
+                    settlements.c.transaction_id == transaction_id
+                )
+            )
+            if settled_at is None:
+                return TransactionStatus.PENDING
+            if request.effective_at < settled_at:
+                raise TooEarly(
+                    f"a Return can't take effect before Transaction {transaction_id} settled"
+                )
+            return TransactionStatus.POSTED
+
         payload = {"reverse": transaction_id, **request.model_dump(exclude={"idempotency_key"})}
         try:
             return self._write(
@@ -250,7 +276,7 @@ class Journal:
                 fingerprint=_fingerprint(payload),
                 description=request.description,
                 reverses=transaction_id,
-                status=original.status,
+                status=status,
                 actor=request.actor,
                 effective_at=request.effective_at,
                 new_entries=[
@@ -271,52 +297,48 @@ class Journal:
 
     def settle(self, transaction_id: int, request: SettlementRequest) -> Posted:
         """Settle a pending Transaction: from the Settlement's Effective Time, as known from
-        its Recorded Time, its Entries (and its Reversal's, if any) count as Posted rather
-        than Pending. No Entry is changed. A Transaction settles at most once."""
+        its Recorded Time, its Entries count as Posted rather than Pending. No Entry is
+        changed. A Transaction settles at most once, and not once it has been reversed."""
         fingerprint = _fingerprint(
             {"settle": transaction_id, **request.model_dump(exclude={"idempotency_key"})}
         )
-        with self._engine.connect() as connection:
-            if _replayed(connection, settlements, request.idempotency_key, fingerprint):
-                return Posted(
-                    transaction=_read_transaction(connection, transaction_id), replayed=True
-                )
+
+        def write(connection: Connection) -> None:
+            _lock(connection, transaction_id)
             original = _read_transaction(connection, transaction_id)
-        if original.reverses is not None:
-            raise NotSettleable(
-                f"Transaction {transaction_id} is a Reversal; it settles with Transaction"
-                f" {original.reverses}"
-            )
-        if original.status is not TransactionStatus.PENDING:
-            raise NotSettleable(f"Transaction {transaction_id} is already posted")
-        if original.reversed_by is not None:
-            raise AlreadyReversed(f"Transaction {transaction_id} has been reversed")
-        if request.effective_at < original.entries[0].effective_at:
-            raise TooEarly(f"a Settlement can't take effect before Transaction {transaction_id}")
-        try:
-            with self._engine.begin() as connection:
-                connection.execute(
-                    insert(settlements).values(
-                        transaction_id=transaction_id,
-                        idempotency_key=request.idempotency_key,
-                        payload_fingerprint=fingerprint,
-                        effective_at=request.effective_at,
-                        recorded_at=self._clock.now(),
-                        **_actor_columns(request.actor),
-                    )
+            if original.reverses is not None:
+                raise NotSettleable(f"Transaction {transaction_id} is a Reversal")
+            if original.status is not TransactionStatus.PENDING:
+                raise NotSettleable(f"Transaction {transaction_id} is already posted")
+            if original.reversed_by is not None:
+                raise AlreadyReversed(f"Transaction {transaction_id} has been reversed")
+            if request.effective_at < original.entries[0].effective_at:
+                raise TooEarly(
+                    f"a Settlement can't take effect before Transaction {transaction_id}"
                 )
-        except IntegrityError as error:
-            with self._engine.connect() as connection:
-                if _replayed(connection, settlements, request.idempotency_key, fingerprint):
-                    return Posted(
-                        transaction=_read_transaction(connection, transaction_id), replayed=True
-                    )
-            if _constraint(error) == "settlements_transaction_id_key":
-                raise AlreadySettled(
+            connection.execute(
+                insert(settlements).values(
+                    transaction_id=transaction_id,
+                    idempotency_key=request.idempotency_key,
+                    payload_fingerprint=fingerprint,
+                    effective_at=request.effective_at,
+                    recorded_at=self._clock.now(),
+                    **_actor_columns(request.actor),
+                )
+            )
+
+        written = self._once(
+            settlements,
+            request.idempotency_key,
+            fingerprint,
+            write,
+            conflicts={
+                "settlements_transaction_id_key": AlreadySettled(
                     f"Transaction {transaction_id} has already been settled"
-                ) from error
-            raise
-        return Posted(transaction=self.transaction(transaction_id), replayed=False)
+                )
+            },
+        )
+        return Posted(transaction=self.transaction(transaction_id), replayed=not written)
 
     def place_hold(self, new: NewHold) -> HoldRecorded:
         """Place a Hold exactly once per Idempotency Key. It reduces the Account's Available
@@ -358,42 +380,47 @@ class Journal:
         fingerprint = _fingerprint(
             {"release": hold_id, **request.model_dump(exclude={"idempotency_key"})}
         )
-        with self._engine.connect() as connection:
-            if _replayed(connection, hold_ends, request.idempotency_key, fingerprint):
-                return HoldRecorded(hold=_read_hold(connection, hold_id), replayed=True)
+
+        def write(connection: Connection) -> None:
             hold = _read_hold(connection, hold_id)
-        if request.effective_at < hold.effective_at:
-            raise TooEarly(f"Hold {hold_id} can't be released before it was placed")
-        try:
-            with self._engine.begin() as connection:
-                connection.execute(
-                    insert(hold_ends).values(
-                        hold_id=hold_id,
-                        outcome=HoldOutcome.RELEASED,
-                        idempotency_key=request.idempotency_key,
-                        payload_fingerprint=fingerprint,
-                        effective_at=request.effective_at,
-                        recorded_at=self._clock.now(),
-                        **_actor_columns(request.actor),
-                    )
+            if request.effective_at < hold.effective_at:
+                raise TooEarly(f"Hold {hold_id} can't be released before it was placed")
+            connection.execute(
+                insert(hold_ends).values(
+                    hold_id=hold_id,
+                    outcome=HoldOutcome.RELEASED,
+                    idempotency_key=request.idempotency_key,
+                    payload_fingerprint=fingerprint,
+                    effective_at=request.effective_at,
+                    recorded_at=self._clock.now(),
+                    **_actor_columns(request.actor),
                 )
-        except IntegrityError as error:
-            with self._engine.connect() as connection:
-                if _replayed(connection, hold_ends, request.idempotency_key, fingerprint):
-                    return HoldRecorded(hold=_read_hold(connection, hold_id), replayed=True)
-            if _constraint(error) == "hold_ends_hold_id_key":
-                raise HoldAlreadyEnded(f"Hold {hold_id} has already ended") from error
-            raise
-        return HoldRecorded(hold=self.hold(hold_id), replayed=False)
+            )
+
+        written = self._once(
+            hold_ends,
+            request.idempotency_key,
+            fingerprint,
+            write,
+            conflicts={
+                "hold_ends_hold_id_key": HoldAlreadyEnded(f"Hold {hold_id} has already ended")
+            },
+        )
+        return HoldRecorded(hold=self.hold(hold_id), replayed=not written)
 
     def capture_hold(self, hold_id: int, new: NewTransaction) -> Posted:
         """Capture a Hold: post `new`, which moves the money, and end the Hold in the same
         commit, at the Transaction's Effective Time and with its Actor. The Transaction must
-        have an Entry on the held Account; its amount need not equal the Hold's. Retries
-        follow the Transaction's Idempotency Key."""
+        take money out of the held Account (reduce its balance, in its normal direction);
+        the amount need not equal the Hold's. Retries follow the Transaction's Idempotency
+        Key."""
         hold = self.hold(hold_id)
-        if all(entry.account != hold.account for entry in new.entries):
-            raise CaptureMissesHold(f"capturing Hold {hold_id} must move money on {hold.account}")
+        sign = self.account(hold.account).type.normal_sign
+        moved = sum(entry.amount for entry in new.entries if entry.account == hold.account)
+        if moved * sign >= 0:
+            raise CaptureMissesHold(
+                f"capturing Hold {hold_id} must take money out of {hold.account}"
+            )
         if new.effective_at < hold.effective_at:
             raise TooEarly(f"Hold {hold_id} can't be captured before it was placed")
 
@@ -417,11 +444,11 @@ class Journal:
                 ),
                 description=new.description,
                 reverses=None,
-                status=new.status,
+                status=lambda _connection: new.status,
                 actor=new.actor,
                 effective_at=new.effective_at,
                 new_entries=new.entries,
-                also=end_hold,
+                on_posted=end_hold,
             )
         except IntegrityError as error:
             if _constraint(error) == "hold_ends_hold_id_key":
@@ -435,15 +462,18 @@ class Journal:
         fingerprint: str,
         description: str,
         reverses: int | None,
-        status: TransactionStatus,
+        status: Callable[[Connection], TransactionStatus],
         actor: Actor,
         effective_at: datetime,
         new_entries: Sequence[NewEntry],
-        also: Callable[[Connection, int, datetime], None] | None = None,
+        on_posted: Callable[[Connection, int, datetime], None] | None = None,
     ) -> Posted:
-        """Insert a Transaction and its Entries, and run `also` in the same commit."""
+        """Insert a Transaction and its Entries once per Idempotency Key. `status` runs
+        first, inside the commit, so it can take a lock and read before deciding; `on_posted`
+        runs after the Entries, in the same commit, only when the Transaction is new."""
         recorded_at = self._clock.now()
         with self._engine.begin() as connection:
+            decided = status(connection)
             transaction_id: int | None = connection.scalar(
                 pg_insert(transactions)
                 .values(
@@ -451,7 +481,7 @@ class Journal:
                     payload_fingerprint=fingerprint,
                     description=description,
                     reverses_id=reverses,
-                    status=status,
+                    status=decided,
                     recorded_at=recorded_at,
                 )
                 .on_conflict_do_nothing(index_elements=[transactions.c.idempotency_key])
@@ -476,8 +506,8 @@ class Journal:
                         for new_entry in new_entries
                     ],
                 )
-                if also is not None:
-                    also(connection, transaction_id, recorded_at)
+                if on_posted is not None:
+                    on_posted(connection, transaction_id, recorded_at)
         # Read after commit, once the deferred balance check has passed.
         with self._engine.connect() as connection:
             if transaction_id is not None:
@@ -495,21 +525,52 @@ class Journal:
                 )
             return Posted(transaction=_read_transaction(connection, original.id), replayed=True)
 
+    def _once(
+        self,
+        table: Table,
+        key: str,
+        fingerprint: str,
+        write: Callable[[Connection], None],
+        conflicts: dict[str, Conflict],
+    ) -> bool:
+        """Run `write` in one commit, once per Idempotency Key in `table`. Returns False for
+        a retry of the same payload, which writes nothing. A unique violation named in
+        `conflicts` (an "at most once" rule) raises that Conflict, unless it came from a
+        concurrent retry of this same request."""
+        with self._engine.connect() as connection:
+            if _replayed(connection, table, key, fingerprint):
+                return False
+        try:
+            with self._engine.begin() as connection:
+                write(connection)
+        except IntegrityError as error:
+            with self._engine.connect() as connection:
+                if _replayed(connection, table, key, fingerprint):
+                    return False
+            conflict = conflicts.get(_constraint(error) or "")
+            if conflict is not None:
+                raise conflict from error
+            raise
+        return True
 
-def _entry_balances(account_id: int, sign: int, effective_at: datetime, known_at: datetime) -> Any:
-    """Posted, Pending and unsettled outflows of one Account, in its normal direction.
 
-    An Entry is settled when its Transaction is posted, or when the Settlement of its
-    Transaction (for a Reversal, of the Transaction it reverses) is known by `known_at` and
-    in effect by `effective_at`. Unsettled Entries are grouped by that Transaction, so a
-    pending Transaction and its Reversal net out, and each group that takes money out of
-    the Account adds its net to the unsettled outflows.
+def _entry_balances(
+    account_id: int, sign: int, effective_at: datetime, known_at: datetime
+) -> Select[Decimal, Decimal, Decimal]:
+    """Posted, Pending and unsettled outflows of one Account, in its normal direction
+    (Postgres sums BIGINTs as NUMERIC, hence Decimal).
+
+    An Entry is settled when its Transaction is posted, or when its Transaction's
+    Settlement is known by `known_at` and in effect by `effective_at`. Unsettled Entries are
+    grouped by Transaction, with a pending Reversal (a decline) in its original's group, so
+    a declined Transaction nets out; each group that takes money out of the Account adds
+    its net to the unsettled outflows.
     """
     base = func.coalesce(transactions.c.reverses_id, transactions.c.id)
     settled = or_(
         transactions.c.status == TransactionStatus.POSTED,
         exists().where(
-            settlements.c.transaction_id == base,
+            settlements.c.transaction_id == transactions.c.id,
             settlements.c.effective_at <= effective_at,
             settlements.c.recorded_at <= known_at,
         ),
@@ -540,7 +601,7 @@ def _entry_balances(account_id: int, sign: int, effective_at: datetime, known_at
     )
 
 
-def _held(account_id: int, effective_at: datetime, known_at: datetime) -> Any:
+def _held(account_id: int, effective_at: datetime, known_at: datetime) -> Select[Decimal]:
     """The total of the Account's Holds placed and not yet ended, at `effective_at` as known
     at `known_at`."""
     ended = exists().where(
@@ -554,6 +615,13 @@ def _held(account_id: int, effective_at: datetime, known_at: datetime) -> Any:
         holds.c.recorded_at <= known_at,
         ~ended,
     )
+
+
+def _lock(connection: Connection, transaction_id: int) -> None:
+    """Serialise settling and reversing one Transaction until this commit ends. An advisory
+    lock, since row locks need UPDATE, which the app role doesn't have. It's keyed by the
+    Transaction id alone: the Ledger takes no other advisory locks."""
+    connection.execute(select(func.pg_advisory_xact_lock(transaction_id)))
 
 
 def _replayed(connection: Connection, table: Table, key: str, fingerprint: str) -> int | None:
@@ -605,9 +673,7 @@ def _read_transaction(connection: Connection, transaction_id: int) -> Transactio
         select(transactions.c.id).where(transactions.c.reverses_id == transaction_id)
     )
     settlement = connection.execute(
-        select(settlements).where(
-            settlements.c.transaction_id == (row.reverses_id or transaction_id)
-        )
+        select(settlements).where(settlements.c.transaction_id == transaction_id)
     ).one_or_none()
     entry_rows = connection.execute(
         select(entries, accounts.c.code.label("account_code"))

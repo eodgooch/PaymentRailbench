@@ -1,6 +1,7 @@
 """Holds (SPEC §3.3, ADR 0009): placed, then released or captured once; they reduce the
 Available Balance without moving money."""
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -107,7 +108,7 @@ def test_a_hold_reduces_available_without_moving_money(journal: Journal) -> None
 
     assert placed.replayed is False
     assert placed.hold.ended is None
-    balance = journal.balance(customer, AUCTION_CLOSE)
+    balance = journal.balances(customer, AUCTION_CLOSE)
     assert (balance.posted, balance.held, balance.available) == (10_000, 2_500, 7_500)
 
 
@@ -120,7 +121,7 @@ def test_placing_a_hold_is_idempotent(journal: Journal) -> None:
 
     assert again.replayed is True
     assert again.hold == first.hold
-    assert journal.balance(customer, AUCTION_CLOSE).held == 2_500
+    assert journal.balances(customer, AUCTION_CLOSE).held == 2_500
     with pytest.raises(IdempotencyConflict):
         journal.place_hold(hold(customer, 2_501, key=request.idempotency_key))
 
@@ -134,8 +135,8 @@ def test_releasing_a_hold_restores_available_from_the_release(journal: Journal) 
     assert released.hold.ended is not None
     assert released.hold.ended.outcome is HoldOutcome.RELEASED
     assert released.hold.ended.actor == OPERATOR
-    assert journal.balance(customer, AUCTION_CLOSE).available == 7_500
-    after = journal.balance(customer, LATER)
+    assert journal.balances(customer, AUCTION_CLOSE).available == 7_500
+    after = journal.balances(customer, LATER)
     assert (after.posted, after.held, after.available) == (10_000, 0, 10_000)
 
 
@@ -150,11 +151,11 @@ def test_capturing_a_hold_moves_the_money_and_ends_the_hold(journal: Journal) ->
     assert ended.outcome is HoldOutcome.CAPTURED
     assert ended.transaction == captured.transaction.id
     assert ended.effective_at == LATER
-    before = journal.balance(customer, AUCTION_CLOSE)
-    after = journal.balance(customer, LATER)
+    before = journal.balances(customer, AUCTION_CLOSE)
+    after = journal.balances(customer, LATER)
     assert (before.posted, before.held, before.available) == (10_000, 2_500, 7_500)
     assert (after.posted, after.held, after.available) == (8_000, 0, 8_000)
-    assert journal.balance(fees, LATER).posted == 2_000
+    assert journal.balances(fees, LATER).posted == 2_000
 
 
 def test_retrying_a_release_or_capture_replays(journal: Journal) -> None:
@@ -170,7 +171,7 @@ def test_retrying_a_release_or_capture_replays(journal: Journal) -> None:
     assert again_release.replayed and again_capture.replayed
     assert again_release.hold == first_release.hold
     assert again_capture.transaction == first_capture.transaction
-    assert journal.balance(customer, LATER).posted == 7_500
+    assert journal.balances(customer, LATER).posted == 7_500
 
 
 @pytest.mark.parametrize(
@@ -193,22 +194,32 @@ def test_a_hold_ends_once(journal: Journal, first: str, second: str) -> None:
             journal.capture_hold(hold_id, charge(customer, fees))
 
     end(first)
-    before = journal.balance(customer, LATER)
+    before = journal.balances(customer, LATER)
     with pytest.raises(HoldAlreadyEnded):
         end(second)
 
-    assert journal.balance(customer, LATER) == before
+    assert journal.balances(customer, LATER) == before
 
 
-def test_a_capture_must_move_money_on_the_held_account(journal: Journal) -> None:
+@pytest.mark.parametrize(
+    "capture",
+    [
+        pytest.param(lambda customer, other, fees: charge(other, fees), id="another account"),
+        pytest.param(lambda customer, other, fees: charge(customer, fees, -2_500), id="money in"),
+    ],
+)
+def test_a_capture_must_take_money_out_of_the_held_account(
+    journal: Journal, capture: Callable[[str, str, str], NewTransaction]
+) -> None:
     customer, fees = funded_customer(journal)
     other, _ = funded_customer(journal)
     hold_id = journal.place_hold(hold(customer)).hold.id
 
     with pytest.raises(CaptureMissesHold):
-        journal.capture_hold(hold_id, charge(other, fees))
+        journal.capture_hold(hold_id, capture(customer, other, fees))
 
     assert journal.hold(hold_id).ended is None
+    assert journal.balances(customer, LATER).posted == 10_000
 
 
 def test_a_hold_cannot_end_before_it_was_placed(journal: Journal) -> None:
@@ -253,5 +264,5 @@ def test_holds_are_bitemporal(journal: Journal, clock: ManualClock) -> None:
     # Placed at LATER, backdated to the Auction Close.
     journal.place_hold(hold(customer))
 
-    assert journal.balance(customer, AUCTION_CLOSE, known_at=AUCTION_CLOSE).held == 0
-    assert journal.balance(customer, AUCTION_CLOSE).held == 2_500
+    assert journal.balances(customer, AUCTION_CLOSE, known_at=AUCTION_CLOSE).held == 0
+    assert journal.balances(customer, AUCTION_CLOSE).held == 2_500
