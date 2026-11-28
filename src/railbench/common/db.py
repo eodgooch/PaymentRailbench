@@ -9,8 +9,15 @@ LEDGER_SCHEMA = "ledger"
 PAYMENTS_SCHEMA = "payments"  # Payments and the Inbox of Provider Events
 RECONCILIATION_SCHEMA = "reconciliation"
 SIMULATOR_SCHEMA = "simulator"
+MARKETPLACE_SCHEMA = "marketplace"  # Auction Closes and their Payouts (migration 0007)
 
-SCHEMAS = (LEDGER_SCHEMA, PAYMENTS_SCHEMA, RECONCILIATION_SCHEMA, SIMULATOR_SCHEMA)
+SCHEMAS = (
+    LEDGER_SCHEMA,
+    PAYMENTS_SCHEMA,
+    RECONCILIATION_SCHEMA,
+    SIMULATOR_SCHEMA,
+    MARKETPLACE_SCHEMA,
+)
 
 LEDGER_APP_ROLE = "railbench_app"  # SELECT and INSERT only on the Ledger (migration 0002)
 

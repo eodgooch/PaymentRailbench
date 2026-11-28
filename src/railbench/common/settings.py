@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     triage_cost_cap_night_usd: int = 1
     triage_cost_cap_eval_usd: int = 10
     instant_payout_limit_cents: int = 500_000
+    # Mintwharf's fee on each lot sold, in basis points of the hammer price, rounded down
+    # (extends SPEC §13; a fictional fee, not any real marketplace's).
+    seller_fee_bps: int = 1_000
     cash_advance_bps: int = 6_000
     loan_apr_bps: int = 1_200
 
@@ -31,7 +34,8 @@ class Settings(BaseSettings):
     ledger_port: int = 8000
     simulator_port: int = 8100
     # How often a running service does its Clock-driven work: the Simulator advances
-    # Payments and delivers due webhooks; the Ledger makes settled ACH funds Available.
+    # Payments and delivers due webhooks; the Ledger makes settled ACH funds Available and
+    # releases due Standard Payouts.
     # 0 turns the background loop off (tests drive both by hand on a ManualClock).
     simulator_tick_seconds: float = 0
     ledger_tick_seconds: float = 0

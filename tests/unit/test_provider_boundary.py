@@ -1,6 +1,6 @@
 """The Ledger talks to the Simulator only through the Provider interface (ADR 0005): no
-Ledger or Payments module imports the Simulator, and the Simulator imports neither. And the
-Ledger never reads the Fault Manifest (SPEC §6, ADR 0011): only Scenario tooling may import
+Ledger, Payments or marketplace module imports the Simulator, and the Simulator imports none
+of them. Payments doesn't depend on the marketplace built on it. And the Ledger never reads the Fault Manifest (SPEC §6, ADR 0011): only Scenario tooling may import
 `railbench.scenarios`, which writes it."""
 
 import ast
@@ -12,14 +12,21 @@ SRC = Path(__file__).parents[2] / "src" / "railbench"
 
 FORBIDDEN = {
     "ledger": ("railbench.simulator", "railbench.scenarios"),
-    "payments": ("railbench.simulator", "railbench.scenarios"),
+    "payments": ("railbench.simulator", "railbench.scenarios", "railbench.marketplace"),
+    "marketplace": ("railbench.simulator", "railbench.scenarios"),
     "common": (
         "railbench.simulator",
         "railbench.ledger",
         "railbench.payments",
+        "railbench.marketplace",
         "railbench.scenarios",
     ),
-    "simulator": ("railbench.ledger", "railbench.payments", "railbench.scenarios"),
+    "simulator": (
+        "railbench.ledger",
+        "railbench.payments",
+        "railbench.marketplace",
+        "railbench.scenarios",
+    ),
 }
 
 

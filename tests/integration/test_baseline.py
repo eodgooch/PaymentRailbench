@@ -23,7 +23,7 @@ def test_migrations_create_a_schema_for_each_part_of_railbench(engine: Engine) -
             connection.scalars(text("SELECT schema_name FROM information_schema.schemata"))
         )
 
-    assert {"ledger", "payments", "reconciliation", "simulator"} <= schemas
+    assert {"ledger", "payments", "reconciliation", "simulator", "marketplace"} <= schemas
 
 
 def test_baseline_downgrades_and_upgrades_cleanly(database_url: str, engine: Engine) -> None:
