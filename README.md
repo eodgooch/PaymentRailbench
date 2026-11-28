@@ -103,7 +103,8 @@ ADR 0010):
    after submission (the 16:00 Cutoff pushes a late one a day), and delivers signed
    Provider Events (`payment.submitted`, `payment.settled`) to
    `POST /providers/simulator/events`, retrying non-2xx answers and timeouts after 30 s,
-   60 s, … up to an hour apart, 10 attempts at most.
+   60 s, … up to an hour apart, 10 attempts at most. It claims due events in a short commit
+   and POSTs outside any transaction, so a slow Ledger holds no locks.
 3. The Ledger verifies the HMAC signature (401 if it fails; nothing is stored), stores the
    event raw in the **Inbox**, deduplicates it by event ID, and applies it at most once.
    The ACH state machine (`created → submitted → settled → available`, or `canceled` /
@@ -134,6 +135,12 @@ clock and do the same work on timers (`SIMULATOR_TICK_SECONDS`, `LEDGER_TICK_SEC
 Compose), so under `make dev` a pull reaches `submitted` within a second but settles on the
 real next Banking Day. A clock shared by running services, for demos, comes with
 `make night`.
+
+Three settings extend SPEC §13: `LEDGER_WEBHOOK_URL` (where the Simulator delivers Provider
+Events), `SIMULATOR_TICK_SECONDS` and `LEDGER_TICK_SECONDS` (the timers above; `0` turns
+them off). Applying one Provider Event is one database transaction: the Journal runs as a
+unit of work on the Inbox's connection, so a step the Ledger refuses leaves no Ledger rows
+behind, only the exception.
 
 The Ledger API adds `POST /payments`, `GET /payments/{id}` and
 `POST /providers/{provider}/events`; the Simulator serves `POST /payments` and
