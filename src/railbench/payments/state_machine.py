@@ -61,6 +61,17 @@ RETURNABLE = (PaymentState.SETTLED, PaymentState.AVAILABLE)
 RTP_ENDINGS = (PaymentState.SETTLED, PaymentState.DECLINED)
 
 
+def current_state(states: Collection[PaymentState]) -> PaymentState:
+    """Where a Payment recorded in `states` stands: an ending before settlement, else
+    returned, else the furthest state on the main path."""
+    ended = [state for state in ENDS_BEFORE_SETTLEMENT if state in states]
+    if ended:
+        return ended[0]
+    if PaymentState.RETURNED in states:
+        return PaymentState.RETURNED
+    return max(states, key=MAIN_PATH.index)
+
+
 @dataclass(frozen=True)
 class Advance:
     """Move through `path`, in order, booking each state."""

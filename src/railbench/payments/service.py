@@ -116,12 +116,11 @@ from railbench.payments.model import (
 from railbench.payments.provider import PaymentOrder, Provider, ProviderEvent
 from railbench.payments.reports import payment_adjustments
 from railbench.payments.state_machine import (
-    ENDS_BEFORE_SETTLEMENT,
-    MAIN_PATH,
     Advance,
     Impossible,
     PaymentState,
     Stale,
+    current_state,
     decide,
 )
 from railbench.payments.tables import (
@@ -297,7 +296,7 @@ class Payments:
             description=row.description,
             recorded_at=row.recorded_at,
             hold_id=row.hold_id,
-            state=_current(states),
+            state=current_state(states),
             available_at=None
             if settled is None or row.direction != "pull"
             else available_at(settled.effective_at),
@@ -367,7 +366,7 @@ class Payments:
                 idempotency_key=row.idempotency_key,
                 rail=row.rail,
                 direction=row.direction,
-                state=_current(states[row.id]),
+                state=current_state(states[row.id]),
             )
             for row in rows
         }
@@ -454,7 +453,7 @@ class Payments:
             payment = connection.execute(select(payments).where(payments.c.id == payment_id)).one()
             reached = _states(connection, payment_id)
             decision = decide(
-                _current(reached),
+                current_state(reached),
                 event.reported,
                 reached,
                 rail=payment.rail,
@@ -785,7 +784,7 @@ class Payments:
     def _make_available(self, payment_id: int, due: datetime) -> bool:
         with self._engine.begin() as connection:
             _lock(connection, payment_id)
-            if _current(_states(connection, payment_id)) is not PaymentState.SETTLED:
+            if current_state(_states(connection, payment_id)) is not PaymentState.SETTLED:
                 return False
             hold_id: int = connection.execute(
                 select(transitions.c.hold_id).where(
@@ -855,15 +854,6 @@ class Payments:
                 self._journal.open_account(
                     NewAccount(code=code, type=AccountType.ASSET, currency=new.currency)
                 )
-
-
-def _current(states: list[PaymentState]) -> PaymentState:
-    ended = [state for state in states if state in ENDS_BEFORE_SETTLEMENT]
-    if ended:
-        return ended[0]
-    if PaymentState.RETURNED in states:
-        return PaymentState.RETURNED
-    return max(states, key=MAIN_PATH.index)
 
 
 def _states(connection: Connection, payment_id: int) -> list[PaymentState]:
