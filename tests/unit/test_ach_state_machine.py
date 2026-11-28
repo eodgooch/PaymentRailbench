@@ -40,6 +40,12 @@ def test_the_payment_moves_forward(
         (AV, SUB),
         (DEC, DEC),
         (CAN, CAN),
+        # A decline or cancellation delivered before the `submitted` it followed: the
+        # Payment has passed created and submitted on its way to the end (an out-of-order
+        # delivery, not a contradiction).
+        (DEC, SUB),
+        (CAN, SUB),
+        (DEC, C),
     ],
 )
 def test_an_event_for_a_state_already_passed_is_stale(
@@ -54,7 +60,6 @@ def test_an_event_for_a_state_already_passed_is_stale(
         (SET, DEC),  # declined after the money settled
         (AV, CAN),
         (DEC, SET),  # settled after a decline
-        (CAN, SUB),
         (DEC, CAN),
         (C, AV),  # only the Ledger decides Available, and only after settlement
         (SUB, AV),

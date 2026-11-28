@@ -4,10 +4,12 @@
     created | submitted → canceled | declined
 
 It only moves forward. An event reporting a state the Payment has reached or passed is
-stale: recorded, and nothing happens. An event that skips ahead along the main path (a
-`settled` for a Payment still `created`) advances through every state it skipped, so the
-Ledger books each step. Anything else (a decline after settlement, a settlement after a
-decline) is impossible: the caller records an exception and writes nothing to the Ledger.
+stale: recorded, and nothing happens. A canceled or declined Payment has passed created and
+submitted, so a `submitted` delivered after its decline is stale too. An event that skips
+ahead along the main path (a `settled` for a Payment still `created`) advances through every
+state it skipped, so the Ledger books each step. Anything else (a decline after settlement,
+a settlement after a decline) is impossible: the caller records an exception and writes
+nothing to the Ledger.
 Returns join in #7.
 """
 
@@ -53,7 +55,8 @@ def decide(current: AchState, reported: AchState) -> Decision:
         return Impossible(f"an ACH Payment can't go from {current} to {reported}")
 
     if current in ENDS_BEFORE_SETTLEMENT:
-        return Stale() if reported == current else impossible()
+        passed = (current, AchState.CREATED, AchState.SUBMITTED)
+        return Stale() if reported in passed else impossible()
     position = MAIN_PATH.index(current)
     if reported in ENDS_BEFORE_SETTLEMENT:
         return Advance(path=(reported,)) if position < 2 else impossible()
