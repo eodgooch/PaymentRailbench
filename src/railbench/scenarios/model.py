@@ -22,7 +22,8 @@ case for injecting it, a Scenario subclass here that adds the Payment it names (
 Payment's size go in `PaymentPlan`'s validators.
 
 Settlement Report Faults (`missing_report_line`, `wrong_report_amount`,
-`settlement_after_cutoff`, `provider_adjustment`, `orphan_adjustment`; ADR 0014) name a
+`settlement_after_cutoff`, `duplicate_report_line`, `provider_adjustment`,
+`orphan_adjustment`; ADR 0014, ADR 0015) name a
 Payment or Payout that settles and act on its line in the Provider's Settlement Report
 (an orphan adjustment adds a line for a Payment the Provider never made), never on a
 Provider Event.
@@ -53,6 +54,7 @@ from railbench.payments.accounts import customer_balance_account
 from railbench.simulator.model import (
     DelayedDelivery,
     DuplicateDelivery,
+    DuplicateReportLine,
     EventName,
     FaultPlan,
     MissingReportLine,
@@ -174,6 +176,10 @@ class AfterCutoff(SettlementAfterCutoff, _OnPayment):
     pass
 
 
+class ListedTwice(DuplicateReportLine, _OnPayment):
+    pass
+
+
 class Adjustment(PlannedAdjustment, _OnPayment):
     pass
 
@@ -190,6 +196,7 @@ ScenarioFault = Annotated[
     | MissingLine
     | WrongAmount
     | AfterCutoff
+    | ListedTwice
     | Adjustment
     | Orphan,
     Field(discriminator="kind"),
@@ -421,6 +428,8 @@ def _plain(fault: ScenarioFault) -> FaultPlan:
             return WrongReportAmount(**data)
         case AfterCutoff():
             return SettlementAfterCutoff(**data)
+        case ListedTwice():
+            return DuplicateReportLine(**data)
         case Adjustment():
             return PlannedAdjustment(**data)
         case Orphan():

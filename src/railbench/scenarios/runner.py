@@ -140,6 +140,8 @@ def run(
         ledger_webhook_url=f"{ledger_url}/providers/simulator/events",
         # Both ends are this process, so each run signs with a throwaway secret of its own.
         webhook_signing_secret=secrets.token_hex(16),
+        # One ManualClock and one process: every write has committed before the next tick.
+        reconciliation_settle_seconds=0,
     ).model_copy(update=_ledger_settings(scenario))
     ledger_app = create_ledger_app(app_engine, clock, settings)
     delivery_http = httpx.Client(timeout=DELIVERY_TIMEOUT)

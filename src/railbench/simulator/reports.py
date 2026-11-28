@@ -13,6 +13,8 @@ the Cutoff rule are the shared contract in `railbench.common.settlement_reports`
 - `settlement_after_cutoff`: the Provider books the settlement at its Rail's Cutoff on the
   day it should have counted toward, so the line, stamped with that time, lands on the
   next Banking Day's report.
+- `duplicate_report_line`: the line is listed twice on the report it lands on, the second
+  time under its own line ID (a line ID appears once per report).
 - `provider_adjustment`: `after` Banking Days after the settlement's report day, an
   adjustment line at noon New York for `amount`, signed by its reason (- for a fee
   correction, + for a recalled part of a Payout). It names the original line and Payment.
@@ -34,6 +36,7 @@ from typing import Any
 from railbench.common.calendar import add_banking_days, at_new_york
 from railbench.common.settlement_reports import COLUMNS, AdjustmentReason, cutoff, report_day
 from railbench.simulator.model import (
+    DuplicateReportLine,
     FaultPlan,
     MissingReportLine,
     OrphanAdjustment,
@@ -126,6 +129,11 @@ def _digest(*parts: str) -> str:
 def settlement_line_id(idempotency_key: str) -> str:
     """The line ID of a Payment's settlement line: the same in every run of a Scenario."""
     return f"simline_{_digest('line', idempotency_key, 'settlement')}"
+
+
+def duplicate_line_id(idempotency_key: str, fault_id: str) -> str:
+    """The line ID of a settlement listed a second time."""
+    return f"simline_{_digest('line', idempotency_key, 'duplicate', fault_id)}"
 
 
 def adjustment_line_id(idempotency_key: str, fault_id: str) -> str:
@@ -237,6 +245,19 @@ def _payment_lines(
                     f"instead of {where.proper.isoformat()}'s (settlement after Cutoff).",
                 )
         found.lines.append(line(line_id, "settlement", amount, where.booked))
+        for fault in payment.faults:
+            if isinstance(fault, DuplicateReportLine):
+                again = duplicate_line_id(payment.idempotency_key, fault.id)
+                found.lines.append(line(again, "settlement", amount, where.booked))
+                inject(
+                    fault,
+                    LINE_EVENT,
+                    on_day,
+                    f"The Simulator listed {who}, settled at {_instant(payment.settled_at)}, "
+                    f"twice on {report}: as line {line_id} and again as line {again} "
+                    "(duplicate report line).",
+                    line=again,
+                )
     if where.lands is None and where.proper == day:
         for fault in payment.faults:
             if isinstance(fault, MissingReportLine):

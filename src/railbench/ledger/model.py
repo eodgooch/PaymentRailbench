@@ -72,10 +72,19 @@ class Account(NewAccount):
     recorded_at: datetime
 
 
+def job_label(name: str, version: str) -> str:
+    """How a system job is named in views and logs: `<name>@<version>`."""
+    return f"{name}@{version}"
+
+
 class SystemJob(_Value):
     kind: Literal["system_job"] = "system_job"
     name: NonEmpty
     version: NonEmpty
+
+    @property
+    def label(self) -> str:
+        return job_label(self.name, self.version)
 
 
 class ProviderEventActor(_Value):

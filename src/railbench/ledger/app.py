@@ -31,18 +31,18 @@ what was done with each Provider Adjustment. A Payment's booked adjustments are 
 Reconciliation (`railbench.reconciliation`, ADR 0015): the `reconciliation` job reconciles
 each Banking Day once its report and the next Banking Day's are ingested. `GET /breaks` is
 the Exception Queue (open Breaks by default; `status=resolved` or `all`, and filters by
-`provider`, `banking_day` and `break_type`), largest exposure first, then oldest;
-`GET /breaks/{id}` reads one with its evidence; `POST /breaks/{id}/resolution` resolves it
-once, by a person, with a correcting Transaction or a reason (a retry 200, otherwise 409).
-`GET /reconciliations/{provider}/{date}` says whether the day is reconciled and what's
-unresolved, and `POST` to it reconciles the day (or re-runs it, finding the same Breaks;
-409 until both reports are ingested).
+`provider`, `banking_day` and `break_type`), within each currency largest exposure first,
+then oldest; `GET /breaks/{id}` reads one with its evidence and related Breaks;
+`POST /breaks/{id}/resolution` resolves it once, by a person, with a correcting Transaction
+or a reason (a retry 200, otherwise 409). `GET /reconciliations/{provider}/{date}` says
+whether the day is reconciled and what's unresolved, and `POST` to it reconciles the day
+(or re-runs it, finding the same Breaks; 409 until it's ready, 404 for another Provider).
 """
 
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, timedelta
 from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -96,7 +96,7 @@ from railbench.payments.service import (
     PaymentsError,
     UnknownProvider,
 )
-from railbench.reconciliation.matching import BreakType
+from railbench.reconciliation.matching import BreakType, ReportDay
 from railbench.reconciliation.model import (
     Break,
     BreakStatus,
@@ -112,6 +112,7 @@ from railbench.reconciliation.service import (
     ReconciliationError,
     ResolutionConflict,
 )
+from railbench.reconciliation.service import UnknownProvider as NotReconciledHere
 
 log = logging.getLogger(__name__)
 
@@ -181,6 +182,7 @@ ReconciliationDep = Annotated[Reconciliation, Depends(get_reconciliation)]
 
 RECONCILIATION_ERROR_STATUS = {
     BreakNotFound: status.HTTP_404_NOT_FOUND,
+    NotReconciledHere: status.HTTP_404_NOT_FOUND,
     ResolutionConflict: status.HTTP_409_CONFLICT,
     NotReady: status.HTTP_409_CONFLICT,
     CorrectingTransactionNotFound: status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -207,7 +209,9 @@ def create_app(
     journal = Journal(engine, clock)
     payments = Payments(engine, clock, journal, provider)
     reports = SettlementReports(engine, clock, journal, provider)
-    reconciliation = Reconciliation(engine, clock, provider)
+    reconciliation = Reconciliation(
+        engine, clock, provider, settle=timedelta(seconds=settings.reconciliation_settle_seconds)
+    )
     marketplace = Marketplace(
         engine,
         clock,
@@ -421,7 +425,7 @@ def create_app(
 
     @app.get("/breaks/{break_id}")
     def get_break(break_id: str, reconciliation: ReconciliationDep) -> Break:
-        return reconciliation.break_(break_id)
+        return reconciliation.find(break_id)
 
     @app.post(
         "/breaks/{break_id}/resolution",
@@ -438,15 +442,13 @@ def create_app(
     def get_reconciliation_status(
         provider: str, banking_day: date, reconciliation: ReconciliationDep
     ) -> DayStatus:
-        return reconciliation.day_status(banking_day, provider)
+        return reconciliation.day_status(ReportDay(provider, banking_day))
 
     @app.post("/reconciliations/{provider}/{banking_day}")
     def reconcile_day(
         provider: str, banking_day: date, reconciliation: ReconciliationDep
     ) -> RunView:
-        if provider != reconciliation.provider:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f"no Provider {provider}")
-        return reconciliation.reconcile(banking_day)
+        return reconciliation.reconcile(ReportDay(provider, banking_day))
 
     @app.post("/providers/{provider}/events", responses={401: {}, 400: {}, 503: {}})
     async def receive_event(provider: str, request: Request, payments: PaymentsDep) -> Receipt:

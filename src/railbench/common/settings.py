@@ -39,3 +39,6 @@ class Settings(BaseSettings):
     # 0 turns the background loop off (tests drive both by hand on a ManualClock).
     simulator_tick_seconds: float = 0
     ledger_tick_seconds: float = 0
+    # How long after a day's second Settlement Report arrives Reconciliation waits before
+    # reconciling it, so writes that read the Clock just before have committed (ADR 0015).
+    reconciliation_settle_seconds: float = 300

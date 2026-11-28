@@ -24,18 +24,21 @@ from sqlalchemy.exc import DBAPIError
 
 from railbench.common.clock import ManualClock
 from railbench.common.db import LEDGER_APP_ROLE, make_engine
+from railbench.common.settlement_reports import report_published_at
 from railbench.ledger.app import create_app as create_ledger_app
 from railbench.ledger.journal import Journal
 from railbench.ledger.model import NewEntry, NewTransaction, Person
 from railbench.payments.reports import SettlementReports
-from railbench.reconciliation.matching import BreakType
+from railbench.reconciliation.matching import BreakType, ReportDay
 from railbench.reconciliation.model import BreakStatus, NewResolution, Resolver
 from railbench.reconciliation.service import (
     BreakNotFound,
     CorrectingTransactionNotFound,
+    CsvReports,
     NotReady,
     Reconciliation,
     ResolutionConflict,
+    UnknownProvider,
 )
 from railbench.reconciliation.tables import break_evidence, breaks, runs
 from railbench.scenarios.model import Scenario, load
@@ -46,6 +49,7 @@ pytestmark = pytest.mark.integration
 
 SCENARIOS = Path(__file__).parents[2] / "scenarios"
 FRIDAY, TUESDAY = date(2026, 9, 4), date(2026, 9, 8)
+SIM_FRIDAY, SIM_TUESDAY = ReportDay("simulator", FRIDAY), ReportDay("simulator", TUESDAY)
 
 DELIVERY_FAULTS = Scenario.model_validate(
     {
@@ -132,6 +136,7 @@ def about(kept: Kept, payment: str) -> set[tuple[str, str, int]]:
 
 # What each Fault becomes (ADR 0015's table): a Break Type, or None when the Ledger agrees.
 REPORT_FAULTS: dict[str, str | None] = {
+    "ottoline-listed-twice": "duplicate",
     "wren-reported-short": "amount_mismatch",
     "pax-line-missing": "missing_at_provider",
     "jules-after-cutoff": "timing_mismatch",
@@ -181,6 +186,7 @@ def test_the_report_faults_scenario_has_exactly_these_breaks(report_faults: Kept
     )
 
     assert found == [
+        ("simulator:2026-09-03", "duplicate", 27_000),
         ("simulator:2026-09-04", "amount_mismatch", 500),
         ("simulator:2026-09-04", "missing_at_provider", 12_000),
         ("simulator:2026-09-04", "status_mismatch", 5_000),
@@ -246,7 +252,7 @@ def stack(report_faults: Kept) -> Iterator[tuple[Reconciliation, ManualClock, En
     engine = make_engine(report_faults.url, role=LEDGER_APP_ROLE)
     clock = ManualClock(report_faults.found.ticks[-1] + timedelta(days=1))
     try:
-        yield Reconciliation(engine, clock, RecordedProvider("simulator", {})), clock, engine
+        yield Reconciliation(engine, clock, CsvReports("simulator")), clock, engine
     finally:
         engine.dispose()
 
@@ -261,16 +267,16 @@ def test_re_running_a_day_finds_the_same_breaks_and_adds_nothing(
 ) -> None:
     reconciliation, _, engine = stack
     before = {table.name: count(engine, table) for table in (runs, breaks, break_evidence)}
-    first = reconciliation.break_(reconciliation.breaks(banking_day=FRIDAY)[0].id)
+    first = reconciliation.find(reconciliation.breaks(banking_day=FRIDAY)[0].id)
 
-    again = reconciliation.reconcile(FRIDAY)
+    again = reconciliation.reconcile(SIM_FRIDAY)
 
     assert len(again.breaks) == 4
     assert {b.id for b in reconciliation.breaks(status=None, banking_day=FRIDAY)} == set(
         again.breaks
     )
     assert {table.name: count(engine, table) for table in (runs, breaks, break_evidence)} == before
-    assert reconciliation.break_(first.id).detected_at == first.detected_at
+    assert reconciliation.find(first.id).detected_at == first.detected_at
     assert reconciliation.reconcile_due() == []  # nothing left to do
 
 
@@ -282,7 +288,7 @@ def test_two_runs_of_one_day_at_once_record_it_once(
 
     def go() -> list[str]:
         barrier.wait()
-        return reconciliation.reconcile(TUESDAY).breaks
+        return reconciliation.reconcile(SIM_TUESDAY).breaks
 
     with ThreadPoolExecutor(2) as pool:
         results = [f.result() for f in [pool.submit(go), pool.submit(go)]]
@@ -302,10 +308,13 @@ def test_a_day_is_not_reconciled_before_its_next_banking_days_report_is_in(
 ) -> None:
     reconciliation, _, _ = stack
 
+    thursday = ReportDay("simulator", date(2026, 9, 10))
     with pytest.raises(NotReady, match="2026-09-11"):
-        reconciliation.reconcile(date(2026, 9, 10))  # Friday 11's report never came
-    status = reconciliation.day_status(date(2026, 9, 10))
+        reconciliation.reconcile(thursday)  # Friday 11's report never came
+    status = reconciliation.day_status(thursday)
     assert (status.reconciled, status.breaks) == (False, 0)
+    with pytest.raises(UnknownProvider):
+        reconciliation.reconcile(ReportDay("elsewhere", FRIDAY))
 
 
 def test_the_exception_queue_reads_largest_exposure_first_then_oldest(
@@ -317,24 +326,29 @@ def test_the_exception_queue_reads_largest_exposure_first_then_oldest(
     open_ones = [b for b in queue if b.status is BreakStatus.OPEN]
 
     assert open_ones == queue
-    exposures = [(b.exposure, b.detected_at) for b in queue]
-    assert exposures == sorted(exposures, key=lambda e: (-e[0], e[1]))
+    # One currency today: largest exposure first, then the older Banking Day, then id.
+    ranked = [(b.currency, -b.exposure, -b.age_seconds, b.id) for b in queue]
+    assert ranked == sorted(ranked)
+    assert len({b.age_seconds for b in queue}) > 1  # one run's Breaks needn't tie on age
     assert [b.break_type for b in reconciliation.breaks(break_type=BreakType.TIMING_MISMATCH)] == [
         BreakType.TIMING_MISMATCH
     ]
     assert reconciliation.breaks(provider="elsewhere") == []
 
 
-def test_a_breaks_age_runs_from_detection_on_the_ledgers_clock(
+def test_a_breaks_age_runs_from_its_banking_days_report_on_the_ledgers_clock(
     stack: tuple[Reconciliation, ManualClock, Engine],
 ) -> None:
     reconciliation, clock, _ = stack
     [orphan] = reconciliation.breaks(break_type=BreakType.MISSING_IN_LEDGER)
-    detected = datetime(2026, 9, 10, 0, 0, tzinfo=UTC)  # Wednesday's report, 20:00 New York
+    tuesdays_report = datetime(2026, 9, 9, 0, 0, tzinfo=UTC)  # 20:00 New York, Tuesday 8
 
-    assert orphan.detected_at == detected
-    clock.set(detected + timedelta(hours=30))
-    assert reconciliation.break_(orphan.id).age_seconds == 30 * 3600
+    assert orphan.banking_day == TUESDAY
+    assert report_published_at(TUESDAY) == tuesdays_report
+    # Found once Wednesday's report was in, a day later; aged from Tuesday's.
+    assert orphan.detected_at == datetime(2026, 9, 10, 0, 0, tzinfo=UTC)
+    clock.set(tuesdays_report + timedelta(hours=30))
+    assert reconciliation.find(orphan.id).age_seconds == 30 * 3600
 
 
 def resolver(proposal: str | None = None) -> Resolver:
@@ -346,7 +360,7 @@ def test_resolving_with_a_reason_takes_a_break_off_the_queue_once(
 ) -> None:
     reconciliation, clock, _ = stack
     [status] = reconciliation.breaks(break_type=BreakType.STATUS_MISMATCH)
-    before = reconciliation.day_status(FRIDAY)
+    before = reconciliation.day_status(SIM_FRIDAY)
     new = NewResolution(actor=resolver(), reason="the settlement webhook arrived on 9 September")
 
     resolved, replayed = reconciliation.resolve(status.id, new)
@@ -355,7 +369,7 @@ def test_resolving_with_a_reason_takes_a_break_off_the_queue_once(
     assert resolved.resolution is not None and resolved.resolution.recorded_at == clock.now()
     assert status.id not in {b.id for b in reconciliation.breaks()}
     assert status.id in {b.id for b in reconciliation.breaks(status=BreakStatus.RESOLVED)}
-    after = reconciliation.day_status(FRIDAY)
+    after = reconciliation.day_status(SIM_FRIDAY)
     assert after.open_breaks == before.open_breaks - 1
     assert after.open_exposure["USD"] == before.open_exposure["USD"] - 5_000
     # The same resolution again is a retry; another one is a conflict.
@@ -364,7 +378,7 @@ def test_resolving_with_a_reason_takes_a_break_off_the_queue_once(
         reconciliation.resolve(status.id, NewResolution(actor=resolver(), reason="other"))
     # Its age stopped when it was resolved.
     clock.advance(timedelta(days=3))
-    assert reconciliation.break_(status.id).age_seconds == resolved.age_seconds
+    assert reconciliation.find(status.id).age_seconds == resolved.age_seconds
 
 
 def test_resolving_with_a_correcting_transaction_links_one_that_is_in_the_ledger(
@@ -449,6 +463,8 @@ def test_the_api_serves_the_queue_a_break_and_a_days_status(report_faults: Kept)
             orphan["id"]
         ]
         assert client.post("/reconciliations/simulator/2026-09-11").status_code == 409
+        assert client.post("/reconciliations/elsewhere/2026-09-08").status_code == 404
+        assert client.get("/reconciliations/elsewhere/2026-09-08").status_code == 404
 
         url = f"/breaks/{orphan['id']}/resolution"
         body = {"actor": {"operator_id": "op-maren"}, "reason": "a stranger's fee: disputed"}
@@ -488,15 +504,23 @@ def test_a_reissued_report_is_a_duplicate_break_and_a_line_for_no_payment_missin
             clock = ManualClock(datetime(2026, 9, 5, 0, 0, tzinfo=UTC))
             provider = RecordedProvider("simulator", {})
             reports = SettlementReports(engine, clock, Journal(engine, clock), provider)
-            reconciliation = Reconciliation(engine, clock, provider)
+            reconciliation = Reconciliation(
+                engine, clock, CsvReports("simulator"), settle=timedelta(minutes=5)
+            )
             reports.replay("simulator", FRIDAY, body(FRIDAY, 700), {})
             reports.replay("simulator", FRIDAY, body(FRIDAY, 900, 300), {})  # a re-issue
             clock.set(datetime(2026, 9, 9, 0, 0, tzinfo=UTC))
             reports.replay("simulator", TUESDAY, b"not,a,report\n", {})
             assert reconciliation.reconcile_due() == []
             with pytest.raises(NotReady):
-                reconciliation.reconcile(FRIDAY)
+                reconciliation.reconcile(SIM_FRIDAY)
             reports.replay("simulator", TUESDAY, body(TUESDAY), {})
+            # A write that read the Clock just now may not have committed: wait the margin.
+            assert reconciliation.reconcile_due() == []
+            with pytest.raises(NotReady, match="waits until"):
+                reconciliation.reconcile(SIM_FRIDAY)
+            known_at = clock.now()
+            clock.advance(timedelta(minutes=5))
 
             [ran] = reconciliation.reconcile_due()
 
@@ -505,9 +529,88 @@ def test_a_reissued_report_is_a_duplicate_break_and_a_line_for_no_payment_missin
                 (BreakType.MISSING_IN_LEDGER, 700),  # simpay_0: no such Payment
                 (BreakType.DUPLICATE, 200 + 300),  # 700 restated as 900, and a new 300
             }
-            assert ran.known_at == clock.now()
+            assert ran.known_at == known_at
+            [reissued] = reconciliation.breaks(break_type=BreakType.DUPLICATE)
+            # Both sides of what differs, without reading the re-issue's raw bytes.
+            assert reissued.facts["ingested_lines"] == [
+                {"line_id": "simline_0", "currency": "USD", "amount": 700}
+            ]
+            assert reissued.facts["reissued_lines"] == [
+                {"line_id": "simline_0", "currency": "USD", "amount": 900},
+                {"line_id": "simline_1", "currency": "USD", "amount": 300},
+            ]
         finally:
             engine.dispose()
+
+
+def test_one_cause_two_breaks_the_late_line_names_the_missing_break_and_is_named_back(
+    database_url: str,
+) -> None:
+    """A line more than a Banking Day late is missing at the Provider on its own day, then a
+    timing mismatch on the day it lands; the two name each other. No Simulator Fault makes
+    one, so the Payment and the reports are written by hand."""
+    friday_0830 = datetime(2026, 9, 4, 12, 30, tzinfo=UTC)
+    wednesday, thursday = date(2026, 9, 9), date(2026, 9, 10)
+    header = (
+        "report_date,provider,line_id,type,provider_payment_id,idempotency_key,rail,direction,"
+        "currency,amount,settled_at,original_line_id,reason\n"
+    )
+    with fresh_database(database_url, prefix="late") as url:
+        owner = create_engine(url)
+        engine = make_engine(url, role=LEDGER_APP_ROLE)
+        try:
+            with owner.begin() as connection:
+                connection.execute(
+                    text(
+                        "INSERT INTO ledger.accounts (code, type, currency, recorded_at) "
+                        "VALUES ('customer:c-lark:usd', 'liability', 'USD', :at)"
+                    ),
+                    {"at": friday_0830},
+                )
+                payment_id = connection.execute(
+                    text(
+                        "INSERT INTO payments.payments (idempotency_key, payload_fingerprint, "
+                        "provider, provider_payment_id, rail, direction, customer_account, "
+                        "currency, amount, recorded_at) VALUES ('key-lark', :fp, 'simulator', "
+                        "'simpay_lark', 'ach', 'pull', 'customer:c-lark:usd', 'USD', 5000, :at) "
+                        "RETURNING id"
+                    ),
+                    {"fp": "0" * 64, "at": friday_0830 - timedelta(days=1)},
+                ).scalar_one()
+                for state in ("created", "settled"):
+                    connection.execute(
+                        text(
+                            "INSERT INTO payments.transitions (payment_id, state, job_name, "
+                            "job_version, effective_at, recorded_at) "
+                            "VALUES (:id, :state, 'by-hand', '1', :at, :at)"
+                        ),
+                        {"id": payment_id, "state": state, "at": friday_0830},
+                    )
+            clock = ManualClock(datetime(2026, 9, 11, 0, 0, tzinfo=UTC))
+            provider = RecordedProvider("simulator", {})
+            reports = SettlementReports(engine, clock, Journal(engine, clock), provider)
+            late = (
+                f"{wednesday},simulator,simline_lark,settlement,simpay_lark,key-lark,ach,pull,"
+                f"USD,5000,{wednesday}T12:30:00Z,,\n"
+            )
+            for day in (FRIDAY, TUESDAY, wednesday, thursday):
+                body = header + (late if day == wednesday else "")
+                reports.replay("simulator", day, body.encode(), {})
+            reconciliation = Reconciliation(engine, clock, CsvReports("simulator"))
+            reconciliation.reconcile_due()
+
+            [missing] = reconciliation.breaks(break_type=BreakType.MISSING_AT_PROVIDER)
+            [timing] = reconciliation.breaks(break_type=BreakType.TIMING_MISMATCH)
+
+            assert (missing.banking_day, timing.banking_day) == (FRIDAY, wednesday)
+            assert timing.facts["related_breaks"] == [missing.id]
+            assert timing.related_breaks == [missing.id]
+            assert reconciliation.find(missing.id).related_breaks == [timing.id]
+            assert payment_id in missing.evidence.payments
+            assert payment_id in timing.evidence.payments
+        finally:
+            engine.dispose()
+            owner.dispose()
 
 
 # The schema's defences (migration 0010).

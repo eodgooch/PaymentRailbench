@@ -508,7 +508,8 @@ def test_every_settlement_report_fault_shows_on_its_report_and_in_the_manifest(
     ]
     assert report_lines(found, "2026-09-10") == []
     assert report_lines(found, "2026-09-03") == [
-        ("settlement", "rtp", -27_000, "2026-09-03T21:00:00+00:00")
+        ("settlement", "rtp", -27_000, "2026-09-03T21:00:00+00:00"),
+        ("settlement", "rtp", -27_000, "2026-09-03T21:00:00+00:00"),  # listed twice
     ]
     assert sorted(report_lines(found, "2026-09-04")) == [
         ("adjustment", "rtp", 2_000, "2026-09-04T16:00:00+00:00"),
@@ -527,6 +528,7 @@ def test_every_settlement_report_fault_shows_on_its_report_and_in_the_manifest(
         ("wren-reported-short", "wren-funding", "wrong_report_amount"),
         ("pax-line-missing", "pax-funding", "missing_report_line"),
         ("jules-after-cutoff", "jules-funding", "settlement_after_cutoff"),
+        ("ottoline-listed-twice", "ottoline-payout:rtp", "duplicate_report_line"),
         ("ottoline-payout-recalled", "ottoline-payout:rtp", "provider_adjustment"),
         ("wren-fee-corrected", "wren-funding", "provider_adjustment"),
         ("rosa-settled-late", "rosa-funding", "delayed_delivery"),

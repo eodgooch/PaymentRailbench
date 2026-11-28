@@ -95,6 +95,7 @@ from railbench.ledger.model import (
     SettlementRequest,
     SystemJob,
     TransactionStatus,
+    job_label,
 )
 from railbench.payments.accounts import (
     bank_cash_account,
@@ -306,7 +307,9 @@ class Payments:
                     effective_at=step.effective_at,
                     recorded_at=step.recorded_at,
                     inbox_id=step.inbox_id,
-                    job=None if step.job_name is None else f"{step.job_name}@{step.job_version}",
+                    job=None
+                    if step.job_name is None
+                    else job_label(step.job_name, step.job_version),
                     transaction_id=step.transaction_id,
                     hold_id=step.hold_id,
                 )

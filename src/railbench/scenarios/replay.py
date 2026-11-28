@@ -231,7 +231,7 @@ def replay_inbox(
     # Each Auction Close is booked under the terms it recorded; the release job needs none.
     marketplace = Marketplace(target, clock, journal, service)
     reports = SettlementReports(target, clock, journal, provider)
-    reconciliation = Reconciliation(target, clock, provider)
+    reconciliation = Reconciliation(target, clock, provider)  # no settle margin, as recorded
 
     for step in steps:
         clock.set(step.at)

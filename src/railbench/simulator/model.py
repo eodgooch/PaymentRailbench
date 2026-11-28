@@ -210,6 +210,13 @@ class SettlementAfterCutoff(_ReportFault):
     kind: Literal["settlement_after_cutoff"] = "settlement_after_cutoff"
 
 
+class DuplicateReportLine(_ReportFault):
+    """The Provider lists the settlement twice on the report it lands on: the same Payment,
+    amount and time under a second line ID."""
+
+    kind: Literal["duplicate_report_line"] = "duplicate_report_line"
+
+
 Amount = Annotated[int, Field(strict=True, gt=0, le=BIGINT_MAX)]
 AfterBankingDays = Annotated[int, Field(strict=True, ge=1, le=30)]
 
@@ -241,10 +248,11 @@ ReportFault = (
     MissingReportLine
     | WrongReportAmount
     | SettlementAfterCutoff
+    | DuplicateReportLine
     | PlannedAdjustment
     | OrphanAdjustment
 )
-LINE_FAULTS = (MissingReportLine, WrongReportAmount, SettlementAfterCutoff)
+LINE_FAULTS = (MissingReportLine, WrongReportAmount, SettlementAfterCutoff, DuplicateReportLine)
 
 # A discriminated union: a new kind is one more variant here.
 FaultPlan = Annotated[
@@ -255,6 +263,7 @@ FaultPlan = Annotated[
     | MissingReportLine
     | WrongReportAmount
     | SettlementAfterCutoff
+    | DuplicateReportLine
     | PlannedAdjustment
     | OrphanAdjustment,
     Field(discriminator="kind"),
@@ -305,7 +314,9 @@ class PaymentPlan(BaseModel):
             raise ValueError("a Payment is returned at most once")
         line_faults = [f for f in self.faults if isinstance(f, LINE_FAULTS)]
         if len(line_faults) > 1:
-            raise ValueError("a report line can be missing, wrong or late, but only one of them")
+            raise ValueError(
+                "a report line can be missing, wrong, late or listed twice, but only one of them"
+            )
         if sum(isinstance(f, PlannedAdjustment) for f in self.faults) > 1:
             raise ValueError("a Payment gets at most one Provider Adjustment")
         emitted = events_for(self.outcome, self.rail, returned=bool(returns))

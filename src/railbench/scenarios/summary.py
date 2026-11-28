@@ -35,8 +35,9 @@ from collections.abc import Collection
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Connection, Engine, select
+from sqlalchemy import Connection, Engine, select, true
 
+from railbench.ledger.model import job_label
 from railbench.ledger.tables import accounts, entries, hold_ends, holds, settlements, transactions
 from railbench.marketplace.tables import auction_closes, lots, payout_steps, payouts
 from railbench.payments.accounts import parse_ledger_key
@@ -51,13 +52,8 @@ from railbench.payments.tables import (
     settlement_reports,
     transitions,
 )
-from railbench.reconciliation.tables import (
-    EVIDENCE_COLUMNS,
-    break_evidence,
-    break_resolutions,
-    breaks,
-    runs,
-)
+from railbench.reconciliation.service import read_breaks
+from railbench.reconciliation.tables import runs
 
 Summary = dict[str, Any]
 
@@ -154,49 +150,43 @@ class _Summariser:
                 for row in self._c.execute(select(provider_adjustments))
             },
         }
-        evidence: dict[str, dict[str, list[str]]] = {}
-        for item in self._c.execute(select(break_evidence)):
-            for kind, column in EVIDENCE_COLUMNS.items():
-                ref = getattr(item, column)
-                if ref is None:
-                    continue
-                name = (
-                    self._key(self._transaction_key(ref))
-                    if kind == "transactions"
-                    else names[kind][ref]
-                )
-                evidence.setdefault(item.break_id, {}).setdefault(kind, []).append(name)
-        resolutions = {row.break_id: row for row in self._c.execute(select(break_resolutions))}
-        run_names = {}
         found_runs = {}
         for run in self._c.execute(select(runs)):
-            run_names[run.id] = f"{run.provider}:{run.banking_day.isoformat()}"
-            found_runs[run_names[run.id]] = {
+            found_runs[f"{run.provider}:{run.banking_day.isoformat()}"] = {
                 "report": reports[run.report_id],
                 "next_report": reports[run.next_report_id],
                 "known_at": _time(run.known_at),
-                "job": f"{run.job_name}@{run.job_version}",
+                "job": job_label(run.job_name, run.job_version),
                 "recorded_at": _time(run.recorded_at),
             }
+
+        def name(kind: str, ref: int) -> str:
+            if kind == "transactions":
+                return self._key(self._transaction_key(ref))
+            return names[kind][ref]
+
         found_breaks = {}
-        for row in self._c.execute(select(breaks)):
-            resolution = resolutions.get(row.id)
-            found_breaks[row.id] = {
-                "run": run_names[row.run_id],
-                "break_type": row.break_type,
-                "match_key": row.match_key,
-                "exposure": row.exposure,
-                "currency": row.currency,
-                "facts": row.facts,
-                "detected_at": _time(row.detected_at),
+        for found in read_breaks(self._c, None, true()):
+            resolution = found.resolution
+            found_breaks[found.id] = {
+                "run": f"{found.provider}:{found.banking_day.isoformat()}",
+                "break_type": found.break_type,
+                "match_key": found.match_key,
+                "exposure": found.exposure,
+                "currency": found.currency,
+                "facts": found.facts,
+                "related_breaks": found.related_breaks,
+                "detected_at": _time(found.detected_at),
                 "evidence": {
-                    kind: sorted(refs) for kind, refs in sorted(evidence.get(row.id, {}).items())
+                    kind: sorted(name(kind, ref) for ref in refs)
+                    for kind, refs in sorted(found.evidence.model_dump().items())
+                    if refs
                 },
                 "resolution": None
                 if resolution is None
                 else {
-                    "operator_id": resolution.actor_operator_id,
-                    "proposal_id": resolution.actor_proposal_id,
+                    "operator_id": resolution.actor.operator_id,
+                    "proposal_id": resolution.actor.proposal_id,
                     "correcting_transaction": None
                     if resolution.correcting_transaction_id is None
                     else self._key(self._transaction_key(resolution.correcting_transaction_id)),
@@ -301,7 +291,7 @@ class _Summariser:
                                 "hold": None
                                 if step.hold_id is None
                                 else self._hold_key(step.hold_id),
-                                "job": f"{step.job_name}@{step.job_version}",
+                                "job": job_label(step.job_name, step.job_version),
                                 "effective_at": _time(step.effective_at),
                                 "recorded_at": _time(step.recorded_at),
                             }
@@ -339,7 +329,7 @@ class _Summariser:
                         "recorded_at": _time(s.recorded_at),
                         "actor": self._events[str(s.inbox_id)]
                         if s.inbox_id is not None
-                        else f"{s.job_name}@{s.job_version}",
+                        else job_label(s.job_name, s.job_version),
                         "transaction": None
                         if s.transaction_id is None
                         else self._key(self._transaction_key(s.transaction_id)),
@@ -428,7 +418,8 @@ class _Summariser:
             case "provider_event":
                 return f"provider_event:{self._events[row.actor_inbox_id]}"
             case "system_job":
-                return f"system_job:{row.actor_job_name}@{row.actor_job_version}"
+                job: str = job_label(row.actor_job_name, row.actor_job_version)
+                return f"system_job:{job}"
             case kind:
                 return f"{kind}:{row.actor_operator_id}:{row.actor_proposal_id}"
 

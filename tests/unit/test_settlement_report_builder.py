@@ -10,6 +10,7 @@ import pytest
 
 from railbench.common.settlement_reports import COLUMNS
 from railbench.simulator.model import (
+    DuplicateReportLine,
     FaultPlan,
     MissingReportLine,
     OrphanAdjustment,
@@ -119,6 +120,23 @@ def test_a_missing_report_line_leaves_the_settlement_off_its_report() -> None:
     assert (injected.fault, injected.cause_code) == (fault, "missing_report_line")
     assert injected.params == {"report_date": "2026-09-04"}
     assert "simpay_pull" in injected.root_cause
+
+
+def test_a_duplicate_report_line_lists_the_settlement_twice_under_two_line_ids() -> None:
+    fault = DuplicateReportLine(id="twice")
+    report = build_report("simulator", FRIDAY, [settled("pull", fault)])
+
+    listed = rows(report.body)
+    assert [(line["provider_payment_id"], line["amount"]) for line in listed] == [
+        ("simpay_pull", "10000"),
+        ("simpay_pull", "10000"),
+    ]
+    assert len({line["line_id"] for line in listed}) == 2
+    [injected] = report.injected
+    assert injected.cause_code == "duplicate_report_line"
+    assert injected.line_id in {line["line_id"] for line in listed}
+    assert injected.line_id in injected.root_cause
+    assert build_report("simulator", TUESDAY, [settled("pull", fault)]).injected == ()
 
 
 def test_a_wrong_report_amount_reports_the_amount_off_by_its_delta() -> None:

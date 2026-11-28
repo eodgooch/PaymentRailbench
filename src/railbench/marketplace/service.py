@@ -56,6 +56,7 @@ from railbench.ledger.model import (
     NewTransaction,
     ReleaseRequest,
     SystemJob,
+    job_label,
 )
 from railbench.marketplace.model import (
     AuctionClose,
@@ -577,7 +578,7 @@ def _payout(
                 step=s.step,
                 detail=s.detail,
                 hold_id=s.hold_id,
-                job=f"{s.job_name}@{s.job_version}",
+                job=job_label(s.job_name, s.job_version),
                 effective_at=s.effective_at,
                 recorded_at=s.recorded_at,
             )

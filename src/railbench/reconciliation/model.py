@@ -34,7 +34,9 @@ class EvidenceView(_Value):
 
 class Resolver(_Value):
     """The person resolving a Break: an operator, and the approved Proposal they acted on,
-    if they acted on one. A system job never resolves a Break."""
+    if they acted on one. Not an Entry's person Actor (operator and approved Proposal, both
+    required): resolving a Break moves no money, and a person may resolve one by their own
+    judgement, with a reason. A system job never resolves a Break (ADR 0015)."""
 
     kind: Literal["person"] = "person"
     operator_id: NonEmpty
@@ -72,9 +74,14 @@ class Break(_Value):
     currency: str
     facts: dict[str, Any]
     evidence: EvidenceView
-    detected_at: datetime
+    # Other Breaks with the same cause: those this one names (`facts.related_breaks`, e.g.
+    # the missing-at-Provider Break of a line that turned up more than a day late) and those
+    # that name it.
+    related_breaks: list[str] = []
+    detected_at: datetime  # when Reconciliation found it (the run's Recorded Time)
     status: BreakStatus
-    # From detection until now (open) or until its resolution (resolved).
+    # From when the Banking Day it concerns was due on its report (20:00 New York) until
+    # now (open) or until its resolution (resolved): older Banking Days rank first.
     age_seconds: int
     resolution: Resolution | None
 

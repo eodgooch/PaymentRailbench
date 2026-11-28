@@ -7,6 +7,9 @@ from datetime import UTC, date, datetime
 
 import pytest
 
+from railbench.payments.model import AdjustmentOutcome
+from railbench.payments.provider import LineType
+from railbench.payments.state_machine import Direction, PaymentState, Rail
 from railbench.reconciliation.matching import (
     AdjustmentLine,
     BreakType,
@@ -14,6 +17,7 @@ from railbench.reconciliation.matching import (
     Evidence,
     LedgerPayment,
     Reissue,
+    ReportDay,
     RestatedLine,
     StatedLine,
     break_id,
@@ -30,9 +34,9 @@ def payment(
     name: str = "a",
     *,
     amount: int = 5_000,
-    direction: str = "pull",
-    rail: str = "ach",
-    state: str = "settled",
+    direction: Direction = "pull",
+    rail: Rail = "ach",
+    state: PaymentState = PaymentState.SETTLED,
     settled_at: datetime | None = FRIDAY_0830,
 ) -> LedgerPayment:
     number = ord(name[0])
@@ -45,7 +49,9 @@ def payment(
         currency="USD",
         amount=amount,
         state=state,
-        settled_at=None if state not in ("settled", "available", "returned") else settled_at,
+        settled_at=settled_at
+        if state in (PaymentState.SETTLED, PaymentState.AVAILABLE, PaymentState.RETURNED)
+        else None,
         evidence=Evidence(payments=(number,), transitions=(number * 10,), inbox=(number * 100,)),
     )
 
@@ -60,7 +66,7 @@ def line(
     amount: int | None = None,
     line_id: str | None = None,
     position: int = 1,
-    type_: str = "settlement",
+    type_: LineType = "settlement",
 ) -> StatedLine:
     return StatedLine(
         id=next(_rows),
@@ -87,8 +93,7 @@ def view(
     reissues: list[Reissue] | None = None,
 ) -> DayView:
     return DayView(
-        provider="simulator",
-        day=day,
+        report_day=ReportDay("simulator", day),
         report_id=REPORT_IDS[day],
         payments={p.provider_payment_id: p for p in payments},
         settlement_lines=tuple(lines),
@@ -138,8 +143,23 @@ def test_a_line_later_than_the_next_report_is_missing_on_its_day_then_late_on_it
     very_late = line(pull, WEDNESDAY)
 
     assert kinds(view([pull], [], FRIDAY)) == [(BreakType.MISSING_AT_PROVIDER, "simpay_a", 5_000)]
+    [missing] = match(view([pull], [], FRIDAY))
     [found] = match(view([pull], [very_late], WEDNESDAY))
     assert (found.break_type, found.match_key) == (BreakType.TIMING_MISMATCH, very_late.line_id)
+    # One cause, two Breaks: the later one names the earlier, and both name the Payment.
+    friday = break_id(ReportDay("simulator", FRIDAY), missing.break_type, missing.match_key)
+    assert found.facts["related_breaks"] == [friday]
+    assert pull.id in found.evidence.payments and pull.id in missing.evidence.payments
+
+
+def test_a_line_more_than_a_day_late_and_wrong_links_both_its_breaks() -> None:
+    pull = payment()
+
+    found = match(view([pull], [line(pull, WEDNESDAY, amount=4_000)], WEDNESDAY))
+
+    assert [b.break_type for b in found] == [BreakType.AMOUNT_MISMATCH, BreakType.TIMING_MISMATCH]
+    assert all(len(b.facts["related_breaks"]) == 1 for b in found)
+    assert "related_breaks" not in match(view([pull], [line(pull, TUESDAY)]))[0].facts
 
 
 def test_after_the_cutoff_the_ledger_expects_the_next_banking_days_report() -> None:
@@ -222,8 +242,13 @@ def test_a_line_contradicting_its_payment_is_missing_in_ledger_and_the_payment_m
     ]
 
 
-@pytest.mark.parametrize("state", ["created", "submitted", "declined", "canceled"])
-def test_a_line_for_a_payment_the_ledger_has_not_settled_is_a_status_mismatch(state: str) -> None:
+@pytest.mark.parametrize(
+    "state",
+    [PaymentState.CREATED, PaymentState.SUBMITTED, PaymentState.DECLINED, PaymentState.CANCELED],
+)
+def test_a_line_for_a_payment_the_ledger_has_not_settled_is_a_status_mismatch(
+    state: PaymentState,
+) -> None:
     unsettled = payment(state=state)
 
     [found] = match(view([unsettled], [line(unsettled)]))
@@ -237,26 +262,29 @@ def test_a_line_for_a_payment_the_ledger_has_not_settled_is_a_status_mismatch(st
 
 
 def test_a_returned_payment_still_expects_its_settlement_line() -> None:
-    returned = payment(state="returned")
+    returned = payment(state=PaymentState.RETURNED)
 
     assert match(view([returned], [line(returned)])) == []
     assert kinds(view([returned], [])) == [(BreakType.MISSING_AT_PROVIDER, "simpay_a", 5_000)]
 
 
-def adjustment(of: LedgerPayment, outcome: str | None, amount: int = -150) -> AdjustmentLine:
+def adjustment(
+    of: LedgerPayment, outcome: AdjustmentOutcome | None, amount: int = -150
+) -> AdjustmentLine:
+    unmatched = outcome is AdjustmentOutcome.UNMATCHED
     return AdjustmentLine(
         line=line(of, TUESDAY, amount=amount, type_="adjustment", position=5),
         outcome=outcome,
         decisions=(77,),
-        payment_id=of.id if outcome != "unmatched" else None,
-        detail="no Payment simpay_a at simulator in the Ledger" if outcome == "unmatched" else "",
+        payment_id=None if unmatched else of.id,
+        detail="no Payment simpay_a at simulator in the Ledger" if unmatched else "",
     )
 
 
 def test_provider_adjustments_booked_agree_unmatched_are_missing_pending_are_status() -> None:
     pull = payment(settled_at=FRIDAY_1700)  # expected on Tuesday's report, and listed there
     listed = line(pull, TUESDAY)
-    booked, unmatched, pending = (adjustment(pull, o) for o in ("booked", "unmatched", "pending"))
+    pending, booked, unmatched = (adjustment(pull, outcome) for outcome in AdjustmentOutcome)
 
     assert match(view([pull], [listed], TUESDAY, [booked])) == []
     [orphan] = match(view([pull], [listed], TUESDAY, [unmatched]))
@@ -300,6 +328,15 @@ def test_a_reissued_report_stating_other_lines_is_a_duplicate_exposing_the_diffe
     )
     assert found.evidence.reports == (REPORT_IDS[FRIDAY], 99)
     assert set(found.evidence.report_lines) == {listed[0].id, listed[1].id}
+    # Both sides of what differs, so nobody needs to read the re-issue's raw bytes.
+    assert found.facts["ingested_lines"] == [
+        {"line_id": listed[0].line_id, "currency": "USD", "amount": 5_000},
+        {"line_id": listed[1].line_id, "currency": "USD", "amount": 900},
+    ]
+    assert found.facts["reissued_lines"] == [
+        {"line_id": "simline_new", "currency": "USD", "amount": 300},
+        {"line_id": listed[0].line_id, "currency": "USD", "amount": 4_000},
+    ]
 
 
 def test_matching_is_deterministic_whatever_order_its_inputs_come_in() -> None:
@@ -315,18 +352,14 @@ def test_matching_is_deterministic_whatever_order_its_inputs_come_in() -> None:
 
 
 def test_a_breaks_id_is_the_same_for_the_same_disagreement_and_differs_otherwise() -> None:
-    one = break_id("simulator", FRIDAY, BreakType.DUPLICATE, "simline_x")
+    one = break_id(ReportDay("simulator", FRIDAY), BreakType.DUPLICATE, "simline_x")
 
-    assert one == break_id("simulator", FRIDAY, BreakType.DUPLICATE, "simline_x")
+    assert one == break_id(ReportDay("simulator", FRIDAY), BreakType.DUPLICATE, "simline_x")
     assert one.startswith("brk_") and len(one) == 28
-    assert (
-        len(
-            {
-                one,
-                break_id("simulator", TUESDAY, BreakType.DUPLICATE, "simline_x"),
-                break_id("simulator", FRIDAY, BreakType.TIMING_MISMATCH, "simline_x"),
-                break_id("simulator", FRIDAY, BreakType.DUPLICATE, "simline_y"),
-            }
-        )
-        == 4
-    )
+    others = {
+        break_id(ReportDay("simulator", TUESDAY), BreakType.DUPLICATE, "simline_x"),
+        break_id(ReportDay("simulator", FRIDAY), BreakType.TIMING_MISMATCH, "simline_x"),
+        break_id(ReportDay("simulator", FRIDAY), BreakType.DUPLICATE, "simline_y"),
+        break_id(ReportDay("elsewhere", FRIDAY), BreakType.DUPLICATE, "simline_x"),
+    }
+    assert len(others | {one}) == 5
