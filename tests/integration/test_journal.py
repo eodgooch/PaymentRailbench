@@ -26,7 +26,7 @@ from railbench.ledger.model import (
     ReversalRequest,
     SystemJob,
 )
-from tests.integration.helpers import unique
+from tests.integration.helpers import posted_balance, unique
 
 pytestmark = pytest.mark.integration
 
@@ -53,7 +53,7 @@ def test_a_new_account_has_a_zero_posted_balance(journal: Journal) -> None:
     assert account.code == code
     assert account.type is AccountType.LIABILITY
     assert account.currency == "USD"
-    assert journal.posted_balance(code) == 0
+    assert posted_balance(journal, code) == 0
 
 
 SETTLEMENT_JOB = SystemJob(name="ach-settlement", version="1.0.0")
@@ -88,8 +88,10 @@ def test_posting_a_balanced_transaction_moves_posted_balances(journal: Journal) 
     posted = journal.post(funding(clearing, customer, 12_500))
 
     assert posted.replayed is False
-    assert journal.posted_balance(clearing) == 12_500
-    assert journal.posted_balance(customer) == -12_500
+    # Balances read in each Account's normal direction (ADR 0009): the Clearing Account (an
+    # asset) holds 12,500 and Mintwharf owes the Customer (a liability) 12,500.
+    assert posted_balance(journal, clearing) == 12_500
+    assert posted_balance(journal, customer) == 12_500
     assert journal.transaction(posted.transaction.id) == posted.transaction
 
 
@@ -114,7 +116,7 @@ def test_reposting_the_same_key_and_payload_returns_the_original(journal: Journa
 
     assert again.replayed is True
     assert again.transaction == first.transaction
-    assert journal.posted_balance(customer) == -4_200
+    assert posted_balance(journal, customer) == 4_200
 
 
 def test_the_same_effective_time_in_another_offset_is_the_same_payload(
@@ -140,7 +142,7 @@ def test_reusing_a_key_with_a_different_payload_is_a_conflict(journal: Journal) 
     with pytest.raises(IdempotencyConflict):
         journal.post(funding(clearing, customer, 4_201, key=key))
 
-    assert journal.posted_balance(customer) == -4_200
+    assert posted_balance(journal, customer) == 4_200
 
 
 def test_an_unbalanced_transaction_is_rejected_before_it_reaches_the_ledger() -> None:
@@ -181,7 +183,7 @@ def test_an_entry_to_an_unknown_account_is_rejected(journal: Journal) -> None:
     with pytest.raises(UnknownAccount):
         journal.post(funding(clearing, "nobody", 100))
 
-    assert journal.posted_balance(clearing) == 0
+    assert posted_balance(journal, clearing) == 0
 
 
 def test_an_entry_must_be_in_its_accounts_currency(journal: Journal) -> None:
@@ -225,8 +227,8 @@ def test_a_reversal_negates_every_entry_and_references_the_original(journal: Jou
     ]
     assert all(e.actor == OPERATOR for e in reversed_.entries)
     assert all(e.effective_at == AUCTION_CLOSE + timedelta(days=1) for e in reversed_.entries)
-    assert journal.posted_balance(clearing) == 0
-    assert journal.posted_balance(customer) == 0
+    assert posted_balance(journal, clearing) == 0
+    assert posted_balance(journal, customer) == 0
 
 
 def test_a_transaction_can_be_reversed_once(journal: Journal) -> None:
@@ -237,7 +239,7 @@ def test_a_transaction_can_be_reversed_once(journal: Journal) -> None:
     with pytest.raises(AlreadyReversed):
         journal.reverse(original.id, reversal())
 
-    assert journal.posted_balance(customer) == 0
+    assert posted_balance(journal, customer) == 0
 
 
 def test_retrying_a_reversal_returns_the_original_reversal(journal: Journal) -> None:

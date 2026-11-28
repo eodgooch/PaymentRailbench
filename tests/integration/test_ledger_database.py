@@ -1,4 +1,5 @@
-"""The Ledger's own defences, proved against the database directly (SPEC §3.2, ADR 0006).
+"""The Ledger's own defences, proved against the database directly (SPEC §3.2, §3.3, ADR 0006,
+ADR 0009).
 
 These bypass the Journal on purpose: the grants and triggers have to hold even for code that
 gets the Python checks wrong, and even for the database owner.
@@ -17,15 +18,19 @@ from railbench.ledger.model import (
     AccountType,
     NewAccount,
     NewEntry,
+    NewHold,
     NewTransaction,
+    ReleaseRequest,
+    SettlementRequest,
     SystemJob,
+    TransactionStatus,
 )
 from tests.integration.helpers import unique
 
 pytestmark = pytest.mark.integration
 
 AUCTION_CLOSE = datetime(2026, 3, 2, 21, 0, tzinfo=UTC)
-TABLES = ("accounts", "transactions", "entries")
+TABLES = ("accounts", "transactions", "entries", "settlements", "holds", "hold_ends")
 EDITS = {
     "update": "UPDATE ledger.{table} SET recorded_at = recorded_at",
     "delete": "DELETE FROM ledger.{table}",
@@ -33,24 +38,54 @@ EDITS = {
 }
 
 
+ACH_JOB = SystemJob(name="ach-settlement", version="1.0.0")
+
+
 @pytest.fixture
 def posted(app_engine: Engine) -> int:
-    """A posted Transaction, so every Ledger table has a row to try to edit."""
+    """A posted Transaction, plus a settled pending one and a released Hold, so every Ledger
+    table has a row to try to edit."""
     journal = Journal(app_engine, ManualClock(AUCTION_CLOSE))
     codes = [unique("clearing"), unique("customer")]
     for code, type_ in zip(codes, (AccountType.ASSET, AccountType.LIABILITY), strict=True):
         journal.open_account(NewAccount(code=code, type=type_, currency="USD"))
-    return journal.post(
-        NewTransaction(
-            idempotency_key=unique("funding"),
-            actor=SystemJob(name="ach-settlement", version="1.0.0"),
-            effective_at=AUCTION_CLOSE,
-            entries=[
-                NewEntry(account=codes[0], currency="USD", amount=500),
-                NewEntry(account=codes[1], currency="USD", amount=-500),
-            ],
+    funding = NewTransaction(
+        idempotency_key=unique("funding"),
+        actor=ACH_JOB,
+        effective_at=AUCTION_CLOSE,
+        entries=[
+            NewEntry(account=codes[0], currency="USD", amount=500),
+            NewEntry(account=codes[1], currency="USD", amount=-500),
+        ],
+    )
+    pending = journal.post(
+        funding.model_copy(
+            update={"idempotency_key": unique("pending"), "status": TransactionStatus.PENDING}
         )
-    ).transaction.id
+    ).transaction
+    journal.settle(
+        pending.id,
+        SettlementRequest(
+            idempotency_key=unique("settlement"), actor=ACH_JOB, effective_at=AUCTION_CLOSE
+        ),
+    )
+    hold = journal.place_hold(
+        NewHold(
+            idempotency_key=unique("hold"),
+            actor=ACH_JOB,
+            effective_at=AUCTION_CLOSE,
+            account=codes[1],
+            currency="USD",
+            amount=100,
+        )
+    ).hold
+    journal.release_hold(
+        hold.id,
+        ReleaseRequest(
+            idempotency_key=unique("release"), actor=ACH_JOB, effective_at=AUCTION_CLOSE
+        ),
+    )
+    return journal.post(funding).transaction.id
 
 
 def sqlstate(error: DBAPIError) -> type[BaseException | None]:
@@ -105,13 +140,14 @@ def test_migrations_can_still_change_ledger_rows(engine: Engine, posted: int) ->
         transaction.rollback()
 
 
-def insert_transaction(connection: Connection) -> int:
+def insert_transaction(connection: Connection, status: str = "posted") -> int:
     transaction_id: int = connection.execute(
         text(
-            "INSERT INTO ledger.transactions (idempotency_key, payload_fingerprint, recorded_at)"
-            " VALUES (:key, repeat('0', 64), now()) RETURNING id"
+            "INSERT INTO ledger.transactions"
+            " (idempotency_key, payload_fingerprint, status, recorded_at)"
+            " VALUES (:key, repeat('0', 64), :status, now()) RETURNING id"
         ),
-        {"key": unique("raw")},
+        {"key": unique("raw"), "status": status},
     ).scalar_one()
     return transaction_id
 
@@ -246,10 +282,117 @@ def test_a_transaction_is_reversed_at_most_once(app_engine: Engine, posted: int)
             connection.execute(
                 text(
                     "INSERT INTO ledger.transactions"
-                    " (idempotency_key, payload_fingerprint, reverses_id, recorded_at)"
-                    " VALUES (:key, repeat('0', 64), :original, now())"
+                    " (idempotency_key, payload_fingerprint, reverses_id, status, recorded_at)"
+                    " VALUES (:key, repeat('0', 64), :original, 'posted', now())"
                 ),
                 {"key": unique("raw-reversal"), "original": posted},
             )
 
     assert sqlstate(raised.value) is psycopg.errors.UniqueViolation
+
+
+SYSTEM_ACTOR = ("actor_kind, actor_job_name, actor_job_version", "'system_job', 'raw-sql', '0'")
+
+
+def insert_settlement(connection: Connection, transaction_id: int) -> None:
+    connection.execute(
+        text(
+            "INSERT INTO ledger.settlements (transaction_id, idempotency_key,"
+            f" payload_fingerprint, effective_at, recorded_at, {SYSTEM_ACTOR[0]})"
+            f" VALUES (:txn, :key, repeat('0', 64), now(), now(), {SYSTEM_ACTOR[1]})"
+        ),
+        {"txn": transaction_id, "key": unique("raw-settlement")},
+    )
+
+
+def pending_transaction(connection: Connection) -> int:
+    transaction_id = insert_transaction(connection, status="pending")
+    insert_entry(connection, transaction_id, account_id(connection), 100)
+    insert_entry(connection, transaction_id, account_id(connection), -100)
+    return transaction_id
+
+
+def test_only_a_pending_transaction_can_settle(app_engine: Engine, posted: int) -> None:
+    with pytest.raises(DBAPIError) as raised, app_engine.begin() as connection:
+        insert_settlement(connection, posted)
+
+    assert sqlstate(raised.value) is psycopg.errors.ForeignKeyViolation
+
+
+def test_a_transaction_settles_at_most_once(app_engine: Engine) -> None:
+    with pytest.raises(DBAPIError) as raised, app_engine.begin() as connection:
+        transaction_id = pending_transaction(connection)
+        insert_settlement(connection, transaction_id)
+        insert_settlement(connection, transaction_id)
+
+    assert sqlstate(raised.value) is psycopg.errors.UniqueViolation
+
+
+def insert_hold(connection: Connection, amount: int = 100) -> int:
+    hold_id: int = connection.execute(
+        text(
+            "INSERT INTO ledger.holds (idempotency_key, payload_fingerprint, account_id,"
+            f" currency, amount, effective_at, recorded_at, {SYSTEM_ACTOR[0]})"
+            " VALUES (:key, repeat('0', 64), :account, 'USD', :amount, now(), now(),"
+            f" {SYSTEM_ACTOR[1]}) RETURNING id"
+        ),
+        {"key": unique("raw-hold"), "account": account_id(connection), "amount": amount},
+    ).scalar_one()
+    return hold_id
+
+
+def end_hold(
+    connection: Connection, hold_id: int, outcome: str, transaction_id: int | None = None
+) -> None:
+    key = None if outcome == "captured" else unique("raw-release")
+    connection.execute(
+        text(
+            "INSERT INTO ledger.hold_ends (hold_id, outcome, transaction_id, idempotency_key,"
+            f" payload_fingerprint, effective_at, recorded_at, {SYSTEM_ACTOR[0]})"
+            f" VALUES (:hold, :outcome, :txn, :key, :fingerprint, now(), now(), {SYSTEM_ACTOR[1]})"
+        ),
+        {
+            "hold": hold_id,
+            "outcome": outcome,
+            "txn": transaction_id,
+            "key": key,
+            "fingerprint": key and "0" * 64,
+        },
+    )
+
+
+@pytest.mark.parametrize("amount", [0, -100])
+def test_a_hold_amount_is_positive(app_engine: Engine, amount: int) -> None:
+    with pytest.raises(DBAPIError) as raised, app_engine.begin() as connection:
+        insert_hold(connection, amount)
+
+    assert sqlstate(raised.value) is psycopg.errors.CheckViolation
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [("released", "released"), ("captured", "released"), ("released", "captured")],
+)
+def test_a_hold_ends_at_most_once(app_engine: Engine, posted: int, first: str, second: str) -> None:
+    with pytest.raises(DBAPIError) as raised, app_engine.begin() as connection:
+        hold_id = insert_hold(connection)
+        for outcome in (first, second):
+            end_hold(connection, hold_id, outcome, posted if outcome == "captured" else None)
+
+    assert sqlstate(raised.value) is psycopg.errors.UniqueViolation
+
+
+@pytest.mark.parametrize(
+    ("outcome", "with_transaction"),
+    [
+        pytest.param("captured", False, id="a capture without its Transaction"),
+        pytest.param("released", True, id="a release with a Transaction"),
+    ],
+)
+def test_a_hold_end_has_the_shape_of_its_outcome(
+    app_engine: Engine, posted: int, outcome: str, with_transaction: bool
+) -> None:
+    with pytest.raises(DBAPIError) as raised, app_engine.begin() as connection:
+        end_hold(connection, insert_hold(connection), outcome, posted if with_transaction else None)
+
+    assert sqlstate(raised.value) is psycopg.errors.CheckViolation

@@ -1,4 +1,5 @@
-"""What the Ledger records, as values: Accounts, Actors, Entries and Transactions (SPEC §3).
+"""What the Ledger records, as values: Accounts, Actors, Entries, Transactions, Settlements,
+Holds and Balances (SPEC §3).
 
 Money is a strict integer in Minor Units: a float, a numeric string or a bool is rejected,
 never coerced. Requests are validated here, so the Journal and the HTTP API share one set of
@@ -44,6 +45,21 @@ class AccountType(StrEnum):
     LIABILITY = "liability"
     REVENUE = "revenue"
     EXPENSE = "expense"
+
+    @property
+    def normal_sign(self) -> int:
+        """+1 for debit-normal Accounts (asset, expense), -1 for credit-normal ones (liability,
+        revenue). A Balance reads as the raw debit-positive sum times this sign, so a Customer
+        Balance holding money Mintwharf owes the Customer is positive (ADR 0009)."""
+        return 1 if self in (AccountType.ASSET, AccountType.EXPENSE) else -1
+
+
+class TransactionStatus(StrEnum):
+    """Fixed when the Transaction is posted. A pending Transaction's Entries are money in
+    motion until a Settlement turns them Posted (ADR 0009)."""
+
+    PENDING = "pending"
+    POSTED = "posted"
 
 
 class NewAccount(_Value):
@@ -91,6 +107,7 @@ class NewTransaction(_Value):
     actor: Actor
     effective_at: AwareDatetime
     description: Annotated[str, Field(max_length=500)] = ""
+    status: TransactionStatus = TransactionStatus.POSTED
     entries: Annotated[list[NewEntry], Field(min_length=2)]
 
     @model_validator(mode="after")
@@ -113,6 +130,15 @@ class ReversalRequest(_Value):
     description: Annotated[str, Field(max_length=500)] = ""
 
 
+class SettlementRequest(_Value):
+    """A request to settle a pending Transaction: its Entries count as Posted from
+    `effective_at`, as known from when the Ledger records the Settlement."""
+
+    idempotency_key: IdempotencyKey
+    actor: Actor
+    effective_at: AwareDatetime
+
+
 class Entry(_Value):
     id: int
     account: str
@@ -123,13 +149,22 @@ class Entry(_Value):
     actor: Actor
 
 
+class Settlement(_Value):
+    id: int
+    effective_at: datetime
+    recorded_at: datetime
+    actor: Actor
+
+
 class Transaction(_Value):
     id: int
     idempotency_key: str
     description: str
     recorded_at: datetime
+    status: TransactionStatus
     reverses: int | None
     reversed_by: int | None
+    settlement: Settlement | None
     entries: list[Entry]
 
 
@@ -138,6 +173,85 @@ class Posted(_Value):
     already been posted with the same payload, and `transaction` is that original."""
 
     transaction: Transaction
+    replayed: bool
+
+
+class Balance(_Value):
+    """An Account's balances at an Effective Time, as known at a Recorded Time, in its normal
+    direction (ADR 0009). Always derived, never stored.
+
+    `available` = `posted` - `held` - `unsettled_outflows`, where `held` is the total of
+    open Holds and `unsettled_outflows` is what pending Transactions are taking out of the
+    Account (each counted net of its Reversal, and only when it reduces the balance).
+    """
+
+    account: str
+    currency: str
+    effective_at: datetime
+    known_at: datetime
+    posted: int
+    pending: int
+    held: int
+    unsettled_outflows: int
+    available: int
+
+
+HoldAmount = Annotated[
+    int, Field(strict=True, gt=0, le=BIGINT_MAX, description="Positive integer Minor Units")
+]
+
+
+class NewHold(_Value):
+    """A Hold to place: it reserves `amount` of the Account's Available Balance without
+    moving money."""
+
+    idempotency_key: IdempotencyKey
+    actor: Actor
+    effective_at: AwareDatetime
+    account: AccountCode
+    currency: Currency
+    amount: HoldAmount
+    description: Annotated[str, Field(max_length=500)] = ""
+
+
+class ReleaseRequest(_Value):
+    """A request to release a Hold, ending the reservation with no money moved."""
+
+    idempotency_key: IdempotencyKey
+    actor: Actor
+    effective_at: AwareDatetime
+
+
+class HoldOutcome(StrEnum):
+    RELEASED = "released"
+    CAPTURED = "captured"
+
+
+class HoldEnd(_Value):
+    outcome: HoldOutcome
+    transaction: int | None  # the capturing Transaction
+    effective_at: datetime
+    recorded_at: datetime
+    actor: Actor
+
+
+class Hold(_Value):
+    id: int
+    idempotency_key: str
+    account: str
+    currency: str
+    amount: int
+    description: str
+    effective_at: datetime
+    recorded_at: datetime
+    actor: Actor
+    ended: HoldEnd | None
+
+
+class HoldRecorded(_Value):
+    """The outcome of placing or releasing a Hold. `replayed` is true for a retry."""
+
+    hold: Hold
     replayed: bool
 
 
