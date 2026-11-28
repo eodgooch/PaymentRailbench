@@ -53,8 +53,12 @@ Who or what created an Entry: a system job, a Provider Event, or a person approv
 A Transaction that exactly negates an earlier one. The only way to correct the Ledger.
 _Avoid_: Void, undo, delete
 
+**Settlement**:
+The record that a pending Transaction's money has stopped moving. From its Effective Time, the Transaction's Entries count toward the Posted Balance instead of the Pending Balance. No Entry changes.
+_Avoid_: Clearing (that's the Clearing Account, a different thing)
+
 **Hold**:
-A reservation that reduces an Account's Available Balance without moving money, later released or captured.
+A reservation that reduces an Account's Available Balance without moving money, later released (no money moves) or captured (a Transaction moves it).
 _Avoid_: Freeze, lock
 
 **Posted Balance**:

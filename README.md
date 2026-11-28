@@ -34,9 +34,32 @@ The Ledger is double-entry and append-only, in the `ledger` schema (migration `0
   own fields.
 - Entries **sum to zero per currency**: checked in code before posting, and again at commit
   by deferred constraint triggers, which also refuse a Transaction with no Entries.
-- **Posted Balance** is the signed sum of an Account's Entries, derived on every read and
-  never stored. Pending and Available Balances, Holds, bitemporal balance queries and Daily
-  Close come later.
+- **Balances are bitemporal and derived (ADR 0002, ADR 0009).**
+  `Journal.balances(account, effective_at, known_at=None)` and
+  `GET /accounts/{code}/balances?effective_at=…&known_at=…` (both with a UTC offset;
+  `known_at` defaults to now and can't be later) return the **Posted**, **Pending** and
+  **Available** Balances, plus the `held` and `unsettled_outflows` behind Available =
+  Posted − Holds − unsettled outflows. A row counts when its Effective Time ≤ `effective_at`
+  and its Recorded Time ≤ `known_at` (both inclusive), so a backdated Entry changes the
+  balance "as known now" but not "as known then". Balances read in the Account's normal
+  direction: a Customer Balance (a liability) holding $30 reads `3000`, while the Entries
+  stay debit-positive. Nothing is stored or cached: every read is one SQL derivation over an
+  index on Entries by (Account, Effective Time, Recorded Time).
+- **Pending and Settlement.** A Transaction is posted (the default) or `pending`, fixed when
+  it's posted. `POST /transactions/{id}/settlement` appends a **Settlement**, with its own
+  Effective Time, Actor and Idempotency Key, from which the pending Entries count as Posted.
+  No Entry changes. A Transaction settles once. Reversing an unsettled pending Transaction
+  (a decline) posts a pending Reversal that cancels it, and it can't settle afterwards;
+  reversing a posted or settled one (a Return) is posted, and can't take effect before the
+  original or its Settlement. Settle and reverse take one advisory lock per Transaction, so
+  they can't race. **Unsettled outflows** are the in-flight pending Transactions that take
+  money out of the Account. Pending inflows aren't Available until they settle.
+- **Holds.** `POST /holds` reserves a positive amount on one Account, reducing Available
+  without moving money. A Hold ends once: `POST /holds/{id}/release` (no money moves) or
+  `POST /holds/{id}/capture` with a Transaction, which is posted in the same commit and must
+  take money out of the held Account. A second release or capture, or a release after a
+  capture, is a `409`. Holds are append-only too (`holds` and `hold_ends`), and bitemporal
+  like Entries. Daily Close comes later.
 - **Idempotency:** every Transaction has a unique Idempotency Key and a SHA-256 fingerprint of
   its payload (times compared as instants). The row goes in with `ON CONFLICT DO NOTHING`,
   so concurrent posts of one key post once. The fingerprint covers the Entries, Actor,
@@ -57,9 +80,12 @@ The Ledger is double-entry and append-only, in the `ledger` schema (migration `0
   `UPDATE` or `DELETE` grant whatever it sets. Transaction and Entry IDs are unique but not
   gapless: a refused or replayed post can use up an ID.
 
-The API: `POST /accounts`, `GET /accounts/{code}` (with its Posted Balance),
-`POST /transactions`, `GET /transactions/{id}` and `POST /transactions/{id}/reversal`. Money
-is a JSON integer: `12.5`, `12.0`, `"1250"` and `true` are all refused with `422`.
+The API: `POST /accounts`, `GET /accounts/{code}`, `GET /accounts/{code}/balances`,
+`POST /transactions`, `GET /transactions/{id}`, `POST /transactions/{id}/reversal`,
+`POST /transactions/{id}/settlement`, `POST /holds`, `GET /holds/{id}`,
+`POST /holds/{id}/release` and `POST /holds/{id}/capture`. Every write takes an Idempotency
+Key and replays or conflicts the same way. Money is a JSON integer: `12.5`, `12.0`,
+`"1250"` and `true` are all refused with `422`.
 
 ### Layout
 
@@ -69,7 +95,7 @@ is a JSON integer: `12.5`, `12.0`, `"1250"` and `true` are all refused with `422
 - `src/railbench/simulator`: the Simulator, a separate service (ADR 0005)
 - `migrations/`: Alembic. The baseline creates the `ledger`, `payments` (Payments and the
   Inbox), `reconciliation` and `simulator` schemas; `0002` adds the Ledger tables, triggers
-  and the `railbench_app` role.
+  and the `railbench_app` role; `0003` adds Transaction status, Settlements and Holds.
 
 Nothing reads the system time directly: code takes a `Clock` (`WallClock` by default,
 `ManualClock` in tests and Scenarios), and a ruff rule bans `datetime.now()` and friends

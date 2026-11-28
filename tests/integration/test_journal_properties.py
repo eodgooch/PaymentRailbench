@@ -25,7 +25,7 @@ from railbench.ledger.model import (
     ReversalRequest,
     SystemJob,
 )
-from tests.integration.helpers import unique
+from tests.integration.helpers import posted_balance, unique
 
 pytestmark = pytest.mark.integration
 
@@ -102,7 +102,7 @@ def transaction(chart: dict[str, list[str]], legs: list[Leg], key: str = "") -> 
 
 
 def balances(journal: Journal, chart: dict[str, list[str]]) -> dict[str, int]:
-    return {code: journal.posted_balance(code) for codes in chart.values() for code in codes}
+    return {code: posted_balance(journal, code) for codes in chart.values() for code in codes}
 
 
 @database
@@ -122,7 +122,7 @@ def test_every_posted_transaction_balances(journal: Journal, legs: list[Leg], sk
     posted = journal.post(new).transaction
 
     for currency, codes in chart.items():
-        assert sum(journal.posted_balance(code) for code in codes) == 0, currency
+        assert sum(posted_balance(journal, code) for code in codes) == 0, currency
     per_currency: defaultdict[str, int] = defaultdict(int)
     for entry in posted.entries:
         per_currency[entry.currency] += entry.amount
