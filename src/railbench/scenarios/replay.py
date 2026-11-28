@@ -23,7 +23,7 @@ Because the Ledger reads time only from its Clock, Recorded Times come out the s
 from collections.abc import Collection, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from enum import IntEnum
 from typing import Any
 
@@ -38,9 +38,11 @@ from railbench.marketplace.service import PAYOUT_JOB, AuctionTerms, Marketplace
 from railbench.marketplace.tables import auction_closes, lots, payout_steps, payouts
 from railbench.payments.model import NewPayment
 from railbench.payments.provider import (
+    FetchedReport,
     PaymentOrder,
     ProviderEvent,
     ProviderPayment,
+    SettlementReport,
     SimulatorProvider,
 )
 from railbench.payments.service import AVAILABILITY_JOB, PaymentNotYetKnown, Payments
@@ -71,6 +73,15 @@ class RecordedProvider:
 
     def read_event(self, body: bytes) -> ProviderEvent:
         return self._reader.read_event(body)
+
+    def fetch_settlement_report(self, report_date: date) -> FetchedReport | None:
+        raise NotImplementedError("a replay never asks the Provider")
+
+    def verify_report(self, body: bytes, headers: Mapping[str, str], now: datetime) -> None:
+        raise NotImplementedError("a replay never verifies: reports were verified when fetched")
+
+    def read_settlement_report(self, report_date: date, body: bytes) -> SettlementReport:
+        return self._reader.read_settlement_report(report_date, body)
 
 
 def availability_job_runs(

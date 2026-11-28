@@ -21,11 +21,18 @@ Auction Closes (`railbench.marketplace`): `POST /auction-closes` books one aucti
 makes its sellers' Payouts, once per auction ID (201, a retry 200, different lots 409), and
 `GET /auction-closes/{auction_id}` reads it back with each Payout's steps and Payments. A
 Payout is never made through `POST /payments`, which only makes pulls.
+
+Settlement Reports (`railbench.payments.reports`, ADR 0014): the Ledger's jobs fetch each due
+report through the Provider interface and ingest it; `GET /settlement-reports/{provider}/
+{date}` lists every report received for that day, with its outcome, its lines as stated and
+what was done with each Provider Adjustment. A Payment's booked adjustments are on
+`GET /payments/{id}` too.
 """
 
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import date
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -61,8 +68,15 @@ from railbench.marketplace.service import (
     Marketplace,
     MarketplaceError,
 )
-from railbench.payments.model import NewPayment, Payment, Receipt, ReturnException
+from railbench.payments.model import (
+    NewPayment,
+    Payment,
+    Receipt,
+    ReturnException,
+    SettlementReportView,
+)
 from railbench.payments.provider import MalformedEvent, Provider, ProviderError, SimulatorProvider
+from railbench.payments.reports import SettlementReports
 from railbench.payments.service import (
     NotACustomerBalance,
     PaymentConflict,
@@ -143,6 +157,7 @@ def create_app(
         )
     journal = Journal(engine, clock)
     payments = Payments(engine, clock, journal, provider)
+    reports = SettlementReports(engine, clock, journal, provider)
     marketplace = Marketplace(
         engine,
         clock,
@@ -156,9 +171,11 @@ def create_app(
 
     def jobs() -> None:
         """The Ledger's Clock-driven work, in order: ACH funds become Available, then the
-        Standard Payouts they were behind are released."""
+        Standard Payouts they were behind are released, then due Settlement Reports are
+        ingested."""
         payments.make_available()
         marketplace.release_payouts()
+        reports.ingest_due()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -169,6 +186,7 @@ def create_app(
     app.state.journal = journal
     app.state.payments = payments
     app.state.marketplace = marketplace
+    app.state.reports = reports
     app.state.provider = provider
 
     @app.exception_handler(LedgerError)
@@ -325,6 +343,13 @@ def create_app(
     @app.get("/auction-closes/{auction_id}")
     def get_auction_close(auction_id: str, marketplace: MarketplaceDep) -> AuctionClose:
         return marketplace.auction_close(auction_id)
+
+    @app.get("/settlement-reports/{provider}/{report_date}")
+    def get_settlement_reports(
+        provider: str, report_date: date, request: Request
+    ) -> list[SettlementReportView]:
+        found: SettlementReports = request.app.state.reports
+        return found.reports(provider, report_date)
 
     @app.post("/providers/{provider}/events", responses={401: {}, 400: {}, 503: {}})
     async def receive_event(provider: str, request: Request, payments: PaymentsDep) -> Receipt:
