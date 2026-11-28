@@ -169,9 +169,74 @@ class PlannedReturn(_Fault):
         return self
 
 
-# A discriminated union: Cutoff and Settlement Report Faults join as new kinds.
+# Settlement Report Faults (ADR 0014) act on the settled Payment's line in its Provider's
+# Settlement Report, never on a Provider Event: the Payment settles as it would have, and
+# only the report disagrees with what the Ledger heard.
+
+
+class _ReportFault(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: FaultId
+    # The Payment must settle: a report lists only what settled.
+    event: Literal["settled"] = "settled"
+
+
+class MissingReportLine(_ReportFault):
+    """Leave the settlement off its Settlement Report."""
+
+    kind: Literal["missing_report_line"] = "missing_report_line"
+
+
+class WrongReportAmount(_ReportFault):
+    """Report the settlement with its amount off by `by` Minor Units (the amount still
+    above zero)."""
+
+    kind: Literal["wrong_report_amount"] = "wrong_report_amount"
+    by: Annotated[int, Field(strict=True, ge=-BIGINT_MAX, le=BIGINT_MAX)]
+
+    @model_validator(mode="after")
+    def _not_zero(self) -> Self:
+        if self.by == 0:
+            raise ValueError("a wrong amount must differ from the right one")
+        return self
+
+
+class SettlementAfterCutoff(_ReportFault):
+    """The Provider books the settlement at its Cutoff, so it lands on the next Banking
+    Day's report, although its Provider Event said it settled earlier that day."""
+
+    kind: Literal["settlement_after_cutoff"] = "settlement_after_cutoff"
+
+
+AdjustmentReason = Literal["fee_correction", "payout_recall"]
+
+
+class ProviderAdjustment(_ReportFault):
+    """`after` Banking Days after the settlement's report, the Provider claws back
+    `amount` of it: a fee correction (any Payment: the money leaves Mintwharf's account) or
+    a recalled part of a Payout (a push only: the money comes back in). Reported on that
+    Banking Day's Settlement Report, never as a Provider Event."""
+
+    kind: Literal["provider_adjustment"] = "provider_adjustment"
+    amount: Annotated[int, Field(strict=True, gt=0, le=BIGINT_MAX)]
+    reason: AdjustmentReason
+    after: Annotated[int, Field(strict=True, ge=1, le=30)] = 1
+
+
+ReportFault = MissingReportLine | WrongReportAmount | SettlementAfterCutoff | ProviderAdjustment
+LINE_FAULTS = (MissingReportLine, WrongReportAmount, SettlementAfterCutoff)
+
+# A discriminated union: a new kind is one more variant here.
 FaultPlan = Annotated[
-    DuplicateDelivery | DelayedDelivery | OutOfOrderDelivery | PlannedReturn,
+    DuplicateDelivery
+    | DelayedDelivery
+    | OutOfOrderDelivery
+    | PlannedReturn
+    | MissingReportLine
+    | WrongReportAmount
+    | SettlementAfterCutoff
+    | ProviderAdjustment,
     Field(discriminator="kind"),
 ]
 
@@ -190,6 +255,25 @@ class PaymentPlan(BaseModel):
     def planned_return(self) -> "PlannedReturn | None":
         return next((f for f in self.faults if isinstance(f, PlannedReturn)), None)
 
+    @property
+    def report_faults(self) -> tuple[ReportFault, ...]:
+        return tuple(f for f in self.faults if isinstance(f, ReportFault))
+
+    def check_against(self, direction: str, amount: int) -> None:
+        """Raise ValueError unless the report Faults fit the Payment made: a wrong amount
+        stays above zero, an adjustment claws back at most what settled, and only a Payout
+        (a push) is recalled."""
+        for fault in self.report_faults:
+            if isinstance(fault, WrongReportAmount) and amount + fault.by <= 0:
+                raise ValueError(f"fault {fault.id}: {amount} off by {fault.by} isn't above 0")
+            if isinstance(fault, ProviderAdjustment):
+                if fault.amount > amount:
+                    raise ValueError(
+                        f"fault {fault.id}: can't claw back {fault.amount} of {amount}"
+                    )
+                if fault.reason == "payout_recall" and direction != "push":
+                    raise ValueError(f"fault {fault.id}: only a Payout (a push) is recalled")
+
     @model_validator(mode="after")
     def _faults_fit_the_outcome(self) -> Self:
         if self.rail == "rtp" and self.outcome == "cancel":
@@ -199,11 +283,18 @@ class PaymentPlan(BaseModel):
             raise ValueError("only an ACH Payment that settles can be returned (RTP has none)")
         if len(returns) > 1:
             raise ValueError("a Payment is returned at most once")
+        line_faults = [f for f in self.faults if isinstance(f, LINE_FAULTS)]
+        if len(line_faults) > 1:
+            raise ValueError("a report line can be missing, wrong or late, but only one of them")
+        if sum(isinstance(f, ProviderAdjustment) for f in self.faults) > 1:
+            raise ValueError("a Payment gets at most one Provider Adjustment")
         emitted = events_for(self.outcome, self.rail, returned=bool(returns))
         for fault in self.faults:
             later = (
                 fault.after if isinstance(fault, OutOfOrderDelivery | DuplicateDelivery) else None
             )
+            if fault.event not in emitted and isinstance(fault, ReportFault):
+                raise ValueError(f"fault {fault.id}: only a Payment that settles is on a report")
             if fault.event not in emitted:
                 raise ValueError(
                     f"fault {fault.id}: a Payment that ends {self.outcome!r} never emits "
