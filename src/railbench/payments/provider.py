@@ -10,6 +10,7 @@ adapter, not a Ledger change.
 """
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -46,6 +47,8 @@ class ProviderEvent:
     provider_payment_id: str
     reported: PaymentState
     occurred_at: datetime
+    # A Return's NACHA return code (`returned` events only).
+    return_code: str | None = None
 
 
 class ProviderError(Exception):
@@ -72,11 +75,14 @@ class Provider(Protocol):
         ...
 
 
+_RETURN_CODE = re.compile(r"^R[0-9]{2}$")
+
 EVENT_STATES = {
     "payment.submitted": PaymentState.SUBMITTED,
     "payment.settled": PaymentState.SETTLED,
     "payment.canceled": PaymentState.CANCELED,
     "payment.declined": PaymentState.DECLINED,
+    "payment.returned": PaymentState.RETURNED,
 }
 
 
@@ -125,11 +131,18 @@ class SimulatorProvider:
             occurred_at = datetime.fromisoformat(event["occurred_at"])
             if occurred_at.utcoffset() is None:
                 raise ValueError("occurred_at has no UTC offset")
+            reported = EVENT_STATES[event["type"]]
+            return_code = None
+            if reported is PaymentState.RETURNED:
+                return_code = str(event["return"]["code"])
+                if not _RETURN_CODE.match(return_code):
+                    raise ValueError(f"not a NACHA return code: {return_code!r}")
             return ProviderEvent(
                 event_id=str(event["event_id"]),
                 provider_payment_id=str(event["payment"]["id"]),
-                reported=EVENT_STATES[event["type"]],
+                reported=reported,
                 occurred_at=occurred_at,
+                return_code=return_code,
             )
         except (ValueError, KeyError, TypeError, AttributeError) as error:
             raise MalformedEvent(f"not a Simulator Provider Event: {error!r}") from error

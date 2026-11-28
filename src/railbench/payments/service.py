@@ -25,6 +25,16 @@ Actor. An ACH pull:
 - available: `make_available()`, a Ledger-side job on the Clock, releases the Hold at the
   start of the second Banking Day after the settlement's Banking Day. The Provider never
   says when funds are Available; the Ledger decides from the calendar.
+- returned (from settled or available, with a NACHA return code; ADR 0013): a posted
+  Reversal of the pending Transaction (Customer Balance debit, Clearing Account credit) and
+  a posted Reversal of the settlement's sweep (Clearing Account debit, Bank Cash credit), so
+  the money leaves Bank Cash and the Clearing Account still nets to zero; the availability
+  Hold is released if it's still in place, so the money is never made Available. If the
+  Customer Balance is then short (its Posted Balance less unsettled outflows is negative,
+  because the money was spent), a posted Transaction moves the deficit to the Customer's
+  Recovery Receivable (Recovery Receivable debit, Customer Balance credit), bringing the
+  Customer Balance back to zero, and a return exception records the exposure. All at the
+  Return's Effective Time; the deficit is measured on everything the Ledger knows now.
 
 An ACH push (a Payout) is the mirror image, and is never made Available:
 
@@ -93,6 +103,7 @@ from railbench.payments.model import (
     PaymentException,
     PaymentRef,
     Receipt,
+    ReturnException,
     Transition,
 )
 from railbench.payments.provider import PaymentOrder, Provider, ProviderEvent
@@ -105,7 +116,13 @@ from railbench.payments.state_machine import (
     Stale,
     decide,
 )
-from railbench.payments.tables import inbox, inbox_outcomes, payments, transitions
+from railbench.payments.tables import (
+    inbox,
+    inbox_outcomes,
+    payments,
+    return_exceptions,
+    transitions,
+)
 
 log = logging.getLogger(__name__)
 
@@ -165,6 +182,12 @@ def parse_ledger_key(key: str) -> tuple[int, str] | None:
     """The Payment id and step in a `ledger_key`, or None for any other key."""
     match = _LEDGER_KEY.match(key)
     return None if match is None else (int(match.group(1)), match.group(2))
+
+
+def recovery_receivable_account(customer_account: str) -> str:
+    """The Recovery Receivable for one Customer Balance (one Customer, one currency): what
+    that Customer owes Mintwharf after a Return left their balance short (SPEC §3.1)."""
+    return f"recovery-receivable:{customer_account}"
 
 
 def bank_cash_account(currency: str) -> str:
@@ -275,6 +298,7 @@ class Payments:
                 )
                 .order_by(inbox_outcomes.c.id)
             ).all()
+            raised = _return_exceptions(connection, return_exceptions.c.payment_id == payment_id)
         states = [PaymentState(step.state) for step in steps]
         settled = next((s for s in steps if s.state == PaymentState.SETTLED), None)
         return Payment(
@@ -310,7 +334,18 @@ class Payments:
                 PaymentException(inbox_id=e.inbox_id, detail=e.detail, recorded_at=e.recorded_at)
                 for e in exceptions
             ],
+            return_exceptions=raised,
         )
+
+    def return_exceptions(self, customer_account: str | None = None) -> list[ReturnException]:
+        """Every return exception raised, oldest first, or only one Customer Balance's."""
+        with self._engine.connect() as connection:
+            return _return_exceptions(
+                connection,
+                None
+                if customer_account is None
+                else return_exceptions.c.customer_account == customer_account,
+            )
 
     def by_keys(
         self, keys: Collection[str], connection: Connection | None = None
@@ -425,6 +460,12 @@ class Payments:
             payment = connection.execute(select(payments).where(payments.c.id == payment_id)).one()
             reached = _states(connection, payment_id)
             decision = decide(_current(reached), event.reported, reached, rail=payment.rail)
+            if (
+                event.reported is PaymentState.RETURNED
+                and payment.direction == "push"
+                and isinstance(decision, Advance)
+            ):
+                decision = Impossible("a Return of a push (a Payout) isn't handled: only pulls")
             outcome, detail = Outcome.APPLIED, ""
             match decision:
                 case Stale():
@@ -549,6 +590,8 @@ class Payments:
                     ),
                 ).transaction
                 return _Booked(transaction_id=reversal.id)
+            case ("ach", PaymentState.RETURNED):
+                return self._book_return(journal, connection, payment, inbox_id, event, kind)
             case ("rtp", PaymentState.SETTLED):
                 paid = move(
                     NewTransaction(
@@ -564,6 +607,106 @@ class Payments:
             case ("rtp", PaymentState.DECLINED):
                 return _Booked()  # nothing was booked, so nothing to undo
         raise AssertionError(f"a Provider Event can't book {state}")
+
+    def _book_return(
+        self,
+        journal: Journal,
+        connection: Connection,
+        payment: Row[Any],
+        inbox_id: int,
+        event: ProviderEvent,
+        kind: str,
+    ) -> _Booked:
+        """A Return of a settled pull: reverse the funding and its sweep to Bank Cash, end
+        the availability Hold if it's still in place, and move any deficit it leaves to
+        Recovery Receivable, with a return exception (ADR 0013)."""
+        actor = ProviderEventActor(inbox_id=str(inbox_id))
+        code = event.return_code or "R??"
+        late = PaymentState.AVAILABLE in _states(connection, payment.id)
+
+        def reverse(transaction_id: int, step: str, description: str) -> int:
+            return journal.reverse(
+                transaction_id,
+                ReversalRequest(
+                    idempotency_key=ledger_key(payment.id, step),
+                    actor=actor,
+                    effective_at=event.occurred_at,
+                    description=description,
+                ),
+            ).transaction.id
+
+        funding = _booked_by(connection, payment.id, PaymentState.SUBMITTED)
+        sweep = _booked_by(connection, payment.id, PaymentState.SETTLED)
+        assert funding is not None and sweep is not None
+        reversal = reverse(funding, "returned", f"{kind} returned {code}")
+        reverse(sweep, "bank-cash-returned", f"{kind} returned {code}, out of Bank Cash")
+        hold_id = connection.scalar(
+            select(transitions.c.hold_id).where(
+                transitions.c.payment_id == payment.id,
+                transitions.c.state == PaymentState.SETTLED,
+            )
+        )
+        if hold_id is not None and journal.hold(hold_id).ended is None:
+            journal.release_hold(
+                hold_id,
+                ReleaseRequest(
+                    idempotency_key=ledger_key(payment.id, "returned-hold"),
+                    actor=actor,
+                    effective_at=event.occurred_at,
+                ),
+            )
+
+        customer = payment.customer_account
+        now = self._clock.now()
+        standing = journal.balances(customer, max(now, event.occurred_at), now)
+        deficit = standing.unsettled_outflows - standing.posted
+        if deficit <= 0:
+            return _Booked(transaction_id=reversal)
+        recovery = recovery_receivable_account(customer)
+        try:
+            journal.account(recovery)
+        except AccountNotFound:
+            with suppress(DuplicateAccount):  # opened by a concurrent Return
+                journal.open_account(
+                    NewAccount(code=recovery, type=AccountType.ASSET, currency=payment.currency)
+                )
+        moved = journal.post(
+            NewTransaction(
+                idempotency_key=ledger_key(payment.id, "recovery"),
+                actor=actor,
+                effective_at=event.occurred_at,
+                description=f"{kind} returned {code}: deficit to Recovery Receivable",
+                entries=[
+                    NewEntry(account=recovery, currency=payment.currency, amount=deficit),
+                    NewEntry(account=customer, currency=payment.currency, amount=-deficit),
+                ],
+            )
+        ).transaction.id
+        detail = (
+            f"{'Late ' if late else ''}Return {code} of {kind} left {customer} short by "
+            f"{deficit} {payment.currency} Minor Units, moved to {recovery}"
+        )
+        connection.execute(
+            insert(return_exceptions).values(
+                payment_id=payment.id,
+                inbox_id=inbox_id,
+                customer_account=customer,
+                recovery_account=recovery,
+                currency=payment.currency,
+                return_code=code,
+                exposure=deficit,
+                late=late,
+                recovery_transaction_id=moved,
+                detail=detail,
+                effective_at=event.occurred_at,
+                recorded_at=now,
+            )
+        )
+        log.warning(
+            "Return left a Customer Balance short",
+            extra={"payment_id": payment.id, "exposure": deficit, "return_code": code},
+        )
+        return _Booked(transaction_id=reversal)
 
     @staticmethod
     def _sweep(
@@ -603,7 +746,7 @@ class Payments:
                     ~select(later.c.id)
                     .where(
                         later.c.payment_id == transitions.c.payment_id,
-                        later.c.state == PaymentState.AVAILABLE,
+                        later.c.state.in_([PaymentState.AVAILABLE, PaymentState.RETURNED]),
                     )
                     .exists(),
                 )
@@ -695,6 +838,8 @@ def _current(states: list[PaymentState]) -> PaymentState:
     ended = [state for state in states if state in ENDS_BEFORE_SETTLEMENT]
     if ended:
         return ended[0]
+    if PaymentState.RETURNED in states:
+        return PaymentState.RETURNED
     return max(states, key=MAIN_PATH.index)
 
 
@@ -714,6 +859,16 @@ def _booked_by(connection: Connection, payment_id: int, state: PaymentState) -> 
         )
     )
     return found
+
+
+def _return_exceptions(connection: Connection, where: Any) -> list[ReturnException]:
+    query = select(return_exceptions).order_by(return_exceptions.c.id)
+    if where is not None:
+        query = query.where(where)
+    return [
+        ReturnException.model_validate({k: v for k, v in row._asdict().items() if k != "id"})
+        for row in connection.execute(query)
+    ]
 
 
 def _outcome(connection: Connection, inbox_id: int) -> tuple[Outcome, str] | None:

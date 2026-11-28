@@ -65,6 +65,27 @@ class PaymentException(_Value):
     recorded_at: datetime
 
 
+class ReturnException(_Value):
+    """A Return left the Customer Balance short: the deficit (`exposure`, in Minor Units) was
+    moved to the Customer's Recovery Receivable by `recovery_transaction_id`. Raised by the
+    Provider Event `inbox_id`; `late` if the funds had been Available (a Late Return), so
+    Mintwharf may have paid them out. An exception for people to work, not a Reconciliation
+    Break (SPEC §4.3, ADR 0013)."""
+
+    payment_id: int
+    inbox_id: int
+    customer_account: str
+    recovery_account: str
+    currency: str
+    return_code: str
+    exposure: int
+    late: bool
+    recovery_transaction_id: int
+    detail: str
+    effective_at: datetime
+    recorded_at: datetime
+
+
 class Payment(_Value):
     id: int
     idempotency_key: str
@@ -84,6 +105,7 @@ class Payment(_Value):
     available_at: datetime | None
     transitions: list[Transition]
     exceptions: list[PaymentException]
+    return_exceptions: list[ReturnException]
 
 
 class PaymentRef(_Value):

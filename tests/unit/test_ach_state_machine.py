@@ -89,3 +89,46 @@ def test_an_impossible_transition_is_an_exception(
     assert isinstance(decision, Impossible)
     assert current.value in decision.reason
     assert reported.value in decision.reason
+
+
+RET = PaymentState.RETURNED
+
+
+@pytest.mark.parametrize("current", [SET, AV])
+def test_a_settled_or_available_payment_can_be_returned(current: PaymentState) -> None:
+    assert decide(current, RET, rail="ach") == Advance(path=(RET,))
+
+
+@pytest.mark.parametrize("current", [C, SUB])
+def test_a_return_for_a_payment_never_settled_is_impossible(current: PaymentState) -> None:
+    """SPEC §4.2's own example: the Ledger never heard it settled, so a Return now is an
+    exception record, never a Ledger write, even if the settlement is only late."""
+    decision = decide(current, RET, rail="ach")
+
+    assert isinstance(decision, Impossible)
+    assert "never settled" in decision.reason
+
+
+@pytest.mark.parametrize("ending", [DEC, CAN])
+def test_a_return_after_a_decline_or_cancellation_is_impossible(ending: PaymentState) -> None:
+    assert isinstance(decide(ending, RET, reached=[C, SUB, ending], rail="ach"), Impossible)
+
+
+@pytest.mark.parametrize("reported", [C, SUB, SET, AV, RET])
+def test_a_returned_payment_has_passed_everything_on_its_way(reported: PaymentState) -> None:
+    """Returned is final. A late settlement, a second Return, or the availability step after
+    a Return report nothing new."""
+    assert decide(RET, reported, reached=[C, SUB, SET, RET], rail="ach") == Stale()
+
+
+@pytest.mark.parametrize("reported", [DEC, CAN])
+def test_a_returned_payment_cannot_be_declined_or_canceled(reported: PaymentState) -> None:
+    assert isinstance(decide(RET, reported, reached=[C, SUB, SET, RET], rail="ach"), Impossible)
+
+
+@pytest.mark.parametrize("current", [C, SET])
+def test_rtp_has_no_returns(current: PaymentState) -> None:
+    decision = decide(current, RET, rail="rtp")
+
+    assert isinstance(decision, Impossible)
+    assert "RTP" in decision.reason
