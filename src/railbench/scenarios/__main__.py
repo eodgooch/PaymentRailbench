@@ -3,7 +3,7 @@
 The run gets a throwaway database on the Postgres at DATABASE_URL (`make dev` starts one),
 migrated, used and dropped, with the Ledger and the Simulator in-process on one ManualClock.
 It writes the Fault Manifest (default reports/manifests/<scenario>-<seed>.json) and prints
-each Payment's states and Inbox outcomes.
+each Payment's states and Inbox outcomes, and each Auction Close's Payouts.
 """
 
 import argparse
@@ -37,6 +37,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         steps = " → ".join(step["state"] for step in payment["transitions"])
         seen = ", ".join(outcome["outcome"] for outcome in payment["inbox_outcomes"])
         print(f"  {key}: {steps} (Inbox: {seen})")
+    for auction_id, close in result.summary["auction_closes"].items():
+        print(f"Auction Close {auction_id}: {len(close['lots'])} lots")
+        for seller, payout in close["payouts"].items():
+            steps = " → ".join(step["step"] for step in payout["steps"])
+            print(f"  Payout to {seller}: {payout['amount']} ({payout['requested']}): {steps}")
     print(f"{len(result.manifest.faults)} Faults injected; manifest: {result.manifest_path}")
     return 0
 

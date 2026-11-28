@@ -8,11 +8,11 @@ of Mintwharf's buyers and of time:
 1. open each Customer's Customer Balance at the start;
 2. hand the Simulator its plan for every Payment (outcome and Faults, resolved from the
    seed), the way a test would configure a sandbox;
-3. originate each Payment through the Ledger API at its time;
-4. move the Clock straight to the next moment anything is due (a Payment to originate, a
-   Payment to settle or end, a webhook to deliver, ACH funds due to become Available),
-   tick the Simulator and then the Ledger's availability job, and repeat until nothing is
-   left to do;
+3. originate each Payment, then close each auction, through the Ledger API at its time;
+4. move the Clock straight to the next moment anything is due (a Payment to originate, an
+   auction to close, a Payment to settle or end, a webhook to deliver, ACH funds due to
+   become Available), tick the Simulator and then the Ledger's jobs (ACH availability, then
+   Payout release), and repeat until nothing is left to do;
 5. write the Fault Manifest.
 
 No randomness is drawn here and no wall clock is read, so a Scenario and seed give the same
@@ -29,6 +29,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import httpx
@@ -42,9 +43,10 @@ from railbench.common.settings import Settings
 from railbench.ledger.app import create_app as create_ledger_app
 from railbench.ledger.journal import Journal
 from railbench.ledger.model import AccountType, NewAccount
+from railbench.marketplace.service import Marketplace
 from railbench.payments.service import Payments
 from railbench.scenarios.manifest import Manifest, manifest_for
-from railbench.scenarios.model import Scenario
+from railbench.scenarios.model import Scenario, ScenarioAuctionClose
 from railbench.scenarios.servers import free_port, serving
 from railbench.scenarios.summary import Summary, ledger_summary
 from railbench.simulator.app import create_app as create_simulator_app
@@ -94,7 +96,7 @@ def run(
         ledger_webhook_url=f"{ledger_url}/providers/simulator/events",
         # Both ends are this process, so each run signs with a throwaway secret of its own.
         webhook_signing_secret=secrets.token_hex(16),
-    )
+    ).model_copy(update=_ledger_settings(scenario))
     ledger_app = create_ledger_app(app_engine, clock, settings)
     delivery_http = httpx.Client(timeout=DELIVERY_TIMEOUT)
     simulator_app = create_simulator_app(
@@ -114,6 +116,7 @@ def run(
     )
     journal: Journal = ledger_app.state.journal
     payments: Payments = ledger_app.state.payments
+    marketplace: Marketplace = ledger_app.state.marketplace
     simulator: Simulator = simulator_app.state.simulator
     try:
         with (
@@ -122,10 +125,7 @@ def run(
             httpx.Client(base_url=ledger_url, timeout=10.0) as ledger,
         ):
             for customer in scenario.customers:
-                currencies = sorted(
-                    {p.currency for p in scenario.payments if p.customer == customer.id}
-                )
-                for currency in currencies:
+                for currency in _currencies(scenario, customer.id):
                     journal.open_account(
                         NewAccount(
                             code=customer.account(currency),
@@ -137,6 +137,7 @@ def run(
                 simulator.plan(plan)
 
             waiting = sorted(scenario.payments, key=lambda p: p.at)  # stable: file order ties
+            closing = sorted(scenario.auction_closes, key=lambda a: a.at)
             originated: dict[str, int] = {}
             ticks: list[datetime] = []
             while True:
@@ -159,8 +160,15 @@ def run(
                     )
                     response.raise_for_status()
                     originated[payment.id] = response.json()["id"]
+                while closing and scenario.start + closing[0].at <= now:
+                    close = closing.pop(0)
+                    response = ledger.post(
+                        "/auction-closes", json=_auction_close(scenario, close, seed, now)
+                    )
+                    response.raise_for_status()
                 simulator.tick()
                 payments.make_available()
+                marketplace.release_payouts()
                 ticks.append(now)
                 if len(ticks) > MAX_TICKS:
                     raise RunDidNotSettle(f"{scenario.name} still busy after {MAX_TICKS} ticks")
@@ -169,6 +177,7 @@ def run(
                     for moment in (
                         simulator.next_due(),
                         waiting[0].at + scenario.start if waiting else None,
+                        closing[0].at + scenario.start if closing else None,
                         _next_available(payments, originated.values()),
                     )
                     if moment is not None
@@ -190,6 +199,47 @@ def run(
         delivery_http.close()
         app_engine.dispose()
         owner.dispose()
+
+
+def _ledger_settings(scenario: Scenario) -> dict[str, int]:
+    settings = {}
+    if scenario.instant_payout_limit is not None:
+        settings["instant_payout_limit_cents"] = scenario.instant_payout_limit
+    if scenario.seller_fee_bps is not None:
+        settings["seller_fee_bps"] = scenario.seller_fee_bps
+    return settings
+
+
+def _currencies(scenario: Scenario, customer_id: str) -> list[str]:
+    """The currencies a Customer pays or is paid in, one Customer Balance for each."""
+    found = {p.currency for p in scenario.payments if p.customer == customer_id}
+    for close in scenario.auction_closes:
+        if any(customer_id in (lot.buyer, lot.seller) for lot in close.lots):
+            found.add(close.currency)
+    return sorted(found)
+
+
+def _auction_close(
+    scenario: Scenario, close: ScenarioAuctionClose, seed: int, now: datetime
+) -> dict[str, Any]:
+    def account(customer_id: str) -> str:
+        return scenario.customer(customer_id).account(close.currency)
+
+    return {
+        "auction_id": scenario.auction_id(close, seed),
+        "closed_at": now.isoformat(),
+        "currency": close.currency,
+        "lots": [
+            {
+                "lot_id": lot.id,
+                "buyer": account(lot.buyer),
+                "seller": account(lot.seller),
+                "hammer_price": lot.hammer_price,
+            }
+            for lot in close.lots
+        ],
+        "instant_payouts": scenario.instant_payouts(close),
+    }
 
 
 def _next_available(payments: Payments, payment_ids: Iterable[int]) -> datetime | None:
