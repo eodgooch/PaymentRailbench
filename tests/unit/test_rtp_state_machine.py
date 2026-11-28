@@ -48,5 +48,5 @@ def test_anything_else_on_rtp_is_impossible(current: PaymentState, reported: Pay
     assert reported.value in decision.reason
 
 
-def test_ach_is_still_the_default() -> None:
-    assert decide(C, SET) == Advance(path=(SUB, SET))
+def test_the_same_report_means_something_else_on_ach() -> None:
+    assert decide(C, SET, rail="ach") == Advance(path=(SUB, SET))

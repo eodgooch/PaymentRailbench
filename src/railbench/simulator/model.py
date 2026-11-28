@@ -89,7 +89,7 @@ STATUS_FOR_OUTCOME = {
 }
 
 
-def events_for(outcome: Outcome, rail: Rail = "ach") -> tuple[EventName, ...]:
+def events_for(outcome: Outcome, rail: Rail) -> tuple[EventName, ...]:
     """The Provider Events a Payment on `rail` with this outcome emits, in the order it
     emits them. An RTP Payment emits only its ending: it settles or is declined at once."""
     if rail == "rtp":

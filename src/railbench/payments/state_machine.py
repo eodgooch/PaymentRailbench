@@ -74,7 +74,8 @@ def decide(
     current: PaymentState,
     reported: PaymentState,
     reached: Collection[PaymentState] = (),
-    rail: Rail = "ach",
+    *,
+    rail: Rail,
 ) -> Decision:
     """What an event reporting `reported` does to a Payment on `rail` now at `current`,
     having been recorded in the states `reached` (its history, `current` included or not)."""

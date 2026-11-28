@@ -168,22 +168,28 @@ named by their Customer Balance) and the sellers asking for an Instant Payout:
   buyer. `GET /auction-closes/{auction_id}` returns the lots, each Customer's position
   (`owes`, `sold`, `fees`, `owed`) and each Payout with its steps and Payments. An auction
   closes once: a retry answers `200` with `Idempotent-Replayed: true`, other lots `409`.
-- **Standard Payout** (over ACH): a Hold on the seller's Customer Balance at the close, so
-  the proceeds are Posted but not Available. The funds behind it are the buyers of that
-  seller's lots, and they're Available when none of those buyers has a negative Available
-  Balance (a buyer who funded by ACH: when the Ledger releases their funding's Hold). The
-  `payout-release` job then releases the Hold and sends an ACH credit push.
+- **Reserved until it goes out.** Every Payout's amount is held on the seller's Customer
+  Balance from the close, so the proceeds are Posted but not Available. The Payout's
+  Payment names that Hold, and the Transaction booking the money going out captures it (an
+  RTP settlement, an ACH push's submission). If the money stays (an ACH push declined), it's
+  Available again: reversed, or the Hold released.
+- **Standard Payout** (over ACH): sent when the funds behind it are Available, that is when
+  neither the buyers of that seller's lots nor the seller has a negative Available Balance
+  (a buyer who funded by ACH: once the Ledger releases their funding's Hold; the seller: once
+  their own purchases are paid for). The `payout-release` job then sends an ACH credit push.
+  Until then the Payout's `waiting_for` names who it's waiting on.
 - **Instant Payout** (over RTP): sent at once, at Mintwharf's risk, if the seller's
   outstanding exposure (their Instant Payouts not declined whose funds aren't Available yet)
-  plus this one is within `INSTANT_PAYOUT_LIMIT_CENTS` (inclusive). Over it, the whole amount
-  falls back to a Standard Payout. A declined RTP Payout moved nothing, and also falls back
-  to Standard.
+  plus this one is within `INSTANT_PAYOUT_LIMIT_CENTS` (inclusive) and the seller doesn't
+  owe for their own purchases. Otherwise the whole amount falls back to a Standard Payout. A
+  declined RTP moved nothing, and also falls back to Standard. A per-seller lock keeps two
+  auctions closing at once from both spending one seller's limit.
 - **Pushes in the Ledger** mirror the pull through the Clearing Account for their Rail: an
   ACH push is a pending Transaction from the Customer Balance to the Clearing Account at
   submission (an unsettled outflow, no longer Available), then its Settlement and Bank Cash
   to the Clearing Account; declined, a pending Reversal gives the money back. A settled RTP
   push is two posted Transactions, Customer Balance to the RTP Clearing Account and Bank Cash
-  to it, so Clearing nets to zero at once. `POST /payments` only makes pulls.
+  to it, so the Clearing Account nets to zero at once. `POST /payments` only makes pulls.
 - **RTP in the Simulator** is credit push only (an RTP pull is a `422`), instant and final:
   it settles, or is declined if planned, the moment it's created, any day at any hour (no
   Cutoff, no Banking Days), with one Provider Event, `payment.settled` or `payment.declined`,
@@ -191,6 +197,8 @@ named by their Customer Balance) and the sellers asking for an Instant Payout:
   exception. Duplicate and delayed delivery Faults work on RTP events; out-of-order needs a
   later event, which RTP never has. ACH pushes run on the pull's timetable.
 
+A Payout's steps, each at most once, are `reserved`, then `instant` or `standard`, then
+`released` (sent over ACH) and, if its ACH Payment ended without moving money, `returned`.
 The Ledger's ticker (`LEDGER_TICK_SECONDS`) runs ACH availability and then Payout release.
 `SELLER_FEE_BPS` extends SPEC §13. Auction Closes, lots, Payouts and Payout steps are
 append-only in the `marketplace` schema (migration `0007`).

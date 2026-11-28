@@ -429,10 +429,13 @@ def test_an_rtp_push_settles_the_moment_it_is_created_even_on_a_fed_holiday(
     assert payment["status"] == "settled"
     assert payment["settled_at"] == "2026-09-07T16:00:00Z"
     assert payment["submitted_at"] is None
-    assert simulator(client).next_due() == LABOR_DAY_NOON  # its event, and nothing to settle
     simulator(client).tick()
     assert [type_ for type_, _ in received(receiver, payment["id"])] == ["payment.settled"]
-    assert simulator(client).next_due() is None  # final: nothing more ever happens to it
+    # Final: nothing more ever happens to it, however long the Clock runs.
+    clock.set(datetime(2026, 12, 31, tzinfo=UTC))
+    simulator(client).tick()
+    assert [type_ for type_, _ in received(receiver, payment["id"])] == ["payment.settled"]
+    assert client.get(f"/payments/{payment['id']}").json()["status"] == "settled"
 
 
 def test_an_ach_push_settles_on_the_banking_day_after_submission(

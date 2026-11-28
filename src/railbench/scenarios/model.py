@@ -29,6 +29,7 @@ from typing import Annotated, Literal, Self
 import yaml
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
+from railbench.ledger.model import BIGINT_MAX
 from railbench.marketplace.model import payout_key
 from railbench.payments.service import customer_balance_account
 from railbench.simulator.model import (
@@ -65,7 +66,7 @@ class ScenarioPayment(_Strict):
 
     id: Slug
     customer: Slug
-    amount: Annotated[int, Field(strict=True, gt=0, le=2**63 - 1)]
+    amount: Annotated[int, Field(strict=True, gt=0, le=BIGINT_MAX)]
     currency: Annotated[str, Field(pattern=r"^[A-Z]{3,5}$")] = "USD"
     at: timedelta = timedelta(0)
     outcome: Outcome = "settle"
@@ -78,7 +79,7 @@ class ScenarioPayment(_Strict):
         return self
 
 
-Price = Annotated[int, Field(strict=True, gt=0, le=2**63 - 1)]
+Price = Annotated[int, Field(strict=True, gt=0, le=BIGINT_MAX)]
 
 
 class ScenarioLot(_Strict):
@@ -275,7 +276,7 @@ class Scenario(_Strict):
             return drawn
         count = 0
         for payment in self.payments:
-            emitted = events_for(payment.outcome)
+            emitted = events_for(payment.outcome, "ach")
             for position, event in enumerate(emitted):
                 if rng.random() >= config.rate:
                     continue
