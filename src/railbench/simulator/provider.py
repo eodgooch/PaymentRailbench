@@ -468,11 +468,16 @@ class Simulator:
     def _publish(self, connection: Connection, day: date, settled: list[Settled]) -> None:
         built = build_report(PROVIDER, day, settled)
         published_at = report_published_at(day)
-        connection.execute(
-            insert(settlement_reports).values(
-                provider=PROVIDER, report_date=day, published_at=published_at, body=built.body
+        inserted = connection.scalar(
+            pg_insert(settlement_reports)
+            .values(provider=PROVIDER, report_date=day, published_at=published_at, body=built.body)
+            .on_conflict_do_nothing(
+                index_elements=[settlement_reports.c.provider, settlement_reports.c.report_date]
             )
+            .returning(settlement_reports.c.id)
         )
+        if inserted is None:  # a concurrent tick published it first
+            return
         for found in built.injected:
             connection.execute(
                 pg_insert(faults)
