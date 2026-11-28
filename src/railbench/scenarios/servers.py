@@ -1,5 +1,6 @@
 """Run an ASGI app on a real localhost port in a background thread, so the Simulator and the
-Ledger talk over real HTTP in tests (ADR 0005) while sharing one ManualClock in-process."""
+Ledger talk over real HTTP in tests and Scenario runs (ADR 0005) while sharing one
+ManualClock in-process."""
 
 import socket
 import threading

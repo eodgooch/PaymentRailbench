@@ -1,0 +1,32 @@
+# Two buyers fund their Customer Balances by ACH pull, and the Simulator delivers some
+# Provider Events more than once. Expected: each event is applied once (the copies are
+# deduplicated in the Inbox), both pulls end Available, and the Clearing Account nets to zero.
+name: ach-pull-duplicates
+description: Duplicate webhooks for a submission and a settlement.
+seed: 11
+start: 2026-09-03T15:00:00-04:00 # Thursday, before the 16:00 New York ACH Cutoff
+customers:
+  - id: c-avery
+    name: Avery Quill
+  - id: c-bram
+    name: Bram Okonkwo-Hale
+payments:
+  - id: avery-funding
+    customer: c-avery
+    amount: 25000
+    description: Buyer funds their Customer Balance
+  - id: bram-funding
+    customer: c-bram
+    amount: 4200
+    at: PT20M
+    description: Buyer funds their Customer Balance
+faults:
+  - id: dup-avery-submitted
+    kind: duplicate
+    payment: avery-funding
+    event: submitted
+    times: 2
+  - id: dup-bram-settled
+    kind: duplicate
+    payment: bram-funding
+    event: settled

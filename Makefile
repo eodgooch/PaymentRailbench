@@ -1,4 +1,4 @@
-.PHONY: help dev down logs migrate test test-unit lint fmt hooks
+.PHONY: help dev down logs migrate scenario test test-unit lint fmt hooks
 
 UV ?= uv
 # Host ports, overridable when something else already listens on them.
@@ -10,6 +10,7 @@ help:
 	@echo "make dev       start Postgres, the Ledger API and the Simulator; wait until healthy"
 	@echo "make down      stop the stack and delete its data"
 	@echo "make logs      follow the stack's logs"
+	@echo "make scenario  run one Scenario (SCENARIO=scenarios/<name>.yaml [SEED=n]) against make dev's Postgres"
 	@echo "make test      run every test (integration tests need Docker)"
 	@echo "make test-unit run the unit tests only"
 	@echo "make lint      ruff, ruff format --check, mypy --strict"
@@ -29,6 +30,10 @@ logs:
 
 migrate:
 	$(UV) run alembic upgrade head
+
+SCENARIO ?= scenarios/ach-pull-out-of-order.yaml
+scenario:
+	$(UV) run python -m railbench.scenarios run $(SCENARIO) $(if $(SEED),--seed $(SEED))
 
 test:
 	$(UV) run pytest

@@ -26,9 +26,15 @@ def get_simulator(request: Request) -> Simulator:
     return simulator
 
 
-def create_app(engine: Engine, clock: Clock, settings: Settings | None = None) -> FastAPI:
+def create_app(
+    engine: Engine,
+    clock: Clock,
+    settings: Settings | None = None,
+    simulator: Simulator | None = None,
+) -> FastAPI:
+    """The Simulator's API. `simulator` defaults to one built from `settings`."""
     settings = settings or Settings()
-    simulator = Simulator(
+    simulator = simulator or Simulator(
         engine,
         clock,
         webhook_url=settings.ledger_webhook_url,

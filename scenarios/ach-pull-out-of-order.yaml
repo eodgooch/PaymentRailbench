@@ -1,0 +1,43 @@
+# Provider Events arrive out of order and late, and one pull is declined. Expected: a
+# settlement heard before its submission books both steps and the late submission is stale;
+# a decline heard before its submission books nothing, and the late submission is an
+# exception (as far as the Ledger knows the pull was never submitted, so a submission now
+# may mean the debit really went out); a delayed settlement still settles at its Effective
+# Time; nothing moves backward.
+name: ach-pull-out-of-order
+description: Out-of-order and delayed webhooks, and a declined pull.
+seed: 23
+start: 2026-09-03T15:00:00-04:00 # Thursday, before Cutoff; settles Friday before Labor Day
+customers:
+  - id: c-cleo
+    name: Cleo Marchetti
+  - id: c-dov
+    name: Dov Sandoval
+payments:
+  - id: cleo-funding
+    customer: c-cleo
+    amount: 31000
+  - id: dov-funding
+    customer: c-dov
+    amount: 7500
+    outcome: decline
+  - id: cleo-top-up
+    customer: c-cleo
+    amount: 1999
+    at: PT30M
+faults:
+  - id: settled-before-submitted
+    kind: out_of_order
+    payment: cleo-funding
+    event: submitted
+    after: settled
+  - id: declined-before-submitted
+    kind: out_of_order
+    payment: dov-funding
+    event: submitted
+    after: declined
+  - id: settlement-six-hours-late
+    kind: delay
+    payment: cleo-top-up
+    event: settled
+    by: PT6H
