@@ -212,6 +212,9 @@ A deliberate failure the Simulator injects, such as a duplicate Provider Event, 
 **Scenario**:
 A named, seeded script of Payments and Faults that replays exactly the same way every run.
 
+**Fault Manifest**:
+The record a Scenario run writes of every Fault it injected, with its true root cause. The triage evaluation scores against it; the Ledger never reads it.
+
 **Night**:
 A Scenario that runs an Auction Close with its Payouts and Faults, then Reconciliation, producing the Exception Queue.
 

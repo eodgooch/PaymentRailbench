@@ -109,7 +109,7 @@ ADR 0010):
    event raw in the **Inbox**, deduplicates it by event ID, and applies it at most once.
    The ACH state machine (`created → submitted → settled → available`, or `canceled` /
    `declined` before settlement) moves forward only: an event for a state already passed
-   is recorded `stale`, an impossible one (a decline after settlement) is recorded as an
+   is recorded `stale` (including a `submitted` that arrives after its decline), an impossible one (a decline after settlement) is recorded as an
    `exception` with no Ledger write, and both show on `GET /payments/{id}`.
 4. Booking, through the Journal, with the Provider Event's Inbox ID as Actor:
    **submitted**: a pending Transaction, Clearing Account → Customer Balance (Pending);
@@ -146,6 +146,49 @@ The Ledger API adds `POST /payments`, `GET /payments/{id}` and
 `POST /providers/{provider}/events`; the Simulator serves `POST /payments` and
 `GET /payments/{id}`.
 
+## Scenarios and delivery Faults
+
+A **Scenario** is a named, seeded YAML file of Customers, ACH pulls and **Faults** (SPEC §6,
+ADR 0011); the committed ones are in `scenarios/`. Each pull has an amount in Minor Units and
+an ending, `settle`, `decline` or `cancel` (a decline or cancellation happens when the pull
+would have settled). Faults are a `kind` plus the Payment and Provider Event they hit:
+
+```yaml
+faults:
+  - {id: dup, kind: duplicate, payment: avery-funding, event: submitted, times: 2}
+  - {id: late, kind: delay, payment: cleo-top-up, event: settled, by: PT6H}
+  - {id: swap, kind: out_of_order, payment: cleo-funding, event: submitted, after: settled}
+random_faults: {rate: 0.5, kinds: [duplicate, delay, out_of_order], max_delay: PT12H}
+```
+
+The Simulator injects them on its outbox, over the normal signed webhooks: a duplicate is
+the same event ID and body delivered again, a delay holds the event back on the Clock, and an
+out-of-order Fault holds an event until a later one of the same Payment has gone. Random
+Faults are drawn from the seed before the run; event IDs are derived from Idempotency Keys,
+and the runner jumps the ManualClock from one due moment to the next, so a Scenario and seed
+replay exactly (tested: two runs give the same manifest, ticks and Ledger; another seed gives
+other Faults).
+
+```sh
+make dev
+make scenario SCENARIO=scenarios/ach-pull-random-faults.yaml SEED=9
+```
+
+runs one Scenario in a throwaway database on that Postgres, with both services in-process on
+one ManualClock, prints each Payment's states and Inbox outcomes, and writes the **fault
+manifest** to `reports/manifests/<scenario>-<seed>.json`: each Fault's id, kind, Payment,
+event, parameters, when it was injected, a cause code and its true root cause. The Ledger
+never reads it: it lives in the `simulator` schema, which the Ledger's role can't read, and
+the `ledger` and `payments` packages can't import `railbench.scenarios` (both tested).
+
+Under these Faults the Ledger stays correct: a stateful property test
+(`tests/integration/test_ach_payment_properties.py`) delivers a Payment's events in random
+orders, again, late and contradicting each other, and checks after every step that
+Transactions balance, states only move forward, each event applies once, the Clearing
+Account nets to zero, stale and impossible events write nothing, and balances match the
+Payment's furthest state; and replaying the Inbox of a run with every Fault kind into an
+empty database reproduces the Ledger exactly, Recorded Times included.
+
 ### Layout
 
 - `src/railbench/common`: settings, the Clock, the Banking Day calendar, webhook signing,
@@ -154,11 +197,16 @@ The Ledger API adds `POST /payments`, `GET /payments/{id}` and
   `model.py` holds the validated values, `app.py` is the thin HTTP layer
 - `src/railbench/payments`: Payments, the Inbox and the ACH state machine, the Provider
   interface and its Simulator adapter; served by the Ledger API
-- `src/railbench/simulator`: the Simulator, a separate service (ADR 0005)
+- `src/railbench/simulator`: the Simulator, a separate service (ADR 0005), with scripted
+  endings and delivery Faults
+- `src/railbench/scenarios`: Scenario files, the runner and CLI, the fault manifest, the
+  Inbox replay and the Ledger summary they're compared by
+- `scenarios/`: the committed Scenario files
 - `migrations/`: Alembic. The baseline creates the `ledger`, `payments` (Payments and the
   Inbox), `reconciliation` and `simulator` schemas; `0002` adds the Ledger tables, triggers
   and the `railbench_app` role; `0003` adds Transaction status, Settlements and Holds;
-  `0004` adds Payments, the Inbox and state changes; `0005` the Simulator's state.
+  `0004` adds Payments, the Inbox and state changes; `0005` the Simulator's state; `0006`
+  its plans, delivery Faults and the fault manifest.
 
 Nothing reads the system time directly: code takes a `Clock` (`WallClock` by default,
 `ManualClock` in tests and Scenarios), and a ruff rule bans `datetime.now()` and friends
