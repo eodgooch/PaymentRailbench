@@ -14,8 +14,8 @@ Receiving a webhook:
    still in flight) gets no outcome and is refused with "retry later"; the redelivery
    applies it.
 
-Booking an ACH pull, every Ledger write through the Journal, with the Provider Event's
-Inbox ID as Actor:
+Booking, every Ledger write through the Journal, with the Provider Event's Inbox ID as
+Actor. An ACH pull:
 
 - submitted: a pending Transaction, Clearing Account debit, Customer Balance credit.
 - settled: a Settlement of that Transaction (Clearing and Customer Balance now Posted), a
@@ -25,6 +25,21 @@ Inbox ID as Actor:
 - available: `make_available()`, a Ledger-side job on the Clock, releases the Hold at the
   start of the second Banking Day after the settlement's Banking Day. The Provider never
   says when funds are Available; the Ledger decides from the calendar.
+
+An ACH push (a Payout) is the mirror image, and is never made Available:
+
+- submitted: a pending Transaction, Customer Balance debit, Clearing Account credit, so the
+  money is an unsettled outflow: still Posted, no longer Available.
+- settled: its Settlement, and a posted Transaction from Bank Cash to the Clearing Account
+  (Clearing nets to zero; Bank Cash goes down).
+- canceled or declined before settlement: a pending Reversal, so the money is Available in
+  the Customer Balance again.
+
+An RTP push is instant and final, `created → settled` or `declined`:
+
+- settled: a posted Transaction, Customer Balance debit, RTP Clearing Account credit, and a
+  posted Transaction from Bank Cash to that Clearing Account, which nets to zero at once.
+- declined: nothing, since nothing was booked.
 
 Applying one event is one database transaction: the Journal runs as a unit of work on the
 same connection (`Journal.within`), so the Ledger writes, the state changes and the outcome
@@ -79,9 +94,9 @@ from railbench.payments.provider import PaymentOrder, Provider, ProviderEvent
 from railbench.payments.state_machine import (
     ENDS_BEFORE_SETTLEMENT,
     MAIN_PATH,
-    AchState,
     Advance,
     Impossible,
+    PaymentState,
     Stale,
     decide,
 )
@@ -89,7 +104,7 @@ from railbench.payments.tables import inbox, inbox_outcomes, payments, transitio
 
 log = logging.getLogger(__name__)
 
-ORIGINATION_JOB = SystemJob(name="ach-origination", version="1.0.0")
+ORIGINATION_JOB = SystemJob(name="payment-origination", version="1.0.0")
 AVAILABILITY_JOB = SystemJob(name="ach-availability", version="1.0.0")
 AVAILABLE_AFTER_BANKING_DAYS = 2
 # Payments' advisory locks use the two-key form, a separate space from the Journal's
@@ -223,7 +238,7 @@ class Payments:
             )
             if payment_id is not None:
                 _append_transition(
-                    connection, payment_id, AchState.CREATED, now, now, job=ORIGINATION_JOB
+                    connection, payment_id, PaymentState.CREATED, now, now, job=ORIGINATION_JOB
                 )
         if payment_id is None:  # a concurrent request with this key got there first
             existing = self._by_key(new.idempotency_key, fingerprint)
@@ -251,8 +266,8 @@ class Payments:
                 )
                 .order_by(inbox_outcomes.c.id)
             ).all()
-        states = [AchState(step.state) for step in steps]
-        settled = next((s for s in steps if s.state == AchState.SETTLED), None)
+        states = [PaymentState(step.state) for step in steps]
+        settled = next((s for s in steps if s.state == PaymentState.SETTLED), None)
         return Payment(
             id=row.id,
             idempotency_key=row.idempotency_key,
@@ -266,10 +281,12 @@ class Payments:
             description=row.description,
             recorded_at=row.recorded_at,
             state=_current(states),
-            available_at=None if settled is None else available_at(settled.effective_at),
+            available_at=None
+            if settled is None or row.direction != "pull"
+            else available_at(settled.effective_at),
             transitions=[
                 Transition(
-                    state=AchState(step.state),
+                    state=PaymentState(step.state),
                     effective_at=step.effective_at,
                     recorded_at=step.recorded_at,
                     inbox_id=step.inbox_id,
@@ -358,7 +375,7 @@ class Payments:
                 return recorded
             payment = connection.execute(select(payments).where(payments.c.id == payment_id)).one()
             reached = _states(connection, payment_id)
-            decision = decide(_current(reached), event.reported, reached)
+            decision = decide(_current(reached), event.reported, reached, rail=payment.rail)
             outcome, detail = Outcome.APPLIED, ""
             match decision:
                 case Stale():
@@ -399,7 +416,7 @@ class Payments:
         journal: Journal,
         connection: Connection,
         payment: Row[Any],
-        state: AchState,
+        state: PaymentState,
         inbox_id: int,
         event: ProviderEvent,
     ) -> _Booked:
@@ -413,21 +430,29 @@ class Payments:
                 NewEntry(account=credit, currency=payment.currency, amount=-payment.amount),
             ]
 
-        match state:
-            case AchState.SUBMITTED:
+        kind = f"{payment.rail.upper()} {payment.direction} {payment.provider_payment_id}"
+        bank_cash = bank_cash_account(payment.currency)
+        pull = payment.direction == "pull"
+        # Money in: Clearing → Customer Balance, then Bank Cash ← Clearing. Money out (a
+        # Payout): Customer Balance → Clearing, then Clearing ← Bank Cash.
+        into_customer = legs(clearing, customer) if pull else legs(customer, clearing)
+        into_bank_cash = legs(bank_cash, clearing) if pull else legs(clearing, bank_cash)
+
+        match (payment.rail, state):
+            case ("ach", PaymentState.SUBMITTED):
                 pending = journal.post(
                     NewTransaction(
                         idempotency_key=ledger_key(payment.id, "pending"),
                         actor=actor,
                         effective_at=event.occurred_at,
-                        description=f"ACH pull {payment.provider_payment_id} submitted",
+                        description=f"{kind} submitted",
                         status=TransactionStatus.PENDING,
-                        entries=legs(clearing, customer),
+                        entries=into_customer,
                     )
                 ).transaction
                 return _Booked(transaction_id=pending.id)
-            case AchState.SETTLED:
-                pending_id = _booked_by(connection, payment.id, AchState.SUBMITTED)
+            case ("ach", PaymentState.SETTLED):
+                pending_id = _booked_by(connection, payment.id, PaymentState.SUBMITTED)
                 assert pending_id is not None
                 journal.settle(
                     pending_id,
@@ -437,15 +462,9 @@ class Payments:
                         effective_at=event.occurred_at,
                     ),
                 )
-                sweep = journal.post(
-                    NewTransaction(
-                        idempotency_key=ledger_key(payment.id, "bank-cash"),
-                        actor=actor,
-                        effective_at=event.occurred_at,
-                        description=f"ACH pull {payment.provider_payment_id} settled to Bank Cash",
-                        entries=legs(bank_cash_account(payment.currency), clearing),
-                    )
-                ).transaction
+                sweep = self._sweep(journal, payment, actor, event, kind, into_bank_cash)
+                if not pull:
+                    return _Booked(transaction_id=sweep)
                 until = available_at(event.occurred_at)
                 hold = journal.place_hold(
                     NewHold(
@@ -458,9 +477,9 @@ class Payments:
                         description=f"ACH funds Available from {until.isoformat()}",
                     )
                 ).hold
-                return _Booked(transaction_id=sweep.id, hold_id=hold.id)
-            case AchState.CANCELED | AchState.DECLINED:
-                pending_id = _booked_by(connection, payment.id, AchState.SUBMITTED)
+                return _Booked(transaction_id=sweep, hold_id=hold.id)
+            case ("ach", PaymentState.CANCELED | PaymentState.DECLINED):
+                pending_id = _booked_by(connection, payment.id, PaymentState.SUBMITTED)
                 if pending_id is None:
                     return _Booked()
                 reversal = journal.reverse(
@@ -469,28 +488,65 @@ class Payments:
                         idempotency_key=ledger_key(payment.id, state),
                         actor=actor,
                         effective_at=event.occurred_at,
-                        description=f"ACH pull {payment.provider_payment_id} {state}",
+                        description=f"{kind} {state}",
                     ),
                 ).transaction
                 return _Booked(transaction_id=reversal.id)
+            case ("rtp", PaymentState.SETTLED):
+                paid = journal.post(
+                    NewTransaction(
+                        idempotency_key=ledger_key(payment.id, "settled"),
+                        actor=actor,
+                        effective_at=event.occurred_at,
+                        description=f"{kind} settled",
+                        entries=into_customer,
+                    )
+                ).transaction
+                self._sweep(journal, payment, actor, event, kind, into_bank_cash)
+                return _Booked(transaction_id=paid.id)
+            case ("rtp", PaymentState.DECLINED):
+                return _Booked()  # nothing was booked, so nothing to undo
         raise AssertionError(f"a Provider Event can't book {state}")
+
+    @staticmethod
+    def _sweep(
+        journal: Journal,
+        payment: Row[Any],
+        actor: ProviderEventActor,
+        event: ProviderEvent,
+        kind: str,
+        entries: list[NewEntry],
+    ) -> int:
+        """The posted Transaction between Bank Cash and the Clearing Account at settlement,
+        which brings the Clearing Account back to zero."""
+        return journal.post(
+            NewTransaction(
+                idempotency_key=ledger_key(payment.id, "bank-cash"),
+                actor=actor,
+                effective_at=event.occurred_at,
+                description=f"{kind} settled to Bank Cash",
+                entries=entries,
+            )
+        ).transaction.id
 
     # Availability
 
     def make_available(self) -> int:
-        """Release the availability Hold of every settled ACH Payment whose time has come,
+        """Release the availability Hold of every settled ACH pull whose time has come,
         at its `available_at`, and record it `available`. Returns how many it moved."""
         now = self._clock.now()
         later = transitions.alias("later")
         with self._engine.connect() as connection:
             settled = connection.execute(
                 select(transitions.c.payment_id, transitions.c.effective_at)
+                .join(payments, payments.c.id == transitions.c.payment_id)
                 .where(
-                    transitions.c.state == AchState.SETTLED,
+                    payments.c.direction == "pull",
+                    transitions.c.state == PaymentState.SETTLED,
                     ~select(later.c.id)
                     .where(
                         later.c.payment_id == transitions.c.payment_id,
-                        later.c.state == AchState.AVAILABLE,
+                        later.c.state == PaymentState.AVAILABLE,
                     )
                     .exists(),
                 )
@@ -506,12 +562,12 @@ class Payments:
     def _make_available(self, payment_id: int, due: datetime) -> bool:
         with self._engine.begin() as connection:
             _lock(connection, payment_id)
-            if _current(_states(connection, payment_id)) is not AchState.SETTLED:
+            if _current(_states(connection, payment_id)) is not PaymentState.SETTLED:
                 return False
             hold_id: int = connection.execute(
                 select(transitions.c.hold_id).where(
                     transitions.c.payment_id == payment_id,
-                    transitions.c.state == AchState.SETTLED,
+                    transitions.c.state == PaymentState.SETTLED,
                 )
             ).scalar_one()
             self._journal.within(connection).release_hold(
@@ -525,7 +581,7 @@ class Payments:
             _append_transition(
                 connection,
                 payment_id,
-                AchState.AVAILABLE,
+                PaymentState.AVAILABLE,
                 due,
                 self._clock.now(),
                 job=AVAILABILITY_JOB,
@@ -563,23 +619,23 @@ class Payments:
                 )
 
 
-def _current(states: list[AchState]) -> AchState:
+def _current(states: list[PaymentState]) -> PaymentState:
     ended = [state for state in states if state in ENDS_BEFORE_SETTLEMENT]
     if ended:
         return ended[0]
     return max(states, key=MAIN_PATH.index)
 
 
-def _states(connection: Connection, payment_id: int) -> list[AchState]:
+def _states(connection: Connection, payment_id: int) -> list[PaymentState]:
     return [
-        AchState(state)
+        PaymentState(state)
         for state in connection.scalars(
             select(transitions.c.state).where(transitions.c.payment_id == payment_id)
         )
     ]
 
 
-def _booked_by(connection: Connection, payment_id: int, state: AchState) -> int | None:
+def _booked_by(connection: Connection, payment_id: int, state: PaymentState) -> int | None:
     found: int | None = connection.scalar(
         select(transitions.c.transaction_id).where(
             transitions.c.payment_id == payment_id, transitions.c.state == state
@@ -619,7 +675,7 @@ def _record_outcome(
 def _append_transition(
     connection: Connection,
     payment_id: int,
-    state: AchState,
+    state: PaymentState,
     effective_at: datetime,
     recorded_at: datetime,
     *,

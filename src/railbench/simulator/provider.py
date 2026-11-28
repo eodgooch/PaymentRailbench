@@ -14,6 +14,12 @@ after 30 s, then 60 s, doubling to at most an hour, and abandoned after MAX_ATTE
 Events go out in the order they were emitted, claimed briefly and POSTed outside any
 database transaction, so a slow receiver holds no locks.
 
+An ACH push (a Payout) runs on the same timetable as a pull. An RTP push (RTP is credit push
+only) is instant and final: it settles, or is declined if so planned, the moment it's
+created, on any day at any hour (RTP runs 24/7/365, so neither the Cutoff nor the Banking
+Day calendar applies), and emits that one Provider Event (`payment.settled` or
+`payment.declined`). Nothing happens to it afterwards: RTP has no Returns.
+
 A Scenario scripts a Payment before creating it (`plan()`, ADR 0011): how it ends (settles,
 or is declined or canceled at the time it would have settled) and which delivery Faults to
 inject. The Faults act on the outbox when the event is emitted: a duplicate adds more
@@ -82,6 +88,10 @@ class PlanConflict(Exception):
     """A different plan was already made for this Idempotency Key."""
 
 
+class PlanMismatch(Exception):
+    """A Payment created on another Rail than the one it was planned for."""
+
+
 @dataclass(frozen=True)
 class Delivery:
     event_id: str
@@ -141,14 +151,32 @@ class Simulator:
         self._http = http or httpx.Client(timeout=DELIVERY_TIMEOUT)
 
     def create_payment(self, request: PaymentRequest) -> tuple[SimulatedPayment, bool]:
-        """Create and submit a Payment once per Idempotency Key. Returns the Payment and
-        whether this was a replay of an earlier request."""
+        """Create a Payment once per Idempotency Key: submit an ACH one, settle (or decline)
+        an RTP one at once. Returns the Payment and whether this was a replay of an earlier
+        request."""
         fingerprint = payload_fingerprint(request.model_dump(exclude={"idempotency_key"}))
         now = self._clock.now()
         with self._engine.begin() as connection:
-            outcome = connection.scalar(
-                select(plans.c.outcome).where(plans.c.idempotency_key == request.idempotency_key)
-            )
+            plan = connection.execute(
+                select(plans.c.rail, plans.c.outcome).where(
+                    plans.c.idempotency_key == request.idempotency_key
+                )
+            ).one_or_none()
+            if plan is not None and plan.rail != request.rail:
+                raise PlanMismatch(
+                    f"{request.idempotency_key!r} was planned as {plan.rail}, not {request.rail}"
+                )
+            outcome = "settle" if plan is None else plan.outcome
+            if request.rail == "rtp":
+                status = STATUS_FOR_OUTCOME[outcome]
+                timing: dict[str, Any] = (
+                    {"settled_at": now} if outcome == "settle" else {"ended_at": now}
+                )
+                first_event = _event_type(FINAL_EVENT[outcome])
+            else:
+                status = PaymentStatus.SUBMITTED
+                timing = {"submitted_at": now, "settles_at": ach_settles_at(now)}
+                first_event = EventType.SUBMITTED
             payment_id = connection.scalar(
                 pg_insert(payments)
                 .values(
@@ -160,17 +188,16 @@ class Simulator:
                     currency=request.currency,
                     amount=request.amount,
                     reference=request.reference,
-                    status=PaymentStatus.SUBMITTED,
-                    outcome=outcome or "settle",
+                    status=status,
+                    outcome=outcome,
                     created_at=now,
-                    submitted_at=now,
-                    settles_at=ach_settles_at(now),
+                    **timing,
                 )
                 .on_conflict_do_nothing(index_elements=[payments.c.idempotency_key])
                 .returning(payments.c.id)
             )
             if payment_id is not None:
-                self._emit(connection, payment_id, EventType.SUBMITTED, now)
+                self._emit(connection, payment_id, first_event, now)
         with self._engine.connect() as connection:
             row = connection.execute(
                 select(payments).where(payments.c.idempotency_key == request.idempotency_key)
@@ -190,16 +217,19 @@ class Simulator:
             connection.execute(
                 pg_insert(plans)
                 .values(
-                    idempotency_key=plan.idempotency_key, outcome=plan.outcome, faults=faults_json
+                    idempotency_key=plan.idempotency_key,
+                    rail=plan.rail,
+                    outcome=plan.outcome,
+                    faults=faults_json,
                 )
                 .on_conflict_do_nothing(index_elements=[plans.c.idempotency_key])
             )
             stored = connection.execute(
-                select(plans.c.outcome, plans.c.faults).where(
+                select(plans.c.rail, plans.c.outcome, plans.c.faults).where(
                     plans.c.idempotency_key == plan.idempotency_key
                 )
             ).one()
-        if (stored.outcome, stored.faults) != (plan.outcome, faults_json):
+        if (stored.rail, stored.outcome, stored.faults) != (plan.rail, plan.outcome, faults_json):
             raise PlanConflict(f"{plan.idempotency_key!r} already has a different plan")
 
     def faults(self) -> list[InjectedFault]:
@@ -377,14 +407,19 @@ class Simulator:
         connection: Connection, idempotency_key: str, type_: EventType
     ) -> list[FaultPlan]:
         stored = connection.execute(
-            select(plans.c.outcome, plans.c.faults).where(
+            select(plans.c.rail, plans.c.outcome, plans.c.faults).where(
                 plans.c.idempotency_key == idempotency_key
             )
         ).one_or_none()
         if stored is None:
             return []
         plan = PaymentPlan.model_validate(
-            {"idempotency_key": idempotency_key, "outcome": stored.outcome, "faults": stored.faults}
+            {
+                "idempotency_key": idempotency_key,
+                "rail": stored.rail,
+                "outcome": stored.outcome,
+                "faults": stored.faults,
+            }
         )
         return [f for f in plan.faults if _event_type(f.event) == type_]
 

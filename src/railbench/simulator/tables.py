@@ -1,5 +1,5 @@
-"""SQLAlchemy Core views of the Simulator's tables (migrations 0005 and 0006 are the source
-of truth)."""
+"""SQLAlchemy Core views of the Simulator's tables (migrations 0005-0007 are the source of
+truth)."""
 
 from sqlalchemy import BigInteger, Column, DateTime, Integer, MetaData, Table, Text
 from sqlalchemy.dialects.postgresql import JSONB
@@ -56,6 +56,7 @@ plans = Table(
     "plans",
     metadata,
     Column("idempotency_key", Text, primary_key=True),
+    Column("rail", Text, nullable=False),
     Column("outcome", Text, nullable=False),
     Column("faults", JSONB, nullable=False),
 )

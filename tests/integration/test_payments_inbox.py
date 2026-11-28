@@ -21,8 +21,9 @@ from railbench.common.settings import Settings
 from railbench.common.signing import SIGNATURE_HEADER, sign
 from railbench.ledger.app import create_app
 from railbench.ledger.journal import Journal, Rejected
-from railbench.ledger.model import AccountType, NewAccount
-from railbench.ledger.tables import transactions
+from railbench.ledger.model import AccountType, NewAccount, NewEntry, NewTransaction, SystemJob
+from railbench.ledger.tables import accounts, entries, transactions
+from railbench.payments.model import NewPayment
 from railbench.payments.provider import SimulatorProvider
 from railbench.payments.service import Payments, clearing_account
 from railbench.payments.tables import inbox
@@ -402,3 +403,175 @@ def test_a_refused_step_rolls_back_every_ledger_write_of_the_event(
     found = payments(client).payment(payment["id"])
     assert (found.state, [t.state for t in found.transitions]) == ("created", ["created"])
     assert [e.inbox_id for e in found.exceptions] == [response.json()["inbox_id"]]
+
+
+# Pushes: Payouts leave a Customer Balance through the Clearing Account to Bank Cash
+
+
+def funded_customer(client: TestClient, amount: int) -> str:
+    """A Customer Balance holding `amount`, Posted and Available."""
+    customer = unique("seller")
+    journal(client).open_account(
+        NewAccount(code=customer, type=AccountType.LIABILITY, currency="USD")
+    )
+    source = unique("funding")
+    journal(client).open_account(NewAccount(code=source, type=AccountType.ASSET, currency="USD"))
+    journal(client).post(
+        NewTransaction(
+            idempotency_key=unique("fund"),
+            actor=SystemJob(name="test", version="1"),
+            effective_at=SUBMITTED_AT,
+            entries=[
+                NewEntry(account=source, currency="USD", amount=amount),
+                NewEntry(account=customer, currency="USD", amount=-amount),
+            ],
+        )
+    )
+    return customer
+
+
+def push(client: TestClient, rail: str, customer: str, amount: int = AMOUNT) -> dict[str, Any]:
+    created = payments(client).originate(
+        NewPayment.model_validate(
+            {
+                "idempotency_key": unique("payout"),
+                "rail": rail,
+                "direction": "push",
+                "customer_account": customer,
+                "amount": amount,
+                "currency": "USD",
+            }
+        )
+    )
+    return created.payment.model_dump(mode="json")
+
+
+def booked_on(engine: Engine, payment: dict[str, Any], account: str) -> int:
+    """What this Payment's own Transactions add up to on `account` (shared Accounts)."""
+    with engine.connect() as connection:
+        total = connection.execute(
+            select(func.coalesce(func.sum(entries.c.amount), 0))
+            .join(transactions, transactions.c.id == entries.c.transaction_id)
+            .join(accounts, accounts.c.id == entries.c.account_id)
+            .where(
+                transactions.c.idempotency_key.startswith(f"payment:{payment['id']}:"),
+                accounts.c.code == account,
+            )
+        ).scalar_one()
+    return int(total)
+
+
+def test_a_settled_rtp_push_pays_out_through_the_rtp_clearing_account(
+    client: TestClient, clock: ManualClock, engine: Engine
+) -> None:
+    customer = funded_customer(client, 10_000)
+    payout = push(client, "rtp", customer, 7_500)
+    assert payout["state"] == "created"
+
+    response = deliver(client, clock, payout, "payment.settled")
+
+    assert response.json()["outcome"] == "applied"
+    assert customer_balances(client, payout) == (2_500, 0, 2_500)
+    rtp_clearing = clearing_account("simulator", "rtp", "USD")
+    assert booked_on(engine, payout, rtp_clearing) == 0  # nets to zero at once
+    assert booked_on(engine, payout, "bank-cash:usd") == -7_500
+    found = payments(client).payment(payout["id"])
+    assert [t.state for t in found.transitions] == ["created", "settled"]
+    assert found.available_at is None
+
+
+def test_a_declined_rtp_push_books_nothing(
+    client: TestClient, clock: ManualClock, engine: Engine
+) -> None:
+    customer = funded_customer(client, 10_000)
+    payout = push(client, "rtp", customer)
+
+    response = deliver(client, clock, payout, "payment.declined")
+
+    assert response.json()["outcome"] == "applied"
+    assert customer_balances(client, payout) == (10_000, 0, 10_000)
+    assert booked_on(engine, payout, "bank-cash:usd") == 0
+
+
+@pytest.mark.parametrize("type_", ["payment.submitted", "payment.canceled"])
+def test_an_rtp_push_cannot_be_submitted_or_canceled(
+    client: TestClient, clock: ManualClock, type_: str
+) -> None:
+    customer = funded_customer(client, 10_000)
+    payout = push(client, "rtp", customer)
+
+    response = deliver(client, clock, payout, type_)
+
+    assert response.json()["outcome"] == "exception"
+    assert customer_balances(client, payout) == (10_000, 0, 10_000)
+
+
+def test_a_settled_rtp_push_is_final(client: TestClient, clock: ManualClock) -> None:
+    customer = funded_customer(client, 10_000)
+    payout = push(client, "rtp", customer)
+    deliver(client, clock, payout, "payment.settled")
+
+    response = deliver(client, clock, payout, "payment.declined")
+
+    assert response.json()["outcome"] == "exception"
+    assert customer_balances(client, payout) == (2_500, 0, 2_500)
+
+
+def test_an_ach_push_is_an_unsettled_outflow_until_it_settles(
+    client: TestClient, clock: ManualClock, engine: Engine
+) -> None:
+    customer = funded_customer(client, 10_000)
+    payout = push(client, "ach", customer, 7_500)
+    ach_clearing = clearing_account("simulator", "ach", "USD")
+
+    deliver(client, clock, payout, "payment.submitted")
+    # Still Posted (the money hasn't left), but no longer Available to anything else.
+    assert customer_balances(client, payout) == (10_000, -7_500, 2_500)
+    assert booked_on(engine, payout, ach_clearing) == -7_500
+
+    clock.set(SETTLED_AT)
+    deliver(client, clock, payout, "payment.settled", SETTLED_AT)
+    assert customer_balances(client, payout) == (2_500, 0, 2_500)
+    assert booked_on(engine, payout, ach_clearing) == 0
+    assert booked_on(engine, payout, "bank-cash:usd") == -7_500
+
+    # A push is never made Available: that's for money coming in.
+    clock.set(datetime(2026, 9, 30, tzinfo=UTC))
+    payments(client).make_available()
+    assert payments(client).payment(payout["id"]).state == "settled"
+
+
+def test_a_declined_ach_push_gives_the_money_back(
+    client: TestClient, clock: ManualClock, engine: Engine
+) -> None:
+    customer = funded_customer(client, 10_000)
+    payout = push(client, "ach", customer, 7_500)
+    deliver(client, clock, payout, "payment.submitted")
+
+    clock.set(SETTLED_AT)
+    deliver(client, clock, payout, "payment.declined", SETTLED_AT)
+
+    assert customer_balances(client, payout) == (10_000, 0, 10_000)
+    assert booked_on(engine, payout, clearing_account("simulator", "ach", "USD")) == 0
+
+
+@pytest.mark.parametrize(("rail", "direction"), [("ach", "push"), ("rtp", "push"), ("rtp", "pull")])
+def test_the_payments_api_only_originates_pulls(
+    client: TestClient, rail: str, direction: str
+) -> None:
+    """Payouts are made by an Auction Close, never by a bare API call."""
+    customer = funded_customer(client, 10_000)
+
+    response = client.post(
+        "/payments",
+        json={
+            "idempotency_key": unique("push"),
+            "rail": rail,
+            "direction": direction,
+            "customer_account": customer,
+            "amount": 100,
+            "currency": "USD",
+        },
+    )
+
+    assert response.status_code == 422

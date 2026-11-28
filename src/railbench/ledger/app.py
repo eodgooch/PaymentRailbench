@@ -233,6 +233,11 @@ def create_app(
         responses={200: {"description": "A retry: the original Payment", "model": Payment}},
     )
     def create_payment(new: NewPayment, payments: PaymentsDep, response: Response) -> Payment:
+        if new.direction != "pull":
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "only pulls are made here: Payouts are made by an Auction Close",
+            )
         created = payments.originate(new)
         return _respond(
             created.replayed,

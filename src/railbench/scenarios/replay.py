@@ -32,7 +32,7 @@ from railbench.payments.provider import (
     SimulatorProvider,
 )
 from railbench.payments.service import AVAILABILITY_JOB, PaymentNotYetKnown, Payments
-from railbench.payments.state_machine import AchState
+from railbench.payments.state_machine import PaymentState
 from railbench.payments.tables import inbox, payments, transitions
 
 
@@ -48,7 +48,7 @@ class RecordedProvider:
 
     def create_payment(self, order: PaymentOrder) -> ProviderPayment:
         return ProviderPayment(
-            provider_payment_id=self._ids[order.idempotency_key], status=AchState.SUBMITTED
+            provider_payment_id=self._ids[order.idempotency_key], status=PaymentState.SUBMITTED
         )
 
     def get_payment(self, provider_payment_id: str) -> ProviderPayment:
@@ -69,7 +69,8 @@ def availability_job_runs(
     A run that released nothing wrote nothing, and replaying it would release nothing, so
     these are all the runs a replay needs."""
     query = select(transitions.c.recorded_at).where(
-        transitions.c.job_name == AVAILABILITY_JOB.name, transitions.c.state == AchState.AVAILABLE
+        transitions.c.job_name == AVAILABILITY_JOB.name,
+        transitions.c.state == PaymentState.AVAILABLE,
     )
     if payment_ids is not None:
         query = query.where(transitions.c.payment_id.in_(payment_ids))

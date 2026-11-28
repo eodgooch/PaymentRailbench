@@ -1,9 +1,15 @@
-"""The ACH Payment state machine (SPEC §4.1, §4.2), as a pure decision.
+"""The Payment state machines (SPEC §4.1, §4.2), as a pure decision.
 
-    created → submitted → settled → available
+ACH, a pull or a push:
+
+    created → submitted → settled → available (a pull only; the Ledger decides it)
     created | submitted → canceled | declined
 
-It only moves forward. An event reporting a state the Payment has reached or passed is
+RTP, a credit push only, instant and final:
+
+    created → settled | declined
+
+Both only move forward. An event reporting a state the Payment has reached or passed is
 stale: recorded, and nothing happens. A canceled or declined Payment has passed the states
 it was recorded in on the way, so a second `submitted` for a Payment that was submitted and
 then declined is stale; but a `submitted` for one that went straight from created to
@@ -11,15 +17,21 @@ canceled or declined is impossible (the Provider may really have sent the debit)
 that skips ahead along the main path (a `settled` for a Payment still `created`) advances
 through every state it skipped, so the Ledger books each step. Anything else (a decline
 after settlement, a settlement after a decline) is impossible: the caller records an
-exception and writes nothing to the Ledger. Returns join in #7.
+exception and writes nothing to the Ledger. Returns join in #7 (ACH only).
+
+Nothing follows an RTP ending: a settled RTP Payment can't be declined or returned, and RTP
+has no submission or cancellation step, so any other RTP event is impossible.
 """
 
 from collections.abc import Collection
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Literal
+
+Rail = Literal["ach", "rtp"]
 
 
-class AchState(StrEnum):
+class PaymentState(StrEnum):
     CREATED = "created"
     SUBMITTED = "submitted"
     SETTLED = "settled"
@@ -28,15 +40,21 @@ class AchState(StrEnum):
     DECLINED = "declined"
 
 
-MAIN_PATH = (AchState.CREATED, AchState.SUBMITTED, AchState.SETTLED, AchState.AVAILABLE)
-ENDS_BEFORE_SETTLEMENT = (AchState.CANCELED, AchState.DECLINED)
+MAIN_PATH = (
+    PaymentState.CREATED,
+    PaymentState.SUBMITTED,
+    PaymentState.SETTLED,
+    PaymentState.AVAILABLE,
+)
+ENDS_BEFORE_SETTLEMENT = (PaymentState.CANCELED, PaymentState.DECLINED)
+RTP_ENDINGS = (PaymentState.SETTLED, PaymentState.DECLINED)
 
 
 @dataclass(frozen=True)
 class Advance:
     """Move through `path`, in order, booking each state."""
 
-    path: tuple[AchState, ...]
+    path: tuple[PaymentState, ...]
 
 
 @dataclass(frozen=True)
@@ -52,15 +70,22 @@ class Impossible:
 Decision = Advance | Stale | Impossible
 
 
-def decide(current: AchState, reported: AchState, reached: Collection[AchState] = ()) -> Decision:
-    """What an event reporting `reported` does to a Payment now at `current`, having been
-    recorded in the states `reached` (its history, `current` included or not)."""
+def decide(
+    current: PaymentState,
+    reported: PaymentState,
+    reached: Collection[PaymentState] = (),
+    rail: Rail = "ach",
+) -> Decision:
+    """What an event reporting `reported` does to a Payment on `rail` now at `current`,
+    having been recorded in the states `reached` (its history, `current` included or not)."""
+    if rail == "rtp":
+        return _decide_rtp(current, reported)
 
     def impossible() -> Impossible:
         return Impossible(f"an ACH Payment can't go from {current} to {reported}")
 
     if current in ENDS_BEFORE_SETTLEMENT:
-        passed = {current, AchState.CREATED, *reached}
+        passed = {current, PaymentState.CREATED, *reached}
         return Stale() if reported in passed else impossible()
     position = MAIN_PATH.index(current)
     if reported in ENDS_BEFORE_SETTLEMENT:
@@ -68,6 +93,14 @@ def decide(current: AchState, reported: AchState, reached: Collection[AchState] 
     target = MAIN_PATH.index(reported)
     if target <= position:
         return Stale()
-    if reported is AchState.AVAILABLE and current is not AchState.SETTLED:
+    if reported is PaymentState.AVAILABLE and current is not PaymentState.SETTLED:
         return impossible()
     return Advance(path=MAIN_PATH[position + 1 : target + 1])
+
+
+def _decide_rtp(current: PaymentState, reported: PaymentState) -> Decision:
+    if reported in (current, PaymentState.CREATED):
+        return Stale()
+    if current is PaymentState.CREATED and reported in RTP_ENDINGS:
+        return Advance(path=(reported,))
+    return Impossible(f"an RTP Payment can't go from {current} to {reported}")

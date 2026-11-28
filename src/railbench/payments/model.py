@@ -2,15 +2,14 @@
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from railbench.ledger.model import BIGINT_MAX, AccountCode, Currency, IdempotencyKey
-from railbench.payments.state_machine import AchState
+from railbench.payments.state_machine import PaymentState, Rail
 
-Rail = Literal["ach"]  # RTP joins with Payouts (#6)
-Direction = Literal["pull"]
+Direction = Literal["pull", "push"]
 
 
 class _Value(BaseModel):
@@ -18,7 +17,8 @@ class _Value(BaseModel):
 
 
 class NewPayment(_Value):
-    """An ACH pull from the Customer's bank into their Customer Balance."""
+    """A pull from the Customer's bank into their Customer Balance (ACH), or a push out of
+    it to the Customer's bank, a Payout (ACH or RTP; RTP is credit push only)."""
 
     idempotency_key: IdempotencyKey
     rail: Rail
@@ -28,11 +28,17 @@ class NewPayment(_Value):
     currency: Currency
     description: Annotated[str, Field(max_length=200)] = ""
 
+    @model_validator(mode="after")
+    def _rtp_pushes_only(self) -> Self:
+        if self.rail == "rtp" and self.direction != "push":
+            raise ValueError("RTP is credit push only: it can't pull money")
+        return self
+
 
 class Transition(_Value):
     """One state change. Its Actor is the Inbox event behind it or a system job."""
 
-    state: AchState
+    state: PaymentState
     effective_at: datetime
     recorded_at: datetime
     inbox_id: int | None
@@ -65,8 +71,8 @@ class Payment(_Value):
     amount: int
     description: str
     recorded_at: datetime
-    state: AchState
-    # When a settled ACH Payment becomes Available: the start (midnight, New York) of the
+    state: PaymentState
+    # When a settled ACH pull becomes Available: the start (midnight, New York) of the
     # second Banking Day after the Banking Day it settled on (ADR 0004, ADR 0010).
     available_at: datetime | None
     transitions: list[Transition]

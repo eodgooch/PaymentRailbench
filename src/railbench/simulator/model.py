@@ -12,8 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 BIGINT_MAX = 2**63 - 1
 
-Rail = Literal["ach"]
-Direction = Literal["pull"]
+Rail = Literal["ach", "rtp"]
+Direction = Literal["pull", "push"]
 
 
 class PaymentStatus(StrEnum):
@@ -33,7 +33,7 @@ class EventType(StrEnum):
 
 
 class PaymentRequest(BaseModel):
-    """Create a Payment. Only ACH pulls for now; RTP joins with Payouts (#6)."""
+    """Create a Payment: an ACH pull or push, or an RTP push (RTP is credit push only)."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -43,6 +43,12 @@ class PaymentRequest(BaseModel):
     amount: Annotated[int, Field(strict=True, gt=0, le=BIGINT_MAX)]
     currency: Annotated[str, Field(pattern=r"^[A-Z]{3,5}$")]
     reference: Annotated[str, Field(max_length=200)] = ""
+
+    @model_validator(mode="after")
+    def _rtp_pushes_only(self) -> Self:
+        if self.rail == "rtp" and self.direction != "push":
+            raise ValueError("RTP is credit push only: it can't pull money")
+        return self
 
 
 class SimulatedPayment(BaseModel):
@@ -83,8 +89,11 @@ STATUS_FOR_OUTCOME = {
 }
 
 
-def events_for(outcome: Outcome) -> tuple[EventName, ...]:
-    """The Provider Events a Payment with this outcome emits, in the order it emits them."""
+def events_for(outcome: Outcome, rail: Rail = "ach") -> tuple[EventName, ...]:
+    """The Provider Events a Payment on `rail` with this outcome emits, in the order it
+    emits them. An RTP Payment emits only its ending: it settles or is declined at once."""
+    if rail == "rtp":
+        return (FINAL_EVENT[outcome],)
     return ("submitted", FINAL_EVENT[outcome])
 
 
@@ -134,12 +143,15 @@ class PaymentPlan(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     idempotency_key: Annotated[str, Field(min_length=1, max_length=200)]
+    rail: Rail = "ach"
     outcome: Outcome = "settle"
     faults: tuple[FaultPlan, ...] = ()
 
     @model_validator(mode="after")
     def _faults_fit_the_outcome(self) -> Self:
-        emitted = events_for(self.outcome)
+        if self.rail == "rtp" and self.outcome == "cancel":
+            raise ValueError("an RTP Payment can't be canceled: it settles or is declined")
+        emitted = events_for(self.outcome, self.rail)
         for fault in self.faults:
             if fault.event not in emitted:
                 raise ValueError(
