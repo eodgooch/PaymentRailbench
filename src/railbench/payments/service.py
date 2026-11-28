@@ -621,7 +621,8 @@ class Payments:
         the availability Hold if it's still in place, and move any deficit it leaves to
         Recovery Receivable, with a return exception (ADR 0013)."""
         actor = ProviderEventActor(inbox_id=str(inbox_id))
-        code = event.return_code or "R??"
+        code = event.return_code
+        assert code is not None  # the Provider adapter refuses a Return without its code
         late = PaymentState.AVAILABLE in _states(connection, payment.id)
 
         def reverse(transaction_id: int, step: str, description: str) -> int:
